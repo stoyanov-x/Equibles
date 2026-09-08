@@ -97,8 +97,17 @@ def main() -> int:
         del merged[key]
 
     services = merged.setdefault("services", {})
-    # Force the env-settable db host port (Meridian's only divergence).
-    services["db"]["ports"] = [DB_PORT]
+    # Host publish ports are env-settable because upstream defaults collide on a
+    # Coolify host: db 5432 (existing host Postgres) and web 8080 (Coolify's own
+    # reverse proxy). Bake safe defaults here; override via EQUIBLES_*_EXPOSE_PORT
+    # at deploy time if a given port is taken.
+    for svc, (container, env, default) in {
+        "db":  ("5432", "EQUIBLES_DB_EXPOSE_PORT", "15432"),
+        "web": ("8080", "EQUIBLES_WEB_EXPOSE_PORT", "18080"),
+        "mcp": ("8080", "EQUIBLES_MCP_EXPOSE_PORT", "8081"),
+    }.items():
+        if svc in services:
+            services[svc]["ports"] = [f"${{{env}:-{default}}}:{container}"]
 
     # Optional: serve prebuilt GHCR images instead of building from source.
     rewrite_to_images(services)

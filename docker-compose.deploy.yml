@@ -2,7 +2,7 @@ services:
   db:
     image: paradedb/paradedb:latest
     ports:
-    - ${EQUIBLES_DB_EXPOSE_PORT:-5432}:5432
+    - ${EQUIBLES_DB_EXPOSE_PORT:-15432}:5432
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -19,7 +19,7 @@ services:
       start_period: 30s
   mcp:
     ports:
-    - 8081:8080
+    - ${EQUIBLES_MCP_EXPOSE_PORT:-8081}:8080
     environment:
       Embedding__Enabled: ${Embedding__Enabled:-false}
       Embedding__Provider: ${Embedding__Provider:-Ollama}
@@ -37,7 +37,7 @@ services:
     image: ghcr.io/stoyanov-x/equibles-mcp:main
   web:
     ports:
-    - 8080:8080
+    - ${EQUIBLES_WEB_EXPOSE_PORT:-18080}:8080
     environment:
       Embedding__Enabled: ${Embedding__Enabled:-false}
       Embedding__Provider: ${Embedding__Provider:-Ollama}
