@@ -1,0 +1,40 @@
+name: Sync upstream into fork
+
+# Keeps this fork current with daniel3303/Equibles while preserving our small
+# MERIDIAN patch (the env-settable db host port in docker-compose.yml).
+#
+# Runs weekly (Mon 03:17 UTC) and on demand. It merges upstream/main into this
+# repo's main and pushes. If upstream ever edits the same db `ports:` line, the
+# merge will conflict and the run will fail loudly so it can be resolved by hand.
+#
+# NOTE: the push emits a normal push webhook, so Coolify still auto-deploys.
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream/main into main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/daniel3303/Equibles.git
+          git fetch upstream main
+          git merge --no-edit upstream/main
+          git push origin main
