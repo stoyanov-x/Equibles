@@ -7,7 +7,7 @@ name: Hydrate deploy compose
 
 on:
   schedule:
-    - cron: "23 3 * * *"   # daily 03:23 UTC (upstream sync is Mon 03:17 UTC)
+    - cron: "25 3 * * 1"   # weekly Mon 03:25 UTC (right after upstream sync at Mon 03:17)
   workflow_dispatch: {}
 
 permissions:
@@ -35,6 +35,10 @@ jobs:
         run: pip install pyyaml
 
       - name: Hydrate docker-compose.deploy.yml
+        env:
+          # Switch to prebuilt GHCR images once build-push has published them.
+          # Inert (empty) until the repo variable is set, so hydrate stays build-based by default.
+          EQUIBLES_USE_GHCR: ${{ vars.EQUIBLES_USE_GHCR }}
         run: python scripts/hydrate_deploy.py
 
       - name: Commit if changed

@@ -20,6 +20,7 @@ ${EQUIBLES_DB_EXPOSE_PORT:-5432}:5432 so it can't collide with the host's Postgr
 from __future__ import annotations
 
 import copy
+import os
 import sys
 
 import yaml
@@ -47,6 +48,26 @@ def load(path: str) -> dict:
         return yaml.safe_load(fh) or {}
 
 
+GHCR_REPO = os.environ.get("EQUIBLES_IMAGE_REPO", "ghcr.io/stoyanov-x")
+IMAGE_TAG = os.environ.get("EQUIBLES_IMAGE_TAG", "main")
+# service -> image name under GHCR_REPO
+IMAGE_MAP = {"web": "equibles-web", "mcp": "equibles-mcp", "worker": "equibles-worker"}
+
+
+def rewrite_to_images(services: dict) -> None:
+    """Replace each build: service with a prebuilt GHCR image.
+
+    Enabled only when EQUIBLES_USE_GHCR is truthy (1/true/yes). Kept off by
+    default so the deploy file keeps building from source until GHCR images exist.
+    """
+    if os.environ.get("EQUIBLES_USE_GHCR", "0").lower() not in {"1", "true", "yes"}:
+        return
+    for svc, img in IMAGE_MAP.items():
+        if svc in services:
+            services[svc].pop("build", None)
+            services[svc]["image"] = f"{GHCR_REPO}/{img}:{IMAGE_TAG}"
+
+
 def main() -> int:
     merged: object = {}
     for path in (BASE, EMBED, STEALTH):
@@ -58,8 +79,12 @@ def main() -> int:
     for key in [k for k in list(merged.keys()) if str(k).startswith("x-")]:
         del merged[key]
 
+    services = merged.setdefault("services", {})
     # Force the env-settable db host port (Meridian's only divergence).
-    merged.setdefault("services", {})["db"]["ports"] = [DB_PORT]
+    services["db"]["ports"] = [DB_PORT]
+
+    # Optional: serve prebuilt GHCR images instead of building from source.
+    rewrite_to_images(services)
 
     with open(OUT, "w") as fh:
         yaml.safe_dump(merged, fh, sort_keys=False, default_flow_style=False, width=1000)
