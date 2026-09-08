@@ -18,9 +18,6 @@ services:
       retries: 5
       start_period: 30s
   mcp:
-    build:
-      context: .
-      dockerfile: src/Equibles.Mcp.Server/Dockerfile
     ports:
     - 8081:8080
     environment:
@@ -37,10 +34,8 @@ services:
     depends_on:
       web:
         condition: service_healthy
+    image: ghcr.io/stoyanov-x/equibles-mcp:main
   web:
-    build:
-      context: .
-      dockerfile: src/Equibles.Web/Dockerfile
     ports:
     - 8080:8080
     environment:
@@ -67,10 +62,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    image: ghcr.io/stoyanov-x/equibles-web:main
   worker:
-    build:
-      context: .
-      dockerfile: src/Equibles.Worker.Host/Dockerfile
     env_file:
     - path: .env
       required: false
@@ -95,6 +88,7 @@ services:
         condition: service_completed_successfully
       cloakbrowser:
         condition: service_started
+    image: ghcr.io/stoyanov-x/equibles-worker:main
   embedding:
     image: ollama/ollama:latest
     ports:
