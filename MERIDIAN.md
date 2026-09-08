@@ -4,6 +4,18 @@ This is a fork of [`daniel3303/Equibles`](https://github.com/daniel3303/Equibles
 that Meridian self-hosts on its Hetzner + Coolify box (`coolify-hel1-36.stoyanov.sh`).
 It is kept in sync with upstream by `.github/workflows/sync-upstream.yml`.
 
+## Single deploy file
+
+Coolify runs exactly ONE compose file. `docker-compose.deploy.yml` is the
+self-contained stack we deploy: upstream's `docker-compose.yml` **+**
+`docker-compose.embedding.yml` (Ollama embeddings ON) **+**
+`docker-compose.stealth.yml` (CloakBrowser) **+** our env-settable db port, merged
+into one standalone file. Point the app's **Docker Compose Location** at
+`/docker-compose.deploy.yml`.
+
+The upstream layered files (`docker-compose.yml`, `-embedding.yml`, `-stealth.yml`)
+are kept as-is for clean upstream sync; they are NOT deployed directly.
+
 ## The only change vs upstream
 
 Upstream's `docker-compose.yml` publishes the ParadeDB/Postgres service on host
@@ -38,7 +50,8 @@ the same `db: ports:` block, the sync workflow will conflict and surface it.
 ## Deploy (Coolify)
 
 1. App → **Public repository** → `stoyanov-x/Equibles`, branch `main`, build pack
-   **Docker Compose**.
+   **Docker Compose**, and set **Docker Compose Location** to
+   `/docker-compose.deploy.yml`.
 2. Set the env vars above (at minimum `EQUIBLES_DB_EXPOSE_PORT=15432` and
    `SEC_CONTACT_EMAIL`).
 3. Do **not** use a pre/post-deployment command — Coolify execs those into a single
@@ -48,13 +61,13 @@ the same `db: ports:` block, the sync workflow will conflict and surface it.
 > The stack needs one free host port for the DB that isn't `5432`. `15432` is the
 > suggested default. If the host Postgres ever moves, you can set `5433`, etc.
 
-## Embeddings (optional, off by default)
+## Embeddings + stealth
 
-This compose runs without the Ollama embedding stack by default (upstream keeps it
-behind `docker-compose.embedding.yml`, `Embedding__Enabled` defaults to `false`).
-If/when you want semantic search over filings, run the separate embedding compose
-or add those two services to the stack — note it pulls `qwen3-embedding:0.6b` on
-first run.
+`docker-compose.deploy.yml` includes the Ollama `embedding` + `embedding-pull`
+services (embeddings ON, `qwen3-embedding:0.6b`) and the `cloakbrowser` sidecar
+(worker stealth fetch for bot-challenged IR sites). Ollama pulls its model on first
+start (a few GB + RAM). If you ever want embeddings OFF, revert to deploying plain
+`docker-compose.yml` instead.
 
 ## License / AGPL
 
