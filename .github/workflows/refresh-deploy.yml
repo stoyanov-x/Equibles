@@ -1,0 +1,50 @@
+name: Hydrate deploy compose
+
+# Regenerates docker-compose.deploy.yml from the upstream layered files
+# (docker-compose.yml + .embedding.yml + .stealth.yml) so the fork keeps
+# docker-compose.yml pristine and the single deploy file stays in sync.
+# Runs daily (after the weekly upstream sync) and on demand.
+
+on:
+  schedule:
+    - cron: "23 3 * * *"   # daily 03:23 UTC (upstream sync is Mon 03:17 UTC)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hydrate-deploy
+  cancel-in-progress: false
+
+jobs:
+  hydrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install pyyaml
+
+      - name: Hydrate docker-compose.deploy.yml
+        run: python scripts/hydrate_deploy.py
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docker-compose.deploy.yml
+          if git diff --cached --quiet; then
+            echo "No changes to docker-compose.deploy.yml"
+          else
+            git commit -m "chore(deploy): hydrate docker-compose.deploy.yml"
+            git push origin main
+          fi

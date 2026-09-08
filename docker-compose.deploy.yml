@@ -1,76 +1,58 @@
-# MERIDIAN self-contained deploy compose.
-#
-# Coolify runs exactly ONE compose file, so this is the merged, standalone
-# equivalent of upstream's layered files:
-#   docker-compose.yml          (db/web/mcp/worker)
-# + docker-compose.embedding.yml (embeddings ON + Ollama)
-# + docker-compose.stealth.yml   (CloakBrowser for bot-challenged IR sites)
-#
-# Why merged (not `include:` / multiple -f): Coolify passes exactly one `-f`
-# file, and `include:` forbids the same service in more than one file — but
-# the embedding/stealth files re-define web/mcp/worker, so they can only be
-# layered via -f. Hence this single self-contained file.
-#
-# The only Meridian divergence from upstream is the db host port, made
-# env-settable via EQUIBLES_DB_EXPOSE_PORT (default 5432). web/mcp/worker reach
-# db internally as db:5432.
-#
-# Keep all ${VAR:-...} placeholders: Coolify injects these at runtime.
-# NOTE: on upstream sync, reconcile this snapshot against the 3 source files.
-
-x-embedding-environment: &embedding-environment
-  Embedding__Enabled: "true"
-  Embedding__Provider: "Ollama"
-  Embedding__BaseUrl: "http://embedding:11434"
-  Embedding__ModelName: "qwen3-embedding:0.6b"
-  Embedding__ApiKey: ""
-  Embedding__BatchSize: "10"
-
 services:
   db:
     image: paradedb/paradedb:latest
     ports:
-      - "${EQUIBLES_DB_EXPOSE_PORT:-5432}:5432"
+    - ${EQUIBLES_DB_EXPOSE_PORT:-5432}:5432
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: equibles
     volumes:
-      - db-data:/var/lib/postgresql
+    - db-data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h localhost -U postgres -d equibles"]
+      test:
+      - CMD-SHELL
+      - pg_isready -h localhost -U postgres -d equibles
       interval: 5s
       timeout: 5s
       retries: 5
       start_period: 30s
-
   mcp:
     build:
       context: .
       dockerfile: src/Equibles.Mcp.Server/Dockerfile
     ports:
-      - "8081:8080"
+    - 8081:8080
     environment:
-      <<: *embedding-environment
-      ConnectionStrings__DefaultConnection: "Host=db;Database=equibles;Username=postgres;Password=postgres"
+      Embedding__Enabled: 'true'
+      Embedding__Provider: Ollama
+      Embedding__BaseUrl: http://embedding:11434
+      Embedding__ModelName: qwen3-embedding:0.6b
+      Embedding__ApiKey: ''
+      Embedding__BatchSize: '10'
+      ConnectionStrings__DefaultConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
       McpApiKey: ${MCP_API_KEY:-}
       MinimumLogLevel: ${MINIMUM_LOG_LEVEL:-Warning}
       Worker__MinSyncDate: ${Worker__MinSyncDate:-}
     depends_on:
       web:
         condition: service_healthy
-
   web:
     build:
       context: .
       dockerfile: src/Equibles.Web/Dockerfile
     ports:
-      - "8080:8080"
+    - 8080:8080
     environment:
-      <<: *embedding-environment
-      ConnectionStrings__DefaultConnection: "Host=db;Database=equibles;Username=postgres;Password=postgres"
-      ConnectionStrings__TransportConnection: "Host=db;Database=equibles;Username=postgres;Password=postgres"
-      MassTransit__RunMigration: "true"
+      Embedding__Enabled: 'true'
+      Embedding__Provider: Ollama
+      Embedding__BaseUrl: http://embedding:11434
+      Embedding__ModelName: qwen3-embedding:0.6b
+      Embedding__ApiKey: ''
+      Embedding__BatchSize: '10'
+      ConnectionStrings__DefaultConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
+      ConnectionStrings__TransportConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
+      MassTransit__RunMigration: 'true'
       Auth__Username: ${AUTH_USERNAME:-}
       Auth__Password: ${AUTH_PASSWORD:-}
       McpApiKey: ${MCP_API_KEY:-}
@@ -81,27 +63,31 @@ services:
       CheckForUpdates: ${CHECK_FOR_UPDATES:-true}
       Worker__MinSyncDate: ${Worker__MinSyncDate:-}
     volumes:
-      - web-keys:/app/keys
+    - web-keys:/app/keys
     depends_on:
       db:
         condition: service_healthy
-
   worker:
     build:
       context: .
       dockerfile: src/Equibles.Worker.Host/Dockerfile
     env_file:
-      - path: .env
-        required: false
+    - path: .env
+      required: false
     environment:
-      <<: *embedding-environment
-      ConnectionStrings__DefaultConnection: "Host=db;Database=equibles;Username=postgres;Password=postgres"
-      ConnectionStrings__TransportConnection: "Host=db;Database=equibles;Username=postgres;Password=postgres"
-      MassTransit__RunMigration: "true"
+      Embedding__Enabled: 'true'
+      Embedding__Provider: Ollama
+      Embedding__BaseUrl: http://embedding:11434
+      Embedding__ModelName: qwen3-embedding:0.6b
+      Embedding__ApiKey: ''
+      Embedding__BatchSize: '10'
+      ConnectionStrings__DefaultConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
+      ConnectionStrings__TransportConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
+      MassTransit__RunMigration: 'true'
       Sec__ContactEmail: ${SEC_CONTACT_EMAIL}
       MinimumLogLevel: ${MINIMUM_LOG_LEVEL:-Warning}
-      InvestorRelationsDiscovery__StealthFetch__Enabled: "true"
-      InvestorRelationsDiscovery__StealthFetch__SidecarUrl: "http://cloakbrowser:9222"
+      InvestorRelationsDiscovery__StealthFetch__Enabled: 'true'
+      InvestorRelationsDiscovery__StealthFetch__SidecarUrl: http://cloakbrowser:9222
     depends_on:
       web:
         condition: service_healthy
@@ -109,37 +95,40 @@ services:
         condition: service_completed_successfully
       cloakbrowser:
         condition: service_started
-
   embedding:
     image: ollama/ollama:latest
     ports:
-      - "11434:11434"
+    - 11434:11434
     volumes:
-      - ollama-data:/root/.ollama
+    - ollama-data:/root/.ollama
     healthcheck:
-      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      test:
+      - CMD-SHELL
+      - ollama list >/dev/null 2>&1 || exit 1
       interval: 10s
       timeout: 5s
       retries: 10
-
   embedding-pull:
     image: ollama/ollama:latest
     depends_on:
       embedding:
         condition: service_healthy
-    restart: "no"
-    entrypoint: ["ollama", "pull", "qwen3-embedding:0.6b"]
+    restart: 'no'
+    entrypoint:
+    - ollama
+    - pull
+    - qwen3-embedding:0.6b
     environment:
       OLLAMA_HOST: http://embedding:11434
-
   cloakbrowser:
     image: cloakhq/cloakbrowser:0.3.31@sha256:61dee1b490ee8f74b040bc02c3d5384c7f64420b87ccaa26a33f213d07df3f73
-    command: ["cloakserve", "--idle-timeout=300"]
+    command:
+    - cloakserve
+    - --idle-timeout=300
     expose:
-      - "9222"
+    - '9222'
     restart: unless-stopped
-
 volumes:
-  db-data:
-  web-keys:
-  ollama-data:
+  db-data: null
+  web-keys: null
+  ollama-data: null

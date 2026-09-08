@@ -10,11 +10,7 @@ services:
   db:
     image: paradedb/paradedb:latest
     ports:
-      # Host port is env-settable so it can't collide with the Meridian host's
-      # existing Postgres bound to 127.0.0.1:5432. Default stays 5432; set
-      # EQUIBLES_DB_EXPOSE_PORT (e.g. 15432) in the deploy environment to move
-      # it. web/mcp/worker still reach db over the internal network as db:5432.
-      - "${EQUIBLES_DB_EXPOSE_PORT:-5432}:5432"
+      - "5432:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
