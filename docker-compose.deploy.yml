@@ -21,12 +21,12 @@ services:
     ports:
     - 8081:8080
     environment:
-      Embedding__Enabled: 'true'
-      Embedding__Provider: Ollama
-      Embedding__BaseUrl: http://embedding:11434
-      Embedding__ModelName: qwen3-embedding:0.6b
-      Embedding__ApiKey: ''
-      Embedding__BatchSize: '10'
+      Embedding__Enabled: ${Embedding__Enabled:-false}
+      Embedding__Provider: ${Embedding__Provider:-Ollama}
+      Embedding__BaseUrl: ${Embedding__BaseUrl:-http://localhost:11434}
+      Embedding__ModelName: ${Embedding__ModelName:-qwen3-embedding:0.6b}
+      Embedding__ApiKey: ${Embedding__ApiKey:-}
+      Embedding__BatchSize: ${Embedding__BatchSize:-10}
       ConnectionStrings__DefaultConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
       McpApiKey: ${MCP_API_KEY:-}
       MinimumLogLevel: ${MINIMUM_LOG_LEVEL:-Warning}
@@ -39,12 +39,12 @@ services:
     ports:
     - 8080:8080
     environment:
-      Embedding__Enabled: 'true'
-      Embedding__Provider: Ollama
-      Embedding__BaseUrl: http://embedding:11434
-      Embedding__ModelName: qwen3-embedding:0.6b
-      Embedding__ApiKey: ''
-      Embedding__BatchSize: '10'
+      Embedding__Enabled: ${Embedding__Enabled:-false}
+      Embedding__Provider: ${Embedding__Provider:-Ollama}
+      Embedding__BaseUrl: ${Embedding__BaseUrl:-http://localhost:11434}
+      Embedding__ModelName: ${Embedding__ModelName:-qwen3-embedding:0.6b}
+      Embedding__ApiKey: ${Embedding__ApiKey:-}
+      Embedding__BatchSize: ${Embedding__BatchSize:-10}
       ConnectionStrings__DefaultConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
       ConnectionStrings__TransportConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
       MassTransit__RunMigration: 'true'
@@ -68,12 +68,12 @@ services:
     - path: .env
       required: false
     environment:
-      Embedding__Enabled: 'true'
-      Embedding__Provider: Ollama
-      Embedding__BaseUrl: http://embedding:11434
-      Embedding__ModelName: qwen3-embedding:0.6b
-      Embedding__ApiKey: ''
-      Embedding__BatchSize: '10'
+      Embedding__Enabled: ${Embedding__Enabled:-false}
+      Embedding__Provider: ${Embedding__Provider:-Ollama}
+      Embedding__BaseUrl: ${Embedding__BaseUrl:-http://localhost:11434}
+      Embedding__ModelName: ${Embedding__ModelName:-qwen3-embedding:0.6b}
+      Embedding__ApiKey: ${Embedding__ApiKey:-}
+      Embedding__BatchSize: ${Embedding__BatchSize:-10}
       ConnectionStrings__DefaultConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
       ConnectionStrings__TransportConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
       MassTransit__RunMigration: 'true'
@@ -84,36 +84,9 @@ services:
     depends_on:
       web:
         condition: service_healthy
-      embedding-pull:
-        condition: service_completed_successfully
       cloakbrowser:
         condition: service_started
     image: ghcr.io/stoyanov-x/equibles-worker:main
-  embedding:
-    image: ollama/ollama:latest
-    ports:
-    - 11434:11434
-    volumes:
-    - ollama-data:/root/.ollama
-    healthcheck:
-      test:
-      - CMD-SHELL
-      - ollama list >/dev/null 2>&1 || exit 1
-      interval: 10s
-      timeout: 5s
-      retries: 10
-  embedding-pull:
-    image: ollama/ollama:latest
-    depends_on:
-      embedding:
-        condition: service_healthy
-    restart: 'no'
-    entrypoint:
-    - ollama
-    - pull
-    - qwen3-embedding:0.6b
-    environment:
-      OLLAMA_HOST: http://embedding:11434
   cloakbrowser:
     image: cloakhq/cloakbrowser:0.3.31@sha256:61dee1b490ee8f74b040bc02c3d5384c7f64420b87ccaa26a33f213d07df3f73
     command:
@@ -125,4 +98,3 @@ services:
 volumes:
   db-data: null
   web-keys: null
-  ollama-data: null
