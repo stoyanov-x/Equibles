@@ -16,6 +16,18 @@ into one standalone file. Point the app's **Docker Compose Location** at
 The upstream layered files (`docker-compose.yml`, `-embedding.yml`, `-stealth.yml`)
 are kept as-is for clean upstream sync; they are NOT deployed directly.
 
+> **Why not `include:` or multiple `-f`?** Coolify runs exactly one `-f` file, so
+> overlays can't be layered at deploy time. `include:` was also tested and fails —
+> the embedding/stealth files re-define `web`/`mcp`/`worker`, and `include:` rejects
+> the same service in more than one file (`... conflicts with imported resource`).
+> A single deployable file therefore must be self-contained.
+>
+> **Drift:** `docker-compose.deploy.yml` is a snapshot of the 3 source files. On an
+> upstream sync, reconcile it: re-merge the 3 files (e.g. `docker compose -f
+> docker-compose.yml -f docker-compose.embedding.yml -f docker-compose.stealth.yml
+> config`) and re-apply the env-settable db port. If you don't need embeddings/stealth,
+> point Coolify at plain `docker-compose.yml` instead — zero duplication, auto-synced.
+
 ## The only change vs upstream
 
 Upstream's `docker-compose.yml` publishes the ParadeDB/Postgres service on host

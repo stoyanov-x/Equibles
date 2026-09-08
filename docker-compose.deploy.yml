@@ -6,12 +6,17 @@
 # + docker-compose.embedding.yml (embeddings ON + Ollama)
 # + docker-compose.stealth.yml   (CloakBrowser for bot-challenged IR sites)
 #
+# Why merged (not `include:` / multiple -f): Coolify passes exactly one `-f`
+# file, and `include:` forbids the same service in more than one file — but
+# the embedding/stealth files re-define web/mcp/worker, so they can only be
+# layered via -f. Hence this single self-contained file.
+#
 # The only Meridian divergence from upstream is the db host port, made
-# env-settable via EQUIBLES_DB_EXPOSE_PORT (default 5432) so it can't collide
-# with the host's existing Postgres on 127.0.0.1:5432. web/mcp/worker reach db
-# over the internal network as db:5432, so nothing else changes.
+# env-settable via EQUIBLES_DB_EXPOSE_PORT (default 5432). web/mcp/worker reach
+# db internally as db:5432.
 #
 # Keep all ${VAR:-...} placeholders: Coolify injects these at runtime.
+# NOTE: on upstream sync, reconcile this snapshot against the 3 source files.
 
 x-embedding-environment: &embedding-environment
   Embedding__Enabled: "true"
@@ -33,10 +38,6 @@ services:
     volumes:
       - db-data:/var/lib/postgresql
     healthcheck:
-      # -h localhost forces a TCP probe. Without it, pg_isready hits the Unix
-      # socket and reports healthy during ParadeDB's init phase — before the
-      # init script shuts Postgres down and restarts it on TCP. Apps connect
-      # over TCP, so this matches reality.
       test: ["CMD-SHELL", "pg_isready -h localhost -U postgres -d equibles"]
       interval: 5s
       timeout: 5s
@@ -69,10 +70,6 @@ services:
       <<: *embedding-environment
       ConnectionStrings__DefaultConnection: "Host=db;Database=equibles;Username=postgres;Password=postgres"
       ConnectionStrings__TransportConnection: "Host=db;Database=equibles;Username=postgres;Password=postgres"
-      # Web boots before worker (worker depends on web). Without this flag the
-      # bus has no schema to connect to, fails its health check, and /healthz
-      # never goes ready — leaving worker stuck on `web: service_healthy`.
-      # Schema creation is idempotent, so it's safe that worker may also run it.
       MassTransit__RunMigration: "true"
       Auth__Username: ${AUTH_USERNAME:-}
       Auth__Password: ${AUTH_PASSWORD:-}
@@ -82,7 +79,6 @@ services:
       Fred__ApiKey: ${Fred__ApiKey:-}
       MinimumLogLevel: ${MINIMUM_LOG_LEVEL:-Warning}
       CheckForUpdates: ${CHECK_FOR_UPDATES:-true}
-      # Same backfill floor the worker uses — historical charts/tables clamp to it.
       Worker__MinSyncDate: ${Worker__MinSyncDate:-}
     volumes:
       - web-keys:/app/keys
@@ -104,7 +100,6 @@ services:
       MassTransit__RunMigration: "true"
       Sec__ContactEmail: ${SEC_CONTACT_EMAIL}
       MinimumLogLevel: ${MINIMUM_LOG_LEVEL:-Warning}
-      # CloakBrowser sidecar (stealth) for bot-challenged investor-relations sites.
       InvestorRelationsDiscovery__StealthFetch__Enabled: "true"
       InvestorRelationsDiscovery__StealthFetch__SidecarUrl: "http://cloakbrowser:9222"
     depends_on:
@@ -115,7 +110,6 @@ services:
       cloakbrowser:
         condition: service_started
 
-  # Ollama embeddings backend.
   embedding:
     image: ollama/ollama:latest
     ports:
@@ -128,7 +122,6 @@ services:
       timeout: 5s
       retries: 10
 
-  # One-shot: pull the embedding model before worker starts.
   embedding-pull:
     image: ollama/ollama:latest
     depends_on:
@@ -139,8 +132,6 @@ services:
     environment:
       OLLAMA_HOST: http://embedding:11434
 
-  # Third-party stealth Chromium (CloakBrowser) for IR sites with bot challenges.
-  # CDP endpoint stays internal; this container receives no secrets or volumes.
   cloakbrowser:
     image: cloakhq/cloakbrowser:0.3.31@sha256:61dee1b490ee8f74b040bc02c3d5384c7f64420b87ccaa26a33f213d07df3f73
     command: ["cloakserve", "--idle-timeout=300"]
