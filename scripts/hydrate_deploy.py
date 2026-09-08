@@ -9,10 +9,11 @@ Unlike `docker compose config` (which resolves every ${VAR} and would bake secre
 to empty), this merge operates on the YAML structure and PRESERVES ${VAR:-...}
 placeholders so Coolify can still inject secrets at deploy time.
 
-Merge order (later overrides earlier):
+Merge order (later overrides earlier; overlays optional via EQUIBLES_EMBEDDINGS /
+EQUIBLES_CLOAK, default on):
     docker-compose.yml            base (db/web/mcp/worker)
-    docker-compose.embedding.yml  embeddings ON + Ollama services
-    docker-compose.stealth.yml    CloakBrowser sidecar + worker stealth fetch
+    docker-compose.embedding.yml  embeddings ON + Ollama services  (EQUIBLES_EMBEDDINGS)
+    docker-compose.stealth.yml    CloakBrowser sidecar + stealth    (EQUIBLES_CLOAK)
 
 Meridian-only change applied here (NOT in any upstream file): db host port ->
 ${EQUIBLES_DB_EXPOSE_PORT:-5432}:5432 so it can't collide with the host's Postgres.
@@ -31,6 +32,16 @@ STEALTH = "docker-compose.stealth.yml"
 OUT = "docker-compose.deploy.yml"
 
 DB_PORT = "${EQUIBLES_DB_EXPOSE_PORT:-5432}:5432"
+
+
+def _truthy(v) -> bool:
+    return v is not None and str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Optional overlays, each independently disableable via env/repo vars.
+# Default on (upstream files are all included when vars are unset).
+INCLUDE_EMBEDDINGS = _truthy(os.environ.get("EQUIBLES_EMBEDDINGS", "1"))
+INCLUDE_CLOAK = _truthy(os.environ.get("EQUIBLES_CLOAK", "1"))
 
 
 def merge(base: object, over: object) -> object:
@@ -69,8 +80,14 @@ def rewrite_to_images(services: dict) -> None:
 
 
 def main() -> int:
+    files = [BASE]
+    if INCLUDE_EMBEDDINGS:
+        files.append(EMBED)
+    if INCLUDE_CLOAK:
+        files.append(STEALTH)
+
     merged: object = {}
-    for path in (BASE, EMBED, STEALTH):
+    for path in files:
         merged = merge(merged, load(path))
 
     merged = dict(merged)

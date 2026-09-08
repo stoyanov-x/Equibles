@@ -36,9 +36,10 @@ jobs:
 
       - name: Hydrate docker-compose.deploy.yml
         env:
-          # Switch to prebuilt GHCR images once build-push has published them.
-          # Inert (empty) until the repo variable is set, so hydrate stays build-based by default.
+          # Repo vars -> hydrate flags. GHCR=image refs; EMBEDDINGS/CLOAK toggle overlays.
           EQUIBLES_USE_GHCR: ${{ vars.EQUIBLES_USE_GHCR }}
+          EQUIBLES_EMBEDDINGS: ${{ vars.EQUIBLES_EMBEDDINGS }}
+          EQUIBLES_CLOAK: ${{ vars.EQUIBLES_CLOAK }}
         run: python scripts/hydrate_deploy.py
 
       - name: Commit if changed
