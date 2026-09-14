@@ -15,7 +15,13 @@ services:
     # so memory stays generous (shared_buffers alone is ~954 MB) and only CPU is
     # squeezed.
     cpus: "0.5"
-    mem_limit: 1536m
+    # Sized from measured cgroup memory, not guesswork. Postgres is NOT
+    # cgroup-aware: it will happily exceed a limit and get OOM-killed, so this
+    # must clear its non-reclaimable floor (anon ~98 MB + shared_buffers
+    # ~991 MB + kernel/slab ~85 MB, i.e. ~1.15 GiB) while still leaving room for
+    # page cache and sort/hash spares. 1536m left only ~360 MB of cache, which
+    # would just push reads back to disk, so 2048m.
+    mem_limit: 2048m
     # ParadeDB ships max_parallel_workers=10. On 2 cores that lets many concurrent
     # sessions each claim a parallel worker and saturate the CPU. Cap the global
     # pool (max_parallel_workers_per_gather is already 1) and maintenance too.

@@ -2,7 +2,7 @@ services:
   db:
     image: paradedb/paradedb:latest
     cpus: '0.5'
-    mem_limit: 1536m
+    mem_limit: 2048m
     command:
     - postgres
     - -c
