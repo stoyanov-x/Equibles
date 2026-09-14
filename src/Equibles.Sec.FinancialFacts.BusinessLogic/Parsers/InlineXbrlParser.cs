@@ -103,7 +103,74 @@ public class InlineXbrlParser
         {
             Facts = facts,
             CoverListings = ExtractCoverListings(document),
+            FiscalYearEnds = ExtractFiscalYearEnds(document, contexts, namespaces),
         };
+    }
+
+    private static List<ParsedFiscalYearEnd> ExtractFiscalYearEnds(
+        IDocument document,
+        Dictionary<string, ParsedContext> contexts,
+        Dictionary<string, string> namespaces
+    )
+    {
+        var observations = new List<ParsedFiscalYearEnd>();
+        foreach (var element in FindByLocalName(document, NonNumericLocalName))
+        {
+            if (
+                (element.GetAttribute("xsi:nil") ?? element.GetAttribute("nil")) == "1"
+                || string.Equals(
+                    element.GetAttribute("xsi:nil") ?? element.GetAttribute("nil"),
+                    "true",
+                    StringComparison.OrdinalIgnoreCase
+                )
+            )
+                continue;
+            var name = element.GetAttribute("name") ?? "";
+            var parts = name.Split(':');
+            if (
+                parts.Length != 2
+                || parts[1] != "CurrentFiscalYearEndDate"
+                || !namespaces.TryGetValue(parts[0], out var namespaceValue)
+                || !Uri.TryCreate(namespaceValue, UriKind.Absolute, out var namespaceUri)
+                || namespaceUri.Host != "xbrl.sec.gov"
+                || !namespaceUri.AbsolutePath.StartsWith("/dei/", StringComparison.Ordinal)
+            )
+                continue;
+            var contextRef =
+                element.GetAttribute("contextRef") ?? element.GetAttribute("contextref");
+            if (
+                contextRef == null
+                || !contexts.TryGetValue(contextRef, out var context)
+                || string.IsNullOrWhiteSpace(context.ConsolidatedCik)
+            )
+                continue;
+            var format = element.GetAttribute("format");
+            var formatParts = format?.Split(':');
+            if (
+                !string.IsNullOrWhiteSpace(format)
+                && (formatParts?.Length != 2 || formatParts.Any(string.IsNullOrWhiteSpace))
+            )
+                continue;
+            if (
+                !FiscalYearEndValueParser.TryParse(
+                    element.TextContent,
+                    out var date,
+                    formatParts?.Last(),
+                    formatParts?.Length == 2 ? ResolveNamespace(element, formatParts[0]) : null
+                )
+            )
+                continue;
+            observations.Add(
+                new ParsedFiscalYearEnd(
+                    context.ConsolidatedCik,
+                    context.Start,
+                    context.End,
+                    date.Month,
+                    date.Day
+                )
+            );
+        }
+        return observations.Distinct().ToList();
     }
 
     /// <summary>
@@ -182,6 +249,19 @@ public class InlineXbrlParser
         if (string.IsNullOrWhiteSpace(value))
             return null;
         return string.Join(' ', value.Split((char[])null, StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    private static string ResolveNamespace(IElement element, string prefix)
+    {
+        for (var current = element; current != null; current = current.ParentElement)
+        {
+            var attribute = current.Attributes.FirstOrDefault(a =>
+                a.Name.Equals("xmlns:" + prefix, StringComparison.OrdinalIgnoreCase)
+            );
+            if (attribute != null)
+                return attribute.Value;
+        }
+        return null;
     }
 
     /// <summary>

@@ -1,14 +1,21 @@
+using System.Reflection;
 using Equibles.CommonStocks.Data.Models;
 using Equibles.Data;
+using Equibles.Errors.BusinessLogic;
+using Equibles.Errors.Data.Models;
 using Equibles.IntegrationTests.Helpers;
 using Equibles.Media.BusinessLogic;
 using Equibles.Sec.Data.Models;
 using Equibles.Sec.FinancialFacts.BusinessLogic.Parsers;
 using Equibles.Sec.FinancialFacts.Data.Enums;
 using Equibles.Sec.FinancialFacts.Data.Models;
+using Equibles.Sec.FinancialFacts.HostedService;
+using Equibles.Sec.FinancialFacts.HostedService.Configuration;
 using Equibles.Sec.FinancialFacts.HostedService.Services;
 using Equibles.Sec.FinancialFacts.Repositories;
+using Equibles.Sec.Repositories;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using NSubstitute;
 using Xunit;
 using File = Equibles.Media.Data.Models.File;
@@ -65,9 +72,17 @@ public class XbrlFactExtractionServiceExtractTests : ParadeDbMcpTestBase
         dimension.Axis.Should().Be("srt:ProductOrServiceAxis");
         dimension.Member.Should().Be("aapl:IPhoneMember");
 
-        // Idempotency: a second sweep over the same envelope changes nothing.
+        // A version replay repairs derived labels without duplicating facts or dimensions.
+        var factId = fact.Id;
+        fact.FiscalYear = 2024;
+        fact.FiscalPeriod = SecFiscalPeriod.Q4;
+        await DbContext.SaveChangesAsync();
         var secondRun = await sut.Extract(document, CancellationToken.None);
         secondRun.Should().Be(1);
+        await DbContext.Entry(fact).ReloadAsync();
+        fact.Id.Should().Be(factId);
+        fact.FiscalYear.Should().Be(2025);
+        fact.FiscalPeriod.Should().Be(SecFiscalPeriod.Q1);
         (
             await DbContext
                 .Set<FinancialFact>()
@@ -84,7 +99,153 @@ public class XbrlFactExtractionServiceExtractTests : ParadeDbMcpTestBase
             .Be(1);
     }
 
-    private XbrlFactExtractionService BuildSut()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Extract_CalendarChange_RepairsLabelsUsingTheCapturedHistoricalCalendar(
+        bool offPeriodFact
+    )
+    {
+        var envelope = InlineEnvelope()
+            .Replace("<html ", "<html xmlns:dei=\"http://xbrl.sec.gov/dei/2025\" ")
+            .Replace("scheme=\"cik\"", "scheme=\"http://www.sec.gov/CIK\"")
+            .Replace(
+                "</body>",
+                "<ix:nonNumeric name=\"dei:CurrentFiscalYearEndDate\" contextRef=\"Consolidated\">--12-31</ix:nonNumeric></body>"
+            );
+        if (offPeriodFact)
+            envelope = envelope.Replace(
+                "</body>",
+                """
+                <xbrli:context id="Future"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0000320193</xbrli:identifier>
+                <xbrli:segment><xbrldi:explicitMember dimension="srt:ProductOrServiceAxis">aapl:IPhoneMember</xbrldi:explicitMember></xbrli:segment>
+                </xbrli:entity><xbrli:period><xbrli:instant>2025-04-01</xbrli:instant></xbrli:period></xbrli:context>
+                <ix:nonFraction name="us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax" contextRef="Future" unitRef="usd">123</ix:nonFraction>
+                </body>
+                """
+            );
+        var document = await SeedDocument(envelope);
+        await BuildSut().Extract(document, CancellationToken.None);
+        var fact = await DbContext
+            .Set<FinancialFact>()
+            .SingleAsync(f =>
+                f.DocumentId == document.Id && f.PeriodEnd == document.ReportingForDate
+            );
+        var originalId = fact.Id;
+        var originalValue = fact.Value;
+        var originalUnresolvedPeriod = offPeriodFact
+            ? (
+                await DbContext
+                    .Set<FinancialFact>()
+                    .SingleAsync(f =>
+                        f.DocumentId == document.Id && f.PeriodEnd == new DateOnly(2025, 4, 1)
+                    )
+            ).FiscalPeriod
+            : default;
+        fact.FiscalPeriod = SecFiscalPeriod.Q3;
+        document.Issuer.FiscalYearEndMonth = 6;
+        document.Issuer.FiscalYearEndDay = 30;
+        var annual = new Document
+        {
+            Issuer = document.Issuer,
+            Content = document.Content,
+            DocumentType = DocumentType.TenK,
+            ReportingForDate = new(2024, 12, 31),
+            ReportingDate = new(2025, 2, 1),
+            AccessionNumber = "0000320193-25-000000",
+        };
+        DbContext.Add(annual);
+        DbContext.Add(
+            new FinancialFact
+            {
+                EquityIssuerId = document.EquityIssuerId,
+                FinancialConceptId = fact.FinancialConceptId,
+                Document = annual,
+                Unit = "USD",
+                PeriodType = FactPeriodType.Duration,
+                PeriodStart = new(2024, 1, 1),
+                PeriodEnd = new(2024, 12, 31),
+                FiscalYear = 2024,
+                FiscalPeriod = SecFiscalPeriod.FullYear,
+                Value = 100m,
+                Form = DocumentType.TenK,
+                FiledDate = annual.ReportingDate,
+                AccessionNumber = annual.AccessionNumber,
+                DimensionsKey = "",
+            }
+        );
+        await DbContext.SaveChangesAsync();
+        if (offPeriodFact)
+        {
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                var pending = await Assert.ThrowsAsync<FiscalCalendarEvidencePendingException>(() =>
+                    BuildSut(true).Extract(document, CancellationToken.None)
+                );
+                pending.PersistedCount.Should().Be(1);
+                pending.DeferredCount.Should().Be(1);
+            }
+            (await DbContext.Set<FinancialFact>().CountAsync(f => f.DocumentId == document.Id))
+                .Should()
+                .Be(2);
+            (
+                await DbContext
+                    .Set<FinancialFactDimension>()
+                    .CountAsync(d => d.FinancialFact.DocumentId == document.Id)
+            )
+                .Should()
+                .Be(2);
+            var unresolved = await DbContext
+                .Set<FinancialFact>()
+                .AsNoTracking()
+                .SingleAsync(f =>
+                    f.DocumentId == document.Id && f.PeriodEnd == new DateOnly(2025, 4, 1)
+                );
+            unresolved.Value.Should().Be(123m);
+            unresolved.FiscalPeriod.Should().Be(originalUnresolvedPeriod);
+
+            var scopes = ServiceScopeSubstitute.Create(
+                (typeof(EquiblesFinancialDbContext), DbContext),
+                (typeof(DocumentRepository), new DocumentRepository(DbContext)),
+                (typeof(XbrlFactExtractionService), BuildSut(true))
+            );
+            var worker = new XbrlFactsExtractionWorker(
+                NullLogger<XbrlFactsExtractionWorker>(),
+                scopes,
+                new ErrorReporter(scopes, NullLogger<ErrorReporter>()),
+                Options.Create(new XbrlFactsExtractionOptions { BatchSize = 1 })
+            );
+            await (Task)
+                typeof(XbrlFactsExtractionWorker)
+                    .GetMethod("DoWork", BindingFlags.Instance | BindingFlags.NonPublic)!
+                    .Invoke(worker, [CancellationToken.None])!;
+            document.XbrlFactsAttempts.Should().Be(Document.MaxXbrlFactsAttempts);
+            document.XbrlFactsVersion.Should().BeLessThan(XbrlFactExtractionService.CurrentVersion);
+            (await DbContext.Set<Error>().CountAsync()).Should().Be(0);
+            (
+                await XbrlFactsExtractionWorker
+                    .SelectDueDocuments(
+                        DbContext
+                            .Set<Document>()
+                            .Where(d => d.XbrlStatus == XbrlCaptureStatus.Captured),
+                        DbContext.Set<FinancialFactsSyncStatus>()
+                    )
+                    .CountAsync()
+            )
+                .Should()
+                .Be(0);
+        }
+        else
+            (await BuildSut(true).Extract(document, CancellationToken.None)).Should().Be(1);
+        await DbContext.Entry(fact).ReloadAsync();
+        fact.Id.Should().Be(originalId);
+        fact.Value.Should().Be(originalValue);
+        fact.FiscalYear.Should().Be(2025);
+        fact.FiscalPeriod.Should().Be(SecFiscalPeriod.Q1);
+        document.Issuer.FiscalYearEndMonth.Should().Be(6);
+    }
+
+    private XbrlFactExtractionService BuildSut(bool historicalCalendar = false)
     {
         var scopeFactory = ServiceScopeSubstitute.Create(
             (typeof(EquiblesFinancialDbContext), DbContext),
@@ -97,7 +258,14 @@ public class XbrlFactExtractionServiceExtractTests : ParadeDbMcpTestBase
             new InlineXbrlParser(),
             new StandaloneXbrlParser(),
             fileManager,
-            NullLogger<XbrlFactExtractionService>()
+            NullLogger<XbrlFactExtractionService>(),
+            historicalCalendar
+                ? new FiscalCalendarEvidenceReader(
+                    scopeFactory,
+                    fileManager,
+                    new InlineXbrlParser()
+                )
+                : null
         );
     }
 
@@ -122,6 +290,8 @@ public class XbrlFactExtractionServiceExtractTests : ParadeDbMcpTestBase
 
         // Model an authoritative API row occupying this exact natural key.
         consolidated.Value = 999m;
+        consolidated.FiscalYear = 2024;
+        consolidated.FiscalPeriod = SecFiscalPeriod.Q4;
         consolidated.DocumentId = null;
         consolidated.Frame = "CY2025Q1";
         await DbContext.SaveChangesAsync();
@@ -130,22 +300,59 @@ public class XbrlFactExtractionServiceExtractTests : ParadeDbMcpTestBase
 
         consolidated.Id.Should().Be(id);
         consolidated.Value.Should().Be(999m);
+        consolidated.FiscalYear.Should().Be(2025);
+        consolidated.FiscalPeriod.Should().Be(SecFiscalPeriod.Q1);
         consolidated.DocumentId.Should().BeNull();
         consolidated.Frame.Should().Be("CY2025Q1");
         (
             await DbContext
                 .Set<FinancialFact>()
-                .CountAsync(f => f.CommonStockId == document.CommonStockId)
+                .CountAsync(f => f.EquityIssuerId == document.EquityIssuerId)
         )
             .Should()
             .Be(2);
     }
 
+    [Fact]
+    public async Task Extract_ForeignInstantWithoutFye_PreservesExistingAnnualIdentity()
+    {
+        var envelope = InlineEnvelope()
+            .Replace("scheme=\"cik\"", "scheme=\"http://www.sec.gov/CIK\"")
+            .Replace(
+                "<xbrli:startDate>2025-01-01</xbrli:startDate><xbrli:endDate>2025-03-31</xbrli:endDate>",
+                "<xbrli:instant>2025-12-31</xbrli:instant>"
+            );
+        var document = await SeedDocument(envelope);
+        document.DocumentType = DocumentType.SixK;
+        document.ReportingDate = new DateOnly(2026, 2, 1);
+        document.ReportingForDate = new DateOnly(2025, 12, 31);
+        document.Issuer.FiscalYearEndMonth = null;
+        document.Issuer.FiscalYearEndDay = null;
+        await DbContext.SaveChangesAsync();
+        var sut = BuildSut();
+        await sut.Extract(document, CancellationToken.None);
+        var consolidated = await DbContext
+            .Set<FinancialFact>()
+            .SingleAsync(f => f.DocumentId == document.Id && f.DimensionsKey == "");
+        consolidated.FiscalYear = 2025;
+        consolidated.FiscalPeriod = SecFiscalPeriod.FullYear;
+        consolidated.Value = 999m;
+        consolidated.DocumentId = null;
+        await DbContext.SaveChangesAsync();
+
+        await sut.Extract(document, CancellationToken.None);
+        await DbContext.Entry(consolidated).ReloadAsync();
+
+        consolidated.FiscalYear.Should().Be(2025);
+        consolidated.FiscalPeriod.Should().Be(SecFiscalPeriod.FullYear);
+        consolidated.Value.Should().Be(999m);
+        consolidated.DocumentId.Should().BeNull();
+    }
+
     private async Task<Document> SeedDocument(string envelope)
     {
-        var stock = new CommonStock
+        var stock = new EquityIssuer
         {
-            Ticker = "AAPL",
             Name = "Apple Inc.",
             Cik = "0000320193",
             FiscalYearEndMonth = 12,
@@ -172,7 +379,7 @@ public class XbrlFactExtractionServiceExtractTests : ParadeDbMcpTestBase
 
         var document = new Document
         {
-            CommonStock = stock,
+            Issuer = stock,
             Content = contentFile,
             DocumentType = DocumentType.TenQ,
             ReportingDate = new DateOnly(2025, 5, 1),

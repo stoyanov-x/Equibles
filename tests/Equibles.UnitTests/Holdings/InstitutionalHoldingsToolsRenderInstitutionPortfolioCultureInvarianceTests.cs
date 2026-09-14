@@ -9,6 +9,62 @@ namespace Equibles.UnitTests.Holdings;
 
 public class InstitutionalHoldingsToolsRenderInstitutionPortfolioCultureInvarianceTests
 {
+    [Fact]
+    public void RenderInstitutionPortfolio_DoesNotApplyEquitySplitToPrincipal()
+    {
+        EquityIssuer stock = Equibles.TestSupport.EquityIssuerSeed.Create(
+            Ticker: "AAPL",
+            Name: "Apple"
+        );
+        var holder = new InstitutionalHolder { Name = "Principal holder", Cik = "123" };
+        var holding = new InstitutionalHolding
+        {
+            Issuer = Equibles.TestSupport.NativeListingSeed.ForStock(null, stock).Security.Issuer,
+            EquityIssuerId = stock.Id,
+            Shares = 123_456,
+            Value = 123_456,
+            ShareType = ShareType.Principal,
+        };
+        var splits = new Dictionary<Guid, List<StockSplit>>
+        {
+            [stock.Id] =
+            [
+                new StockSplit
+                {
+                    EquityIssuerId = stock.Id,
+                    PriceSeriesTicker = stock.Presentation.Listing.Ticker,
+                    EffectiveDate = new DateOnly(2025, 1, 15),
+                    Numerator = 10,
+                    Denominator = 1,
+                },
+            ],
+        };
+        var method = typeof(InstitutionalHoldingsTools).GetMethod(
+            "RenderInstitutionPortfolio",
+            BindingFlags.NonPublic | BindingFlags.Static
+        );
+        var output = (string)
+            method.Invoke(
+                null,
+                [
+                    holder,
+                    new DateOnly(2024, 12, 31),
+                    new List<InstitutionalHolding> { holding },
+                    splits,
+                    0,
+                    1,
+                    1,
+                    123_456L,
+                    0,
+                    null,
+                    null,
+                ]
+            );
+        output.Should().Contain("Principal");
+        output.Should().Contain("123,456");
+        output.Should().NotContain("1,234,560");
+    }
+
     // Adversarial Lane A. RenderInstitutionPortfolio builds the per-holding
     // markdown row via:
     //   $"| {i + 1} | {ticker} | {name} | {h.Shares:N0} | {h.Value / 1_000_000m:N1} |"
@@ -41,12 +97,17 @@ public class InstitutionalHoldingsToolsRenderInstitutionPortfolioCultureInvarian
         );
 
         var holder = new InstitutionalHolder { Name = "ACME Capital", Cik = "0001234567" };
-        var stock = new CommonStock { Ticker = "AAPL", Name = "Apple Inc." };
+        EquityIssuer stock = Equibles.TestSupport.EquityIssuerSeed.Create(
+            Ticker: "AAPL",
+            Name: "Apple Inc."
+        );
         var holdings = new List<InstitutionalHolding>
         {
             new()
             {
-                CommonStock = stock,
+                Issuer = Equibles
+                    .TestSupport.NativeListingSeed.ForStock(null, stock)
+                    .Security.Issuer,
                 Shares = 1_234_567,
                 Value = 1_234_567_890L,
             },

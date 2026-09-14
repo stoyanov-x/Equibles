@@ -58,12 +58,11 @@ public class InstitutionalHoldingsToolsGetTopHoldersExcludes13DGTests
     {
         await using var db = NewDb();
 
-        var apple = new CommonStock
-        {
-            Ticker = "AAPL",
-            Name = "Apple Inc.",
-            Cik = "0000320193",
-        };
+        EquityIssuer apple = Equibles.TestSupport.EquityIssuerSeed.Create(
+            Ticker: "AAPL",
+            Name: "Apple Inc.",
+            Cik: "0000320193"
+        );
         var vanguardCapital = new InstitutionalHolder
         {
             Cik = "0002100119",
@@ -101,12 +100,24 @@ public class InstitutionalHoldingsToolsGetTopHoldersExcludes13DGTests
                 accession: "sc-13g"
             )
         );
+        var principal = MakeHolding(
+            vanguardCapital,
+            apple,
+            quarterEnd,
+            FilingType.Form13F,
+            InvestmentDiscretion.Sole,
+            shares: 9_000_000_000L,
+            value: 45_000_000L,
+            accession: "principal"
+        );
+        principal.ShareType = ShareType.Principal;
+        db.Add(principal);
         await db.SaveChangesAsync();
 
         var sut = new InstitutionalHoldingsTools(
             new InstitutionalHoldingRepository(db),
             new InstitutionalHolderRepository(db),
-            new CommonStockRepository(db),
+            new EquityIssuerRepository(db),
             new StockSplitRepository(db),
             new StockCombinedQuarterService(
                 new InstitutionalHoldingRepository(db),
@@ -122,6 +133,7 @@ public class InstitutionalHoldingsToolsGetTopHoldersExcludes13DGTests
         output.Should().Contain("953,847,648");
         // The Schedule 13G sole-dispositive-power figure must never render as a holding row.
         output.Should().NotContain("1,099,168,953");
+        output.Should().NotContain("9,000,000,000");
         // The filer appears exactly once, not twice.
         CountOccurrences(output, "VANGUARD CAPITAL MANAGEMENT LLC").Should().Be(1);
     }
@@ -140,7 +152,7 @@ public class InstitutionalHoldingsToolsGetTopHoldersExcludes13DGTests
 
     private static InstitutionalHolding MakeHolding(
         InstitutionalHolder holder,
-        CommonStock stock,
+        EquityIssuer stock,
         DateOnly reportDate,
         FilingType filingType,
         InvestmentDiscretion discretion,
@@ -150,7 +162,7 @@ public class InstitutionalHoldingsToolsGetTopHoldersExcludes13DGTests
     ) =>
         new()
         {
-            CommonStockId = stock.Id,
+            EquityIssuerId = stock.Id,
             InstitutionalHolderId = holder.Id,
             FilingDate = reportDate.AddDays(45),
             ReportDate = reportDate,

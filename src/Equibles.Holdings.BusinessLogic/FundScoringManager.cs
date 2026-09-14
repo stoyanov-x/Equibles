@@ -31,13 +31,13 @@ public class FundScoringManager
     private const decimal MaxStorableMagnitude = 9_999_999_999_999m;
 
     private readonly InstitutionalHoldingRepository _holdingRepository;
-    private readonly CommonStockRepository _stockRepository;
+    private readonly EquityIssuerRepository _stockRepository;
     private readonly BacktestPriceLoader _priceLoader;
     private readonly FundScoreRepository _fundScoreRepository;
 
     public FundScoringManager(
         InstitutionalHoldingRepository holdingRepository,
-        CommonStockRepository stockRepository,
+        EquityIssuerRepository stockRepository,
         BacktestPriceLoader priceLoader,
         FundScoreRepository fundScoreRepository
     )
@@ -69,7 +69,7 @@ public class FundScoringManager
         if (benchmarkTicker == null)
             return null;
 
-        var benchmarkStock = await _stockRepository.GetByTicker(benchmarkTicker);
+        EquityIssuer benchmarkStock = await _stockRepository.GetUsByTicker(benchmarkTicker);
         if (benchmarkStock == null)
             return null;
 
@@ -101,7 +101,7 @@ public class FundScoringManager
         InstitutionalHolder holder,
         DateOnly asOf,
         int windowYears,
-        CommonStock benchmarkStock,
+        EquityIssuer benchmarkStock,
         string benchmarkListedTicker
     )
     {
@@ -124,7 +124,7 @@ public class FundScoringManager
             .Where(h => relevant.Contains(h.ReportDate))
             .Select(h => new HoldingRow(
                 h.ReportDate,
-                h.CommonStockId,
+                h.EquityIssuerId,
                 h.ListedTicker,
                 h.Shares,
                 h.Value,
@@ -251,7 +251,9 @@ public class FundScoringManager
     // artifact must not linger on the leaderboard (#3407). A merely out-of-range / non-finite
     // result is treated as transient and keeps the previous score.
     private static bool ShouldDeleteStaleScore(BacktestResult result, bool has13FSnapshots) =>
-        !has13FSnapshots || IsTooShortToAnnualize(result);
+        !has13FSnapshots
+        || result?.HasUncertifiedSplitPrices == true
+        || IsTooShortToAnnualize(result);
 
     // The backtest ran (produced points) but the scored portfolio's own series was below
     // HoldingsBacktestCalculator.MinAnnualizationDays, so its CAGR could not be computed.

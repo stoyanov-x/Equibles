@@ -63,7 +63,7 @@ public class InstitutionalHoldingsTools
 
     private readonly InstitutionalHoldingRepository _holdingRepository;
     private readonly InstitutionalHolderRepository _holderRepository;
-    private readonly CommonStockRepository _commonStockRepository;
+    private readonly EquityIssuerRepository _commonStockRepository;
     private readonly StockSplitRepository _stockSplitRepository;
     private readonly StockCombinedQuarterService _combinedQuarterService;
     private readonly HoldingsCorpusCoverage _corpusCoverage;
@@ -75,7 +75,7 @@ public class InstitutionalHoldingsTools
     public InstitutionalHoldingsTools(
         InstitutionalHoldingRepository holdingRepository,
         InstitutionalHolderRepository holderRepository,
-        CommonStockRepository commonStockRepository,
+        EquityIssuerRepository commonStockRepository,
         StockSplitRepository stockSplitRepository,
         StockCombinedQuarterService combinedQuarterService,
         ErrorManager errorManager,
@@ -151,7 +151,7 @@ public class InstitutionalHoldingsTools
                 // primary stock but would merge sibling ETF series, so ETFs stay exact/as-filed.
                 var isPrimaryListing = string.Equals(
                     listedTicker,
-                    stock.Ticker,
+                    stock.Presentation.Listing.Ticker,
                     StringComparison.OrdinalIgnoreCase
                 );
                 var anchor =
@@ -178,6 +178,7 @@ public class InstitutionalHoldingsTools
                 // both rank and denominator, so a separate raw aggregate/page query would scan
                 // the combined-quarter view twice and could rank a sibling class incorrectly.
                 var holdings = await allHoldings
+                    .Where(h => h.ShareType == ShareType.Shares)
                     .AsNoTracking()
                     .Select(h => new TopHolderRow
                     {
@@ -200,11 +201,15 @@ public class InstitutionalHoldingsTools
                     .ToListAsync();
                 foreach (var holding in holdings)
                 {
-                    var listing = holding.ListedTicker ?? stock.Ticker;
+                    var listing = holding.ListedTicker ?? stock.Presentation.Listing.Ticker;
                     holding.Shares = SplitAdjustment.AdjustShareCount(
                         holding.Shares,
                         holding.ReportDate,
-                        PriceSeriesSplitScope.ForListing(splits, stock.Ticker, listing)
+                        PriceSeriesSplitScope.ForListing(
+                            splits,
+                            stock.Presentation.Listing.Ticker,
+                            listing
+                        )
                     );
                 }
 
@@ -273,7 +278,7 @@ public class InstitutionalHoldingsTools
     // The request path above uses exact-listing adjusted rows because sibling classes can
     // have different split factors; this adapter preserves the former single-factor shape.
     private static string RenderTopHoldersTable(
-        CommonStock stock,
+        EquityIssuer stock,
         string ticker,
         DateOnly targetDate,
         int totalInstitutions,
@@ -313,13 +318,13 @@ public class InstitutionalHoldingsTools
         );
     }
 
-    private static string StockListingLabel(CommonStock stock, string ticker) =>
+    private static string StockListingLabel(EquityIssuer stock, string ticker) =>
         SecondaryTickerPolicy.RequiresExactListingScope(stock, ticker)
             ? ticker
             : $"{stock.Name} ({ticker})";
 
     private static string RenderAdjustedTopHoldersTable(
-        CommonStock stock,
+        EquityIssuer stock,
         string ticker,
         DateOnly targetDate,
         int totalInstitutions,
@@ -404,7 +409,7 @@ public class InstitutionalHoldingsTools
         ReadOnly = true
     )]
     [Description(
-        "Get the historical trend of aggregate reported 13F exposure for an exact stock or ETF listing across multiple quarters. The legacy Total Shares field sums reported quantities across common-share rows, put/call notional-underlying rows, and any tracked principal-denominated rows, so it is not a pure share-ownership measure. Shows how total reported quantity, published position value, and filer count changed. Values normally use report-date closing prices, may fall back to filer values, and can include zero when unavailable. While the newest quarter's filing window is open, non-ETF primary stocks use a provisional combined view; ETF listings remain exact and as-filed because carry-forward is filer-wide."
+        "Get the historical trend of aggregate reported 13F exposure for an exact stock or ETF listing across multiple quarters. The legacy Total Shares field sums reported quantities across common-share rows, put/call notional-underlying rows, and any tracked principal-denominated rows, so it is not a pure share-ownership measure. Shows total reported quantity, published position value, and filer count. Changes are withheld when a relevant filer has no observed 13F in either compared quarter; missing filings and filer identity changes are not trades. Values normally use report-date closing prices, may fall back to filer values, and can include zero when unavailable. While the newest quarter's filing window is open, non-ETF primary stocks use a provisional combined view; ETF listings remain exact and as-filed because carry-forward is filer-wide."
     )]
     public Task<string> GetInstitutionalOwnershipHistory(
         [Description("Listed security ticker (e.g., AAPL, VOO)")] string ticker,
@@ -437,7 +442,7 @@ public class InstitutionalHoldingsTools
 
                 var isPrimaryListing = string.Equals(
                     listedTicker,
-                    stock.Ticker,
+                    stock.Presentation.Listing.Ticker,
                     StringComparison.OrdinalIgnoreCase
                 );
                 var anchor =
@@ -454,7 +459,7 @@ public class InstitutionalHoldingsTools
                     if (combined == null)
                     {
                         throw new InvalidOperationException(
-                            $"Combined holdings activity is unavailable for {stock.Ticker} on {anchor.ReportDate:yyyy-MM-dd}."
+                            $"Combined holdings activity is unavailable for {stock.Presentation.Listing.Ticker} on {anchor.ReportDate:yyyy-MM-dd}."
                         );
                     }
 
@@ -472,7 +477,13 @@ public class InstitutionalHoldingsTools
                     .OrderBy(row => row.ReportDate)
                     .ToList();
                 await _marketActivityShareRestater.RestateStockActivity(stock, selected);
-                return RenderOwnershipHistory(stock, ticker, selected, anchor);
+                var coverage = await HoldingsComparisonCoverage.History(
+                    _holdingRepository,
+                    stock,
+                    selected.Select(row => row.ReportDate).ToList(),
+                    exactListingScope ? listedTicker : null
+                );
+                return RenderOwnershipHistory(stock, ticker, selected, anchor, coverage);
             },
             "GetInstitutionalOwnershipHistory",
             $"ticker: {ticker}"
@@ -480,10 +491,14 @@ public class InstitutionalHoldingsTools
     }
 
     private static string RenderOwnershipHistory(
-        CommonStock stock,
+        EquityIssuer stock,
         string ticker,
         IReadOnlyList<StockQuarterlyActivity> activity,
-        StockQuarterAnchor anchor
+        StockQuarterAnchor anchor,
+        IReadOnlyDictionary<
+            DateOnly,
+            Equibles.Holdings.BusinessLogic.Models.HoldingsComparisonStatus
+        > coverage
     )
     {
         var result = MarkdownTable.Start(
@@ -499,7 +514,10 @@ public class InstitutionalHoldingsTools
             var isCombinedRow =
                 anchor is { IsCombined: true } && row.ReportDate == anchor.ReportDate;
             combinedRowShown |= isCombinedRow;
-            var change = FormatShareChange(row.CurrentShares, previousShares);
+            var comparison = coverage.GetValueOrDefault(row.ReportDate);
+            var change = comparison is { ComparisonAvailable: false }
+                ? "unavailable (coverage)"
+                : FormatShareChange(row.CurrentShares, previousShares);
 
             result.AppendLine(
                 $"| {FormatDate(row.ReportDate)}{(isCombinedRow ? " \\*" : "")} | {McpFormat.WholeNumber(row.CurrentFilerCount)} | {McpFormat.WholeNumber(row.CurrentShares)} | {FormatMillions(row.CurrentValue)} | {change} |"
@@ -507,6 +525,9 @@ public class InstitutionalHoldingsTools
 
             previousShares = row.CurrentShares;
         }
+
+        foreach (var comparison in coverage.Values.Where(c => !c.ComparisonAvailable))
+            result.AppendLine($"{FormatDate(comparison.ReportDate)}: {comparison.Note}");
 
         if (combinedRowShown)
         {
@@ -601,13 +622,13 @@ public class InstitutionalHoldingsTools
                         // table below renders ROWS — quoting the distinct-stock count as its
                         // denominator once produced "top 39 of 35".
                         Rows = g.Count(),
-                        Positions = g.Select(h => h.CommonStockId).Distinct().Count(),
+                        Positions = g.Select(h => h.EquityIssuerId).Distinct().Count(),
                         Value = g.Sum(h => h.Value),
                         Unvalued = g.Where(h =>
                                 h.Value == 0L
                                 && (h.ValuePending || h.ValueUnavailable || h.FiledValue > 0)
                             )
-                            .Select(h => h.CommonStockId)
+                            .Select(h => h.EquityIssuerId)
                             .Distinct()
                             .Count(),
                     })
@@ -633,7 +654,7 @@ public class InstitutionalHoldingsTools
                 // rows between pages.
                 var holdings = await allHoldings
                     .OrderByDescending(h => h.Value)
-                    .ThenBy(h => h.CommonStockId)
+                    .ThenBy(h => h.EquityIssuerId)
                     .ThenBy(h => h.Id)
                     .Skip(offset)
                     .Take(McpLimit.Clamp(maxResults))
@@ -648,7 +669,7 @@ public class InstitutionalHoldingsTools
                 // web and GetTopHolders), so restate each position's share count by its own
                 // stock's post-report-date splits. Value is a paired per-holding dollar figure
                 // and stays as reported.
-                var splitsByStock = await LoadSplitsByStock(holdings.Select(h => h.CommonStockId));
+                var splitsByStock = await LoadSplitsByStock(holdings.Select(h => h.EquityIssuerId));
 
                 return RenderInstitutionPortfolio(
                     holder,
@@ -746,20 +767,23 @@ public class InstitutionalHoldingsTools
             {
                 // The exact listing held: a GOOG position must not render as GOOGL, and a
                 // sibling ETF split must not rescale this row.
-                var listedTicker = h.ListedTicker ?? h.CommonStock.Ticker;
-                var shares = SplitAdjustment.AdjustShareCount(
-                    h.Shares,
-                    targetDate,
-                    PriceSeriesSplitScope.ForListing(
-                        SplitsFor(splitsByStock, h.CommonStockId),
-                        h.CommonStock.Ticker,
-                        listedTicker
-                    )
-                );
+                var listedTicker = h.ListedTicker ?? h.Issuer?.Presentation?.Listing?.Ticker;
+                var shares =
+                    h.ShareType == ShareType.Principal
+                        ? h.Shares
+                        : SplitAdjustment.AdjustShareCount(
+                            h.Shares,
+                            targetDate,
+                            PriceSeriesSplitScope.ForListing(
+                                SplitsFor(splitsByStock, h.EquityIssuerId),
+                                h.Issuer?.Presentation?.Listing?.Ticker,
+                                listedTicker
+                            )
+                        );
                 var pct = Percentage.Of(h.Value, totalValue);
                 // Rank is the ABSOLUTE position in the value-ranked rows, so page two
                 // continues 21, 22, … instead of restarting at 1.
-                return $"| {offset + rank} | {listedTicker} | {h.CommonStock.Name} | "
+                return $"| {offset + rank} | {listedTicker ?? "—"} | {h.Issuer.Name} | "
                     + $"{PositionType(h.OptionType, h.ShareType)} | "
                     + $"{McpFormat.WholeNumber(shares)} | "
                     + $"{FormatMillions(h.Value)} | "
@@ -879,7 +903,7 @@ public class InstitutionalHoldingsTools
         ReadOnly = true
     )]
     [Description(
-        "Get the institutions that moved the needle the most on a stock this quarter — biggest absolute share additions (Top Buyers) and biggest absolute share reductions (Top Sellers) versus the previous 13F report date. Includes new positions (Δ = full position) and sold-out positions (Δ = −prior position); a previous holder counts as a seller only if it filed a 13F for the target quarter, so a fund that stopped filing (CIK migration, deregistration) is not shown as a mass seller. While the newest quarter's filing window is open, results cover only the funds that have already filed (noted in the output). Returns a markdown table with two sections. Use this to surface the most actionable quarterly signal from 13F filings."
+        "Get the institutions that moved the needle the most on a stock this quarter — biggest absolute share additions (Top Buyers) and biggest absolute share reductions (Top Sellers) versus the previous 13F report date. Includes new positions (Δ = full position) and sold-out positions (Δ = −prior position); entries and exits require observed 13F filings in both compared quarters, so missing filings or a CIK migration cannot become a full-position buy or sale. While the newest quarter's filing window is open, results cover only the funds that have already filed (noted in the output). Returns a markdown table with two sections. Use this to surface the most actionable quarterly signal from 13F filings."
     )]
     public Task<string> GetTopInstitutionalBuyersSellers(
         [Description("Listed security ticker (e.g., AAPL, VOO)")] string ticker,
@@ -951,20 +975,14 @@ public class InstitutionalHoldingsTools
                     previousDate.HasValue
                     && targetDate == reportDates[0]
                     && CombinedQuarterHelper.IsFilingWindowOpen(targetDate);
-                HashSet<Guid> filedPreviousHolders = null;
-                if (previousDate.HasValue)
-                {
-                    var priorHolderIds = activity
-                        .Where(row => row.PreviousPositionCount > 0)
-                        .Select(row => row.InstitutionalHolderId)
-                        .Distinct()
-                        .ToList();
-                    filedPreviousHolders = (
-                        await _holdingRepository
-                            .GetFiledHolderIdsAmong(targetDate, priorHolderIds)
-                            .ToListAsync()
-                    ).ToHashSet();
-                }
+                var comparison = previousDate.HasValue
+                    ? await HoldingsComparisonCoverage.Activity(
+                        _holdingRepository,
+                        activity,
+                        targetDate,
+                        previousDate.Value
+                    )
+                    : null;
 
                 // Restate each quarter's share counts onto today's split basis (the two
                 // quarters sit on different bases if a split fell between them) so Δ Shares
@@ -975,10 +993,10 @@ public class InstitutionalHoldingsTools
                     .ToListAsync();
                 long AdjustShares(long shares, DateOnly asOf, string listedTicker)
                 {
-                    var exactTicker = listedTicker ?? stock.Ticker;
+                    var exactTicker = listedTicker ?? stock.Presentation.Listing.Ticker;
                     var scoped = PriceSeriesSplitScope.ForListing(
                         splits,
-                        stock.Ticker,
+                        stock.Presentation.Listing.Ticker,
                         exactTicker
                     );
                     return SplitAdjustment.AdjustShareCount(shares, asOf, scoped);
@@ -986,11 +1004,7 @@ public class InstitutionalHoldingsTools
 
                 var movers = activity
                     .GroupBy(row => row.InstitutionalHolderId)
-                    .Where(g =>
-                        filedPreviousHolders == null
-                        || g.Any(row => row.CurrentPositionCount > 0)
-                        || filedPreviousHolders.Contains(g.Key)
-                    )
+                    .Where(g => comparison != null && comparison.CanCompareHolder(g.Key))
                     .Select(g =>
                     {
                         var currentShares = g.Sum(row =>
@@ -1025,7 +1039,7 @@ public class InstitutionalHoldingsTools
                     .ToList();
 
                 if (topBuyers.Count == 0 && topSellers.Count == 0)
-                    return $"No quarter-over-quarter movement found for {StockListingLabel(stock, ticker)} as of {FormatDate(targetDate)}.";
+                    return $"No comparable quarter-over-quarter movement found for {StockListingLabel(stock, ticker)} as of {FormatDate(targetDate)}. {(comparison == null ? "No prior quarter is available." : comparison.Note)}";
 
                 var topHolderIds = topBuyers
                     .Select(m => m.Id)
@@ -1088,9 +1102,9 @@ public class InstitutionalHoldingsTools
                 var comparisonNote =
                     windowOpen
                         ? $"Note: the {FormatDate(targetDate)} filing window is still open — "
-                            + "movement is computed only across funds that have already filed."
+                            + "movement requires observed filings in both compared quarters."
                     : previousDate.HasValue
-                        ? $"Note: sellers are counted only among funds that filed a 13F for {FormatDate(targetDate)} — "
+                        ? $"Note: buyers and sellers require observed 13F filings in both compared quarters — "
                             + "funds that stopped filing under this CIK (migrations, deregistrations) are excluded."
                     : null;
 
@@ -1101,7 +1115,7 @@ public class InstitutionalHoldingsTools
                     previousDate,
                     buyerRows,
                     sellerRows,
-                    JoinNotes(dateNote, comparisonNote)
+                    JoinNotes(JoinNotes(dateNote, comparisonNote), comparison?.Note)
                 );
             },
             "GetTopInstitutionalBuyersSellers",
@@ -1110,7 +1124,7 @@ public class InstitutionalHoldingsTools
     }
 
     private static string RenderBuyersSellersTable(
-        CommonStock stock,
+        EquityIssuer stock,
         string ticker,
         DateOnly targetDate,
         DateOnly? previousDate,
@@ -1413,7 +1427,7 @@ public class InstitutionalHoldingsTools
         }
 
         return await _commonStockRepository
-            .GetByIds(ids)
+            .GetCurrentUsDirectoryByIds(ids)
             .Select(stock => stock.Id)
             .ToHashSetAsync();
     }
@@ -1732,7 +1746,7 @@ public class InstitutionalHoldingsTools
         int universeFilers,
         bool comparisonAvailable,
         List<MarketWideStockActivity> rows,
-        IDictionary<Guid, CommonStock> stocks
+        IDictionary<Guid, EquityIssuer> stocks
     )
     {
         var result = new StringBuilder();
@@ -1943,7 +1957,7 @@ public class InstitutionalHoldingsTools
 
                 var holdings = await _holdingRepository
                     .Get13FByHolder(holder, targetDate)
-                    .Include(h => h.CommonStock)
+                    .Include(h => h.Issuer)
                         .ThenInclude(s => s.Industry)
                             .ThenInclude(i => i.Sector)
                     .ToListAsync();
@@ -2526,8 +2540,8 @@ public class InstitutionalHoldingsTools
         DateOnly reportDate
     ) => _holdingRepository.Get13FByHolderWithStock(holder, reportDate).ToListAsync();
 
-    private Task<Dictionary<Guid, CommonStock>> LoadStocksByIds(List<Guid> stockIds) =>
-        _commonStockRepository.GetByIds(stockIds).ToDictionaryAsync(s => s.Id);
+    private Task<Dictionary<Guid, EquityIssuer>> LoadStocksByIds(List<Guid> stockIds) =>
+        _commonStockRepository.GetCurrentUsDirectoryByIds(stockIds).ToDictionaryAsync(s => s.Id);
 
     // Batch-loads the splits for a set of stocks once, grouped by stock, so cross-sectional
     // tools can restate each row's share counts onto today's basis without an N+1 query.
@@ -2541,9 +2555,9 @@ public class InstitutionalHoldingsTools
 
         var splits = await _stockSplitRepository
             .GetEffective(DateOnly.FromDateTime(DateTime.UtcNow))
-            .Where(s => ids.Contains(s.CommonStockId))
+            .Where(s => ids.Contains(s.EquityIssuerId))
             .ToListAsync();
-        return splits.GroupBy(s => s.CommonStockId).ToDictionary(g => g.Key, g => g.ToList());
+        return splits.GroupBy(s => s.EquityIssuerId).ToDictionary(g => g.Key, g => g.ToList());
     }
 
     // A stock with no splits restates by factor 1 (no-op), so an absent key returns an empty set.
@@ -2615,12 +2629,12 @@ public class InstitutionalHoldingsTools
     }
 
     private static (string Ticker, string Name) ResolveStockCells(
-        IDictionary<Guid, CommonStock> stocks,
+        IDictionary<Guid, EquityIssuer> stocks,
         Guid stockId
     )
     {
-        stocks.TryGetValue(stockId, out var s);
-        return (s?.Ticker ?? "—", s?.Name ?? "Unknown");
+        stocks.TryGetValue(stockId, out EquityIssuer s);
+        return (s?.Presentation?.Listing?.Ticker ?? "—", s?.Name ?? "Unknown");
     }
 
     // Raw dollar values rendered in $millions with an explicit leading +/- sign.
@@ -2746,6 +2760,6 @@ public class InstitutionalHoldingsTools
     }
 
     // Thin forwarder so existing reflection-based normalization tests still find the method.
-    private Task<(CommonStock Stock, string Error)> ResolveStockByTicker(string ticker) =>
+    private Task<(EquityIssuer Stock, string Error)> ResolveStockByTicker(string ticker) =>
         _commonStockRepository.ResolveByTicker(ticker);
 }

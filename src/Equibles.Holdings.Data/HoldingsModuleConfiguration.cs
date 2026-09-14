@@ -1,3 +1,4 @@
+using Equibles.CommonStocks.Data.Models;
 using Equibles.Holdings.Data.Models;
 using Microsoft.EntityFrameworkCore;
 
@@ -7,12 +8,37 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
 {
     public void ConfigureEntities(ModelBuilder builder)
     {
+        builder
+            .Entity<InstitutionalHolding>()
+            .HasOne(row => row.Issuer)
+            .WithMany()
+            .HasForeignKey(row => row.EquityIssuerId)
+            .OnDelete(DeleteBehavior.Restrict);
+        builder
+            .Entity<StockQuarterlyActivity>()
+            .HasOne<EquityIssuer>()
+            .WithMany()
+            .HasForeignKey(row => row.EquityIssuerId)
+            .OnDelete(DeleteBehavior.Restrict);
+        builder
+            .Entity<StockQuarterlyActivityCombined>()
+            .HasOne<EquityIssuer>()
+            .WithMany()
+            .HasForeignKey(row => row.EquityIssuerId)
+            .OnDelete(DeleteBehavior.Restrict);
+        builder
+            .Entity<StockQuarterlyListingActivity>()
+            .HasOne<EquityIssuer>()
+            .WithMany()
+            .HasForeignKey(row => row.EquityIssuerId)
+            .OnDelete(DeleteBehavior.Restrict);
+
         // Holdings unique index: include OptionType and FilingType with NULLS NOT DISTINCT (cannot be expressed via attributes)
         builder
             .Entity<InstitutionalHolding>()
             .HasIndex(h => new
             {
-                h.CommonStockId,
+                h.EquityIssuerId,
                 h.InstitutionalHolderId,
                 h.ReportDate,
                 h.ShareType,
@@ -23,6 +49,14 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
             .IsUnique()
             .AreNullsDistinct(false);
 
+        // Principal-value repair must scan only principal rows, not the full holdings corpus.
+        builder
+            .Entity<InstitutionalHolding>()
+            .HasIndex(h => new { h.ShareType, h.Id })
+            .HasDatabaseName("IX_InstitutionalHolding_Principal")
+            .HasFilter("\"ShareType\" = 1")
+            .IsCreatedConcurrently();
+
         // Covering index for the per-stock ownership-trend GROUP BY on the stock
         // Holdings page. Postgres-specific `INCLUDE` is not expressible via the
         // [Index] attribute, so it lives here. Holders / value / shares ride along
@@ -32,15 +66,22 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
         // quarters and the heap fetch dominated cold load time. EF merges this
         // with the entity's `[Index(CommonStockId, ReportDate)]` attribute, so
         // there's a single btree on those columns with the INCLUDE list attached.
+        // Listing, filing-type and option filters must also be covered; otherwise the
+        // position totals and concentration history still fetch the entire stock's heap slice.
         builder
             .Entity<InstitutionalHolding>()
-            .HasIndex(h => new { h.CommonStockId, h.ReportDate })
+            .HasIndex(h => new { h.EquityIssuerId, h.ReportDate })
+            .HasDatabaseName("IX_InstitutionalHolding_StockQuarterExposure")
             .IncludeProperties(h => new
             {
                 h.InstitutionalHolderId,
                 h.Value,
                 h.Shares,
-            });
+                h.ListedTicker,
+                h.FilingType,
+                h.OptionType,
+            })
+            .IsCreatedConcurrently();
 
         // Partial covering index for the holder-rank aggregate on the single-holder /
         // single-stock page. That query needs only common-share 13F rows for one
@@ -51,7 +92,7 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
             .Entity<InstitutionalHolding>()
             .HasIndex(h => new
             {
-                h.CommonStockId,
+                h.EquityIssuerId,
                 h.ReportDate,
                 h.InstitutionalHolderId,
             })
@@ -70,7 +111,7 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
         // to the recent filing window and can run index-only.
         builder
             .Entity<InstitutionalHolding>()
-            .HasIndex(h => new { h.CommonStockId, h.FilingDate })
+            .HasIndex(h => new { h.EquityIssuerId, h.FilingDate })
             .IncludeProperties(h => new { h.AccessionNumber, h.InstitutionalHolderId })
             .IsCreatedConcurrently();
 
@@ -103,7 +144,7 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
             .HasIndex(h => new { h.InstitutionalHolderId, h.ReportDate })
             .IncludeProperties(h => new
             {
-                h.CommonStockId,
+                h.EquityIssuerId,
                 h.Value,
                 h.Shares,
                 h.FilingDate,
@@ -123,7 +164,7 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
             .HasIndex(h => new
             {
                 h.ReportDate,
-                h.CommonStockId,
+                h.EquityIssuerId,
                 h.InstitutionalHolderId,
             })
             .IncludeProperties(h => new { h.Shares, h.Value });
@@ -141,7 +182,7 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
             {
                 h.ReportDate,
                 h.InstitutionalHolderId,
-                h.CommonStockId,
+                h.EquityIssuerId,
             })
             .IncludeProperties(h => new { h.Shares, h.Value });
 
@@ -158,7 +199,7 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
             .Entity<InstitutionalHolding>()
             .HasIndex(h => new
             {
-                h.CommonStockId,
+                h.EquityIssuerId,
                 h.ListedTicker,
                 h.ReportDate,
             })

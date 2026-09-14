@@ -35,27 +35,30 @@ public class FinancialFactsImportService
     // Bump whenever parsing, fiscal identity, or quality filtering changes existing rows. The
     // per-company checkpoint forces a full Company Facts replay without racing the old worker
     // during an additive migration rollout.
-    internal const int CurrentImporterVersion = 4;
+    internal const int CurrentImporterVersion = 6;
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ISecEdgarClient _secEdgarClient;
     private readonly ILogger<FinancialFactsImportService> _logger;
     private readonly ErrorReporter _errorReporter;
+    private readonly FiscalCalendarEvidenceReader _calendarReader;
 
     public FinancialFactsImportService(
         IServiceScopeFactory scopeFactory,
         ISecEdgarClient secEdgarClient,
         ILogger<FinancialFactsImportService> logger,
-        ErrorReporter errorReporter
+        ErrorReporter errorReporter,
+        FiscalCalendarEvidenceReader calendarReader = null
     )
     {
         _scopeFactory = scopeFactory;
         _secEdgarClient = secEdgarClient;
         _logger = logger;
         _errorReporter = errorReporter;
+        _calendarReader = calendarReader;
     }
 
-    public async Task Import(CommonStock stock, CancellationToken cancellationToken)
+    public async Task Import(EquityIssuer stock, CancellationToken cancellationToken)
     {
         if (string.IsNullOrEmpty(stock.Cik))
             return;
@@ -68,7 +71,7 @@ public class FinancialFactsImportService
         // natural key carries the AccessionNumber, and accessions are globally
         // unique in SEC. Any CIK failing to download skips the whole cycle so the
         // checkpoint never advances past an unread source.
-        var parsed = new List<ParsedFact>();
+        var responses = new List<CompanyFactsResponse>();
         foreach (var cik in CiksFor(stock))
         {
             CompanyFactsResponse response;
@@ -81,14 +84,14 @@ public class FinancialFactsImportService
                 _logger.LogWarning(
                     ex,
                     "Company Facts download failed for {Ticker} (CIK {Cik}), skipping this cycle",
-                    stock.Ticker,
+                    stock.Presentation?.Listing?.Ticker,
                     cik
                 );
                 return;
             }
 
             if (response != null && response.Facts.Count > 0)
-                parsed.AddRange(ParseFacts(response, stock));
+                responses.Add(response);
         }
 
         // Guards GH-1591: the stock can be deleted during the network calls
@@ -100,14 +103,57 @@ public class FinancialFactsImportService
             _logger.LogWarning(
                 "CommonStock {Id} ({Ticker}) no longer exists; skipping financial facts import",
                 stock.Id,
-                stock.Ticker
+                stock.Presentation?.Listing?.Ticker
             );
             return;
         }
 
+        var incomingAnnualPeriods = responses
+            .SelectMany(response => response.Facts.Values)
+            .SelectMany(concepts => concepts.Values)
+            .SelectMany(concept => concept.Units.Values)
+            .SelectMany(values => values)
+            .Where(value =>
+                value.Start.HasValue
+                && value.Form is "10-K" or "20-F" or "40-F"
+                && value.End.DayNumber - value.Start.Value.DayNumber is >= 350 and <= 380
+            )
+            .Select(value => (Start: value.Start.Value, End: value.End))
+            .Distinct()
+            .ToArray();
+        HistoricalFiscalCalendar calendar;
+        try
+        {
+            calendar =
+                _calendarReader == null
+                    ? new HistoricalFiscalCalendar(
+                        [],
+                        [],
+                        stock.FiscalYearEndMonth,
+                        stock.FiscalYearEndDay
+                    )
+                    : await _calendarReader.Read(
+                        stock.Id,
+                        incomingAnnualPeriods,
+                        cancellationToken
+                    );
+        }
+        catch (InvalidDataException ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Fiscal calendar evidence is incomplete for {Ticker}; deferring import",
+                stock.Presentation?.Listing?.Ticker
+            );
+            return;
+        }
+        var parsed = responses
+            .SelectMany(response => ParseFacts(response, stock, calendar))
+            .ToList();
+
         if (parsed.Count == 0)
         {
-            await UpsertSyncStatus(stock, null, cancellationToken);
+            await UpsertSyncStatus(stock, null, calendar.Fingerprint, cancellationToken);
             return;
         }
 
@@ -117,6 +163,7 @@ public class FinancialFactsImportService
         var lastSeen = syncStatus?.LastFiledDateSeen;
         if (
             syncStatus?.ImporterVersion >= CurrentImporterVersion
+            && syncStatus.CalendarEvidenceFingerprint == calendar.Fingerprint
             && lastSeen.HasValue
             && lastSeen.Value >= maxFiled
         )
@@ -125,14 +172,14 @@ public class FinancialFactsImportService
             // and skip the (expensive) re-upsert of the full history. Still re-source the share
             // count: an already-ingested cover-page fact may post-date the stale Yahoo figure
             // (and this corrects existing rows the first cycle after the change ships).
-            await UpsertSyncStatus(stock, lastSeen, cancellationToken);
+            await UpsertSyncStatus(stock, lastSeen, calendar.Fingerprint, cancellationToken);
             await UpdateSharesOutstanding(stock, cancellationToken);
             return;
         }
 
         try
         {
-            await PersistFacts(stock, parsed, maxFiled, cancellationToken);
+            await PersistFacts(stock, parsed, maxFiled, calendar.Fingerprint, cancellationToken);
             await UpdateSharesOutstanding(stock, cancellationToken);
         }
         // Per-company fault isolation (mirrors FtdImportService): one company's
@@ -143,14 +190,14 @@ public class FinancialFactsImportService
             _logger.LogError(
                 ex,
                 "Error importing financial facts for {Ticker} (CIK {Cik})",
-                stock.Ticker,
+                stock.Presentation?.Listing?.Ticker,
                 stock.Cik
             );
             await _errorReporter.Report(
                 ErrorSource.FinancialFactsScraper,
                 "FinancialFactsImport.Import",
                 ex,
-                $"ticker: {stock.Ticker}, cik: {stock.Cik}"
+                $"ticker: {stock.Presentation?.Listing?.Ticker}, cik: {stock.Cik}"
             );
         }
     }
@@ -162,10 +209,12 @@ public class FinancialFactsImportService
     // whose classless series ended years ago is not frozen on a stale consolidated value (#5158).
     // No-ops when neither is on record or the value is unchanged.
     private async Task UpdateSharesOutstanding(
-        CommonStock stock,
+        EquityIssuer stock,
         CancellationToken cancellationToken
     )
     {
+        if (stock.Presentation?.Listing is not { MarketCountryCode: "US", Active: true })
+            return;
         using var scope = _scopeFactory.CreateScope();
         var sharesProvider = scope.ServiceProvider.GetRequiredService<ISharesOutstandingProvider>();
         var shares = await sharesProvider.GetCurrentSharesOutstanding(stock, cancellationToken);
@@ -189,14 +238,22 @@ public class FinancialFactsImportService
         // title says what it listed, so ask that before writing. Without this the count goes back
         // onto the ordinary base every facts cycle while the Yahoo importer keeps the market cap
         // on the ADS base, and the two writers undo each other forever.
-        if (ListedSecurityClassifier.IsAmericanDepositary(stock.ListedSecurityTitle))
+        if (
+            ListedSecurityClassifier.IsAmericanDepositary(
+                stock.Presentation.Listing.Security.RegistrationTitle
+            )
+        )
             return;
 
-        var stockRepository = scope.ServiceProvider.GetRequiredService<CommonStockRepository>();
-        var tracked = await stockRepository
-            .GetByIds([stock.Id])
+        EquityIssuerRepository stockRepository =
+            scope.ServiceProvider.GetRequiredService<EquityIssuerRepository>();
+        EquityIssuer tracked = await stockRepository
+            .GetCurrentUsDirectoryByIds([stock.Id])
             .FirstOrDefaultAsync(cancellationToken);
-        if (tracked == null || tracked.SharesOutStanding == shares.Value)
+        if (
+            tracked == null
+            || tracked.Presentation.Listing.Security.SharesOutstanding == shares.Value
+        )
             return;
 
         // The FPI guard above can't see a DOMESTIC filer whose US listing is still an ADS (a
@@ -213,22 +270,26 @@ public class FinancialFactsImportService
         // corrected by the Yahoo importer, which writes the EDGAR count once Yahoo's own share
         // base confirms it plausible.
         if (
-            ShareBasisPlausibility.IsUnitMismatch(shares.Value, tracked.SharesOutStanding)
+            ShareBasisPlausibility.IsUnitMismatch(
+                shares.Value,
+                tracked.Presentation.Listing.Security.SharesOutstanding
+            )
             && ShareBasisPlausibility.ImpliesPlausibleSharePrice(
-                tracked.MarketCapitalization,
-                tracked.SharesOutStanding
+                tracked.Presentation.Listing.Security.MarketCapitalization,
+                tracked.Presentation.Listing.Security.SharesOutstanding
             )
         )
             return;
 
-        tracked.SharesOutStanding = shares.Value;
+        tracked.Presentation.Listing.Security.SharesOutstanding = shares.Value;
         await stockRepository.SaveChanges();
     }
 
     private async Task PersistFacts(
-        CommonStock stock,
+        EquityIssuer stock,
         List<ParsedFact> parsed,
         DateOnly maxFiled,
+        string calendarFingerprint,
         CancellationToken cancellationToken
     )
     {
@@ -248,7 +309,7 @@ public class FinancialFactsImportService
             _logger.LogWarning(
                 "Dropped {Count} facts with unresolved concepts for {Ticker} (CIK {Cik})",
                 droppedConcepts,
-                stock.Ticker,
+                stock.Presentation?.Listing?.Ticker,
                 stock.Cik
             );
         }
@@ -260,7 +321,7 @@ public class FinancialFactsImportService
             _logger.LogWarning(
                 "Rejected {Count} lower-quality Company Facts rows for {Ticker} (CIK {Cik})",
                 quality.Rejected.Count,
-                stock.Ticker,
+                stock.Presentation?.Listing?.Ticker,
                 stock.Cik
             );
         }
@@ -271,17 +332,21 @@ public class FinancialFactsImportService
         // failure leaves the checkpoint un-advanced and the company is
         // retried in full next cycle.
         await BatchPersister.Persist(facts, InsertBatchSize, FlushFacts);
-        await UpsertSyncStatus(stock, maxFiled, cancellationToken);
+        await UpsertSyncStatus(stock, maxFiled, calendarFingerprint, cancellationToken);
 
         _logger.LogInformation(
             "Imported {Count} financial facts for {Ticker} (CIK {Cik})",
             facts.Count,
-            stock.Ticker,
+            stock.Presentation?.Listing?.Ticker,
             stock.Cik
         );
     }
 
-    private IEnumerable<ParsedFact> ParseFacts(CompanyFactsResponse response, CommonStock stock)
+    private IEnumerable<ParsedFact> ParseFacts(
+        CompanyFactsResponse response,
+        EquityIssuer stock,
+        HistoricalFiscalCalendar calendar
+    )
     {
         foreach (var (taxonomyKey, concepts) in response.Facts)
         {
@@ -294,14 +359,15 @@ public class FinancialFactsImportService
                 {
                     foreach (var value in values)
                     {
-                        var fact = TryBuildParsedFact(
+                        var fact = TryBuildParsedFactWithCalendar(
                             taxonomy,
                             tag,
                             concept.Label,
                             concept.Description,
                             unit,
                             value,
-                            stock
+                            stock,
+                            calendar
                         );
                         if (fact != null)
                             yield return fact;
@@ -318,7 +384,19 @@ public class FinancialFactsImportService
         string description,
         string unit,
         CompanyFactValue value,
-        CommonStock stock
+        EquityIssuer stock
+    ) =>
+        TryBuildParsedFactWithCalendar(taxonomy, tag, label, description, unit, value, stock, null);
+
+    private static ParsedFact TryBuildParsedFactWithCalendar(
+        FactTaxonomy taxonomy,
+        string tag,
+        string label,
+        string description,
+        string unit,
+        CompanyFactValue value,
+        EquityIssuer stock,
+        HistoricalFiscalCalendar calendar
     )
     {
         if (string.IsNullOrWhiteSpace(value.Accn))
@@ -326,6 +404,8 @@ public class FinancialFactsImportService
 
         var isInstant = value.Start == null;
         var periodStart = value.Start ?? value.End;
+        if (calendar?.RefusesCalendar(periodStart, value.End) == true)
+            return null;
         // SEC serves foreign private issuers' 6-K interim values with fp = null, so an
         // unmappable fp must not drop the value outright — dropping them left every
         // FPI's interim facts missing platform-wide. The date-derived identity below is
@@ -335,16 +415,19 @@ public class FinancialFactsImportService
         // measures — the filing's fy/fp identifies the filing, not each
         // comparable-year value inside it (#982). Resolver returns null when
         // FYE info is missing or the duration shape is unrecognised; the
-        // original SEC-supplied identity is the fallback. Interim-instant
-        // classification is opted into only on the fp-less path, so fp-carrying
-        // values keep the exact identities they have always had.
-        var resolved = FiscalPeriodResolver.Resolve(
-            periodStart,
-            value.End,
-            stock.FiscalYearEndMonth,
-            stock.FiscalYearEndDay,
-            classifyInterimInstants: !hasMappedFp
-        );
+        // original SEC-supplied identity is the fallback. Instants and durations
+        // must use the same date-derived year; SEC fy names the filing and can
+        // differ from the calendar year in which the measured fiscal year ends.
+        var resolved =
+            calendar != null
+                ? calendar.Resolve(periodStart, value.End)
+                : FiscalPeriodResolver.Resolve(
+                    periodStart,
+                    value.End,
+                    stock.FiscalYearEndMonth,
+                    stock.FiscalYearEndDay,
+                    classifyInterimInstants: true
+                );
         // With neither a mappable fp nor a date-derived identity the period cannot be
         // placed — defaulting would route the fact into the annual bucket (the
         // zero-valued enum member) and corrupt the dashboards, so it is dropped.
@@ -459,7 +542,7 @@ public class FinancialFactsImportService
     }
 
     private async Task<Dictionary<string, FilingDocumentContext>> LoadDocumentsByAccession(
-        CommonStock stock,
+        EquityIssuer stock,
         CancellationToken cancellationToken
     )
     {
@@ -467,7 +550,7 @@ public class FinancialFactsImportService
         var documentRepository = scope.ServiceProvider.GetRequiredService<DocumentRepository>();
 
         var rows = await documentRepository
-            .GetByCompany(stock)
+            .GetByIssuerId((stock).Id)
             .Where(d => d.AccessionNumber != null)
             .Select(d => new
             {
@@ -489,7 +572,7 @@ public class FinancialFactsImportService
     }
 
     private static FinancialFact BuildFact(
-        CommonStock stock,
+        EquityIssuer stock,
         ParsedFact p,
         Dictionary<(FactTaxonomy, string), Guid> conceptIds,
         Dictionary<string, FilingDocumentContext> documents
@@ -503,7 +586,7 @@ public class FinancialFactsImportService
 
         return new FinancialFact
         {
-            CommonStockId = stock.Id,
+            EquityIssuerId = stock.Id,
             FinancialConceptId = conceptId,
             DocumentId = document?.Id,
             Unit = p.Unit,
@@ -530,7 +613,7 @@ public class FinancialFactsImportService
     // document period's calendar year. Comparable prior-year facts in the same accession do not
     // match ReportingForDate and continue through the ordinary date resolver.
     private static (int Year, SecFiscalPeriod Period) ValidateAgainstFilingDocumentPeriod(
-        CommonStock stock,
+        EquityIssuer stock,
         ParsedFact fact,
         FilingDocumentContext document
     )
@@ -569,20 +652,20 @@ public class FinancialFactsImportService
     // secondary. Distinct because the subsidiary-attach path writes SEC's value
     // verbatim — a duplicate would double the companyfacts download and the
     // parsed set held in memory. Internal static so the unit suite pins it.
-    internal static IEnumerable<string> CiksFor(CommonStock stock)
+    internal static IEnumerable<string> CiksFor(EquityIssuer stock)
     {
         return new[] { stock.Cik }.Concat(stock.SecondaryCiks ?? []).Distinct();
     }
 
     private async Task<bool> CommonStockStillExists(
-        CommonStock stock,
+        EquityIssuer stock,
         CancellationToken cancellationToken
     )
     {
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<EquiblesFinancialDbContext>();
         return await dbContext
-            .Set<CommonStock>()
+            .Set<EquityIssuer>()
             .AsNoTracking()
             .AnyAsync(s => s.Id == stock.Id, cancellationToken);
     }
@@ -599,7 +682,7 @@ public class FinancialFactsImportService
             // DimensionsKey) or Postgres can't infer the ON CONFLICT target.
             .On(f => new
             {
-                f.CommonStockId,
+                f.EquityIssuerId,
                 f.FinancialConceptId,
                 f.Unit,
                 f.PeriodStart,
@@ -625,18 +708,19 @@ public class FinancialFactsImportService
     }
 
     private async Task<FinancialFactsSyncStatus> GetSyncStatus(
-        CommonStock stock,
+        EquityIssuer stock,
         CancellationToken cancellationToken
     )
     {
         using var scope = _scopeFactory.CreateScope();
         var repo = scope.ServiceProvider.GetRequiredService<FinancialFactsSyncStatusRepository>();
-        return await repo.GetByStock(stock).FirstOrDefaultAsync(cancellationToken);
+        return await repo.GetByIssuerId(stock.Id).FirstOrDefaultAsync(cancellationToken);
     }
 
     private async Task UpsertSyncStatus(
-        CommonStock stock,
+        EquityIssuer stock,
         DateOnly? lastFiledSeen,
+        string calendarFingerprint,
         CancellationToken cancellationToken
     )
     {
@@ -645,16 +729,17 @@ public class FinancialFactsImportService
 
         var status = new FinancialFactsSyncStatus
         {
-            CommonStockId = stock.Id,
+            EquityIssuerId = stock.Id,
             LastCheckedAt = DateTime.UtcNow,
             LastFiledDateSeen = lastFiledSeen,
             ImporterVersion = CurrentImporterVersion,
+            CalendarEvidenceFingerprint = calendarFingerprint,
         };
 
         await dbContext
             .Set<FinancialFactsSyncStatus>()
             .UpsertRange(status)
-            .On(s => s.CommonStockId)
+            .On(s => s.EquityIssuerId)
             .WhenMatched(
                 (existing, incoming) =>
                     new FinancialFactsSyncStatus
@@ -663,13 +748,14 @@ public class FinancialFactsImportService
                         LastFiledDateSeen =
                             incoming.LastFiledDateSeen ?? existing.LastFiledDateSeen,
                         ImporterVersion = incoming.ImporterVersion,
+                        CalendarEvidenceFingerprint = incoming.CalendarEvidenceFingerprint,
                     }
             )
             .RunAsync(cancellationToken);
     }
 
     private async Task DeleteRejectedFacts(
-        CommonStock stock,
+        EquityIssuer stock,
         IReadOnlyCollection<FinancialFact> rejected,
         CancellationToken cancellationToken
     )
@@ -683,7 +769,7 @@ public class FinancialFactsImportService
         var candidates = await dbContext
             .Set<FinancialFact>()
             .Where(f =>
-                f.CommonStockId == stock.Id
+                f.EquityIssuerId == stock.Id
                 && f.DimensionsKey == ""
                 && accessions.Contains(f.AccessionNumber)
                 && conceptIds.Contains(f.FinancialConceptId)
@@ -699,7 +785,7 @@ public class FinancialFactsImportService
 
     private static FactNaturalKey NaturalKey(FinancialFact fact) =>
         new(
-            fact.CommonStockId,
+            fact.EquityIssuerId,
             fact.FinancialConceptId,
             fact.Unit,
             fact.PeriodStart,
@@ -768,7 +854,7 @@ public class FinancialFactsImportService
             .LatestPerGroup(
                 f =>
                     (
-                        f.CommonStockId,
+                        f.EquityIssuerId,
                         f.FinancialConceptId,
                         f.Unit,
                         f.PeriodStart,

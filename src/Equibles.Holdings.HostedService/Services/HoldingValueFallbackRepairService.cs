@@ -143,6 +143,11 @@ public class HoldingValueFallbackRepairService
 
     public async Task<int> Repair(CancellationToken cancellationToken)
     {
+        var principalValues = await RunPhase(
+            "principal-values",
+            RepairPrincipalValues,
+            cancellationToken
+        );
         var revisedFiled = await RunPhase("revise-filed", ReviseFiledPublishes, cancellationToken);
         var healedZeros = await RunPhase("stuck-zeros", HealStuckZeros, cancellationToken);
         var resetImplausible = await RunPhase(
@@ -171,7 +176,72 @@ public class HoldingValueFallbackRepairService
             );
         }
 
-        return revisedFiled + healedZeros + resetImplausible + markedUnavailable;
+        return principalValues + revisedFiled + healedZeros + resetImplausible + markedUnavailable;
+    }
+
+    internal static IQueryable<InstitutionalHolding> BuildPrincipalCandidateQuery(
+        EquiblesFinancialDbContext dbContext
+    ) =>
+        dbContext
+            .Set<InstitutionalHolding>()
+            .Include(h => h.ManagerEntries)
+            .Where(h =>
+                h.ShareType == ShareType.Principal
+                && (
+                    h.FiledValue > 0
+                        ? h.Value != h.FiledValue
+                            || h.ValueSource != ValueSource.Filed
+                            || h.ValuePending
+                            || h.ValueUnavailable
+                        : h.Value != 0 || h.ValuePending || !h.ValueUnavailable
+                )
+            )
+            .OrderBy(h => h.Id)
+            .Take(MaxRowsPerCycle);
+
+    private async Task<int> RepairPrincipalValues(CancellationToken cancellationToken)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<EquiblesFinancialDbContext>();
+        ExtendCommandTimeout(dbContext);
+        await using var transaction = dbContext.Database.IsRelational()
+            ? await dbContext.Database.BeginTransactionAsync(cancellationToken)
+            : null;
+        var rows = await BuildPrincipalCandidateQuery(dbContext).ToListAsync(cancellationToken);
+        if (rows.Count == 0)
+            return 0;
+        foreach (var holding in rows)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (holding.FiledValue is > 0)
+            {
+                HoldingsValueRecalculator.ApplyFiledValue(holding);
+                holding.ValueUnavailable = false;
+            }
+            else
+            {
+                holding.Value = 0;
+                holding.ValuePending = false;
+                holding.ValueUnavailable = true;
+                holding.ValueSource = ValueSource.Derived;
+                foreach (var entry in holding.ManagerEntries)
+                    entry.Value = 0;
+            }
+        }
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await HoldingsRollupRefresher.Refresh(
+            dbContext,
+            rows.Select(h => h.AccessionNumber).ToHashSet(),
+            rows.Select(h => h.ReportDate).ToHashSet(),
+            cancellationToken
+        );
+        if (transaction != null)
+            await transaction.CommitAsync(cancellationToken);
+        _logger.LogInformation(
+            "Repaired filed values for {Count} principal-denominated positions",
+            rows.Count
+        );
+        return rows.Count;
     }
 
     // One phase's failure must not starve the phases after it; only cancellation propagates.
@@ -212,6 +282,7 @@ public class HoldingValueFallbackRepairService
             .Include(h => h.ManagerEntries)
             .Where(h =>
                 !h.ValuePending
+                && h.ShareType == ShareType.Shares
                 && !h.ValueUnavailable
                 && h.ValueSource == ValueSource.Filed
                 && h.ValueLastRetryAt == null
@@ -244,28 +315,38 @@ public class HoldingValueFallbackRepairService
             return 0;
         }
 
-        var pairs = rows.Select(h => (h.CommonStockId, h.ListedTicker, h.ReportDate))
+        var pairs = rows.Select(h => (h.EquityIssuerId, h.ListedTicker, h.ReportDate))
             .Distinct()
             .ToList();
         var prices = await _stockPriceProvider.GetClosingPrices(pairs, cancellationToken);
 
-        var stockIds = rows.Select(h => h.CommonStockId).Distinct().ToList();
+        var stockIds = rows.Select(h => h.EquityIssuerId).Distinct().ToList();
         var splitsByStock = (
             await dbContext
                 .Set<StockSplit>()
-                .Where(s => stockIds.Contains(s.CommonStockId))
+                .Where(s => stockIds.Contains(s.EquityIssuerId))
                 .ToListAsync(cancellationToken)
         )
-            .GroupBy(s => s.CommonStockId)
+            .GroupBy(s => s.EquityIssuerId)
             .ToDictionary(g => g.Key, g => g.ToList());
         var tickerIdentities = await dbContext
-            .Set<CommonStock>()
+            .Set<EquityIssuer>()
             .Where(cs => stockIds.Contains(cs.Id))
             .Select(cs => new
             {
                 cs.Id,
-                cs.Ticker,
-                cs.SecondaryTickers,
+                Ticker = cs.Presentation.Listing.Ticker,
+                SecondaryTickers = cs
+                    .Securities.SelectMany(nativeSecurity => nativeSecurity.Listings)
+                    .Where(nativeListing =>
+                        nativeListing.MarketCountryCode == "US"
+                        && (
+                            nativeListing.IsDirectoryListed
+                            && nativeListing.Id != cs.Presentation.EquityListingId
+                        )
+                    )
+                    .Select(nativeListing => nativeListing.Ticker)
+                    .ToList(),
             })
             .ToListAsync(cancellationToken);
         var primaryTickers = tickerIdentities.ToDictionary(cs => cs.Id, cs => cs.Ticker);
@@ -287,7 +368,7 @@ public class HoldingValueFallbackRepairService
             // a reset row is always one it can republish.
             if (
                 !prices.TryGetValue(
-                    (holding.CommonStockId, holding.ListedTicker, holding.ReportDate),
+                    (holding.EquityIssuerId, holding.ListedTicker, holding.ReportDate),
                     out var closePrice
                 )
                 || closePrice <= 0
@@ -298,9 +379,9 @@ public class HoldingValueFallbackRepairService
                 continue;
             }
 
-            splitsByStock.TryGetValue(holding.CommonStockId, out var splits);
-            primaryTickers.TryGetValue(holding.CommonStockId, out var primaryTicker);
-            secondaryTickers.TryGetValue(holding.CommonStockId, out var listedSecondaries);
+            splitsByStock.TryGetValue(holding.EquityIssuerId, out var splits);
+            primaryTickers.TryGetValue(holding.EquityIssuerId, out var primaryTicker);
+            secondaryTickers.TryGetValue(holding.EquityIssuerId, out var listedSecondaries);
             if (
                 !HoldingValueBasis.TryResolveShareCountFactor(
                     holding.ReportDate,
@@ -463,6 +544,7 @@ public class HoldingValueFallbackRepairService
             .Include(h => h.ManagerEntries)
             .Where(h =>
                 !h.ValuePending
+                && h.ShareType == ShareType.Shares
                 && h.ValueSource != ValueSource.Filed
                 && h.Shares > 0
                 && (decimal)h.Value > HoldingValueSanityGuard.MaxPlausibleSharePrice * h.Shares

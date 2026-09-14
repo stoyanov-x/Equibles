@@ -104,16 +104,16 @@ public class HoldingValueFallbackRepairServiceTests : IDisposable
         ValueSource valueSource = ValueSource.Derived,
         string accession = null,
         int valueRetryCount = 0,
-        DateTime? valueLastRetryAt = null
+        DateTime? valueLastRetryAt = null,
+        ShareType shareType = ShareType.Shares
     )
     {
         var seedContext = CreateSharedContext();
-        var stock = new CommonStock
-        {
-            Id = Guid.NewGuid(),
-            Ticker = Guid.NewGuid().ToString()[..4],
-            Name = "Issuer",
-        };
+        EquityIssuer stock = Equibles.TestSupport.EquityIssuerSeed.Create(
+            Id: Guid.NewGuid(),
+            Ticker: Guid.NewGuid().ToString()[..4],
+            Name: "Issuer"
+        );
         var holder = new InstitutionalHolder
         {
             Id = Guid.NewGuid(),
@@ -123,7 +123,7 @@ public class HoldingValueFallbackRepairServiceTests : IDisposable
         var holding = new InstitutionalHolding
         {
             Id = Guid.NewGuid(),
-            CommonStockId = stock.Id,
+            EquityIssuerId = stock.Id,
             InstitutionalHolderId = holder.Id,
             ReportDate = new DateOnly(2026, 3, 31),
             FilingDate = new DateOnly(2026, 5, 10),
@@ -135,7 +135,7 @@ public class HoldingValueFallbackRepairServiceTests : IDisposable
             ValueSource = valueSource,
             ValueRetryCount = valueRetryCount,
             ValueLastRetryAt = valueLastRetryAt,
-            ShareType = ShareType.Shares,
+            ShareType = shareType,
             InvestmentDiscretion = InvestmentDiscretion.Sole,
             AccessionNumber = accession ?? Guid.NewGuid().ToString()[..20],
             ManagerEntries =
@@ -150,11 +150,83 @@ public class HoldingValueFallbackRepairServiceTests : IDisposable
             ],
         };
 
-        seedContext.Set<CommonStock>().Add(stock);
+        seedContext.Set<EquityIssuer>().Add(stock);
         seedContext.Set<InstitutionalHolder>().Add(holder);
         seedContext.Set<InstitutionalHolding>().Add(holding);
         await seedContext.SaveChangesAsync();
         return holding;
+    }
+
+    [Fact]
+    public async Task Repair_PrincipalPublishesFiledValuesAndNeverRepricesThem()
+    {
+        var accession = Guid.NewGuid().ToString()[..20];
+        var rows = new List<InstitutionalHolding>();
+        for (var i = 0; i < 3; i++)
+        {
+            var holding = await SeedHolding(
+                45_000_000L,
+                45_000L,
+                900_000L,
+                valueUnavailable: i == 1,
+                valuePending: i == 2,
+                accession: accession,
+                shareType: ShareType.Principal
+            );
+            PriceAt(holding, 50m);
+            rows.Add(holding);
+        }
+        using (var stockContext = CreateSharedContext())
+        {
+            foreach (
+                EquityIssuer stock in await stockContext
+                    .Set<EquityIssuer>()
+                    .Include(issuer => issuer.Presentation.Listing.Security)
+                    .ToListAsync()
+            )
+            {
+                stock.Presentation.Listing.Security.SharesOutstanding = 100_000;
+                stock.Presentation.Listing.Security.MarketCapitalization = 5_000_000;
+            }
+            await stockContext.SaveChangesAsync();
+        }
+        var service = CreateService();
+        (await service.Repair(CancellationToken.None)).Should().Be(3);
+        var impossibleRepair = new ImpossiblePositionRepairService(
+            CreateScopeFactory(),
+            Substitute.For<ILogger<ImpossiblePositionRepairService>>()
+        );
+        (await impossibleRepair.Repair(CancellationToken.None)).Should().Be(0);
+        foreach (var row in rows)
+        {
+            var actual = await Reload(row.Id);
+            actual.Shares.Should().Be(900_000L);
+            actual.Value.Should().Be(45_000L);
+            actual.ValueSource.Should().Be(ValueSource.Filed);
+            actual.ValuePending.Should().BeFalse();
+            actual.ValueUnavailable.Should().BeFalse();
+            actual.ManagerEntries.Should().ContainSingle().Which.Value.Should().Be(45_000L);
+        }
+        (await service.Repair(CancellationToken.None)).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Repair_PrincipalWithoutFiledValueBecomesUnavailable()
+    {
+        var row = await SeedHolding(
+            45_000_000L,
+            null,
+            900_000L,
+            valuePending: true,
+            shareType: ShareType.Principal
+        );
+        var service = CreateService();
+        (await service.Repair(CancellationToken.None)).Should().Be(1);
+        var actual = await Reload(row.Id);
+        actual.Value.Should().Be(0L);
+        actual.ValuePending.Should().BeFalse();
+        actual.ValueUnavailable.Should().BeTrue();
+        (await service.Repair(CancellationToken.None)).Should().Be(0);
     }
 
     private async Task<InstitutionalHolding> Reload(Guid holdingId)
@@ -167,7 +239,7 @@ public class HoldingValueFallbackRepairServiceTests : IDisposable
     }
 
     private void PriceAt(InstitutionalHolding holding, decimal close) =>
-        _prices[(holding.CommonStockId, holding.ListedTicker, holding.ReportDate)] = close;
+        _prices[(holding.EquityIssuerId, holding.ListedTicker, holding.ReportDate)] = close;
 
     // The production signature (SG Americas / AAPL, 2026-06-30): the filer reports the VALUE
     // column in thousands, the close arrived after the publish decision, and every row froze

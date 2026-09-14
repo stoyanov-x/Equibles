@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Reflection;
 using Equibles.CommonStocks.BusinessLogic;
 using Equibles.CommonStocks.Data;
@@ -28,12 +29,13 @@ namespace Equibles.UnitTests.Sec;
 /// </summary>
 public class CompanySyncServiceUpdateExistingWebsiteRefillTests
 {
-    public CompanySyncServiceUpdateExistingWebsiteRefillTests()
-    {
-        // The blank-website memo is static process state; earlier tests sharing a
-        // CIK would otherwise suppress the refill fetch these tests pin.
-        CompanySyncService.ClearBlankWebsiteMemoForTests();
-    }
+    private static long _nextCik = 9_000_000_000;
+
+    // A process-wide memo makes a shared CIK unsafe across parallel test classes. Give each
+    // case its own key instead of clearing memo entries another test may still be using.
+    private readonly string _cik = Interlocked
+        .Increment(ref _nextCik)
+        .ToString(CultureInfo.InvariantCulture);
 
     private static EquiblesFinancialDbContext NewDb()
     {
@@ -62,21 +64,24 @@ public class CompanySyncServiceUpdateExistingWebsiteRefillTests
             Substitute.For<IBus>()
         );
 
-    private static object BuildState(EquiblesFinancialDbContext db, CommonStock existingStock)
+    private static object BuildState(EquiblesFinancialDbContext db, EquityIssuer existingStock)
     {
         var t = typeof(CompanySyncService).GetNestedType("StockSyncState", BindingFlags.NonPublic);
         var s = Activator.CreateInstance(t);
         void Set(string n, object v) => t.GetProperty(n).SetValue(s, v);
         Set("SecCiks", new HashSet<string> { existingStock.Cik });
-        Set("ExistingStocks", new List<CommonStock> { existingStock });
+        Set("ExistingStocks", new List<EquityIssuer> { existingStock });
         Set("ExistingCiks", new HashSet<string> { existingStock.Cik });
-        Set("ExistingPrimaryTickers", new HashSet<string> { existingStock.Ticker });
-        Set("PrimaryTickerToStock", new Dictionary<string, CommonStock>());
-        Set("SecondaryCikToParent", new Dictionary<string, CommonStock>());
-        Set("CommonStockRepository", new CommonStockRepository(db));
+        Set(
+            "ExistingPrimaryTickers",
+            new HashSet<string> { existingStock.Presentation.Listing.Ticker }
+        );
+        Set("PrimaryTickerToStock", new Dictionary<string, EquityIssuer>());
+        Set("SecondaryCikToParent", new Dictionary<string, EquityIssuer>());
+        Set("CommonStockRepository", new EquityIssuerRepository(db));
         Set(
             "CommonStockManager",
-            new CommonStockManager(new CommonStockRepository(db), Substitute.For<IBus>())
+            new EquityIdentityManager(new EquityIssuerRepository(db), Substitute.For<IBus>())
         );
         Set("DbContext", db);
         return s;
@@ -96,31 +101,32 @@ public class CompanySyncServiceUpdateExistingWebsiteRefillTests
         return (Task)m.Invoke(sut, [secCompany, primaryTicker, new List<string>(), state]);
     }
 
-    private static async Task<(EquiblesFinancialDbContext Db, CommonStock Stock)> SeedStock(
+    private async Task<(EquiblesFinancialDbContext Db, EquityIssuer Stock)> SeedStock(
         string website
     )
     {
         var db = NewDb();
-        db.Set<CommonStock>()
+        db.Set<EquityIssuer>()
             .Add(
-                new CommonStock
-                {
-                    Cik = "0000000002",
-                    Ticker = "EXM",
-                    Name = "Example Corp",
-                    Website = website,
-                }
+                Equibles.TestSupport.EquityIssuerSeed.Create(
+                    Cik: _cik,
+                    Ticker: "EXM",
+                    Name: "Example Corp",
+                    Website: website
+                )
             );
         await db.SaveChangesAsync();
         db.ChangeTracker.Clear();
-        var stock = await db.Set<CommonStock>().FirstAsync(s => s.Cik == "0000000002");
+        EquityIssuer stock = await new EquityIssuerRepository(db)
+            .GetAll()
+            .FirstAsync(s => s.Cik == _cik);
         return (db, stock);
     }
 
-    private static CompanyInfo UnchangedCompanyInfo() =>
+    private CompanyInfo UnchangedCompanyInfo() =>
         new()
         {
-            Cik = "0000000002",
+            Cik = _cik,
             Name = "Example Corp",
             Tickers = ["EXM"],
         };
@@ -132,12 +138,14 @@ public class CompanySyncServiceUpdateExistingWebsiteRefillTests
         using var _ = db;
         var edgar = Substitute.For<ISecEdgarClient>();
         edgar
-            .GetCompanyMetadata("0000000002")
+            .GetCompanyMetadata(_cik)
             .Returns(new CompanyMetadata { Website = "https://www.example.com" });
 
         await Invoke(BuildSut(edgar), UnchangedCompanyInfo(), "EXM", BuildState(db, stock));
 
-        var updated = await db.Set<CommonStock>().FirstAsync(s => s.Cik == "0000000002");
+        EquityIssuer updated = await new EquityIssuerRepository(db)
+            .GetAll()
+            .FirstAsync(s => s.Cik == _cik);
         updated.Website.Should().Be("https://www.example.com");
     }
 
@@ -147,11 +155,13 @@ public class CompanySyncServiceUpdateExistingWebsiteRefillTests
         var (db, stock) = await SeedStock("");
         using var _ = db;
         var edgar = Substitute.For<ISecEdgarClient>();
-        edgar.GetCompanyMetadata("0000000002").Returns(new CompanyMetadata { Website = "" });
+        edgar.GetCompanyMetadata(_cik).Returns(new CompanyMetadata { Website = "" });
 
         await Invoke(BuildSut(edgar), UnchangedCompanyInfo(), "EXM", BuildState(db, stock));
 
-        var updated = await db.Set<CommonStock>().FirstAsync(s => s.Cik == "0000000002");
+        EquityIssuer updated = await new EquityIssuerRepository(db)
+            .GetAll()
+            .FirstAsync(s => s.Cik == _cik);
         updated.Website.Should().BeNull();
     }
 
@@ -165,7 +175,9 @@ public class CompanySyncServiceUpdateExistingWebsiteRefillTests
         await Invoke(BuildSut(edgar), UnchangedCompanyInfo(), "EXM", BuildState(db, stock));
 
         await edgar.DidNotReceive().GetCompanyMetadata(Arg.Any<string>());
-        var updated = await db.Set<CommonStock>().FirstAsync(s => s.Cik == "0000000002");
+        EquityIssuer updated = await new EquityIssuerRepository(db)
+            .GetAll()
+            .FirstAsync(s => s.Cik == _cik);
         updated.Website.Should().Be("https://www.already-set.com");
     }
 }

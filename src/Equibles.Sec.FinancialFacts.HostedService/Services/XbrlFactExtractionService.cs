@@ -64,7 +64,8 @@ public class XbrlFactExtractionService
     // envelopes; the re-drain classifies every stock's ListedSecurityType.
     // Version 5: preserve every cover-page symbol observation as dated issuer evidence.
     // Version 6: fill absent standard consolidated facts in foreign financial reports.
-    public const int CurrentVersion = 6;
+    // Version 7 replays derived fiscal identities for interim instants and existing rows.
+    public const int CurrentVersion = 8;
 
     private const int InsertBatchSize = 1000;
 
@@ -99,6 +100,7 @@ public class XbrlFactExtractionService
     private readonly InlineXbrlParser _inlineParser;
     private readonly StandaloneXbrlParser _standaloneParser;
     private readonly IFileManager _fileManager;
+    private readonly FiscalCalendarEvidenceReader _calendarReader;
     private readonly ILogger<XbrlFactExtractionService> _logger;
 
     public XbrlFactExtractionService(
@@ -106,13 +108,15 @@ public class XbrlFactExtractionService
         InlineXbrlParser inlineParser,
         StandaloneXbrlParser standaloneParser,
         IFileManager fileManager,
-        ILogger<XbrlFactExtractionService> logger
+        ILogger<XbrlFactExtractionService> logger,
+        FiscalCalendarEvidenceReader calendarReader = null
     )
     {
         _scopeFactory = scopeFactory;
         _inlineParser = inlineParser;
         _standaloneParser = standaloneParser;
         _fileManager = fileManager;
+        _calendarReader = calendarReader;
         _logger = logger;
     }
 
@@ -120,7 +124,7 @@ public class XbrlFactExtractionService
     /// Parses the document's captured envelope and upserts its dimensional
     /// facts. Returns the number of facts persisted. Expects
     /// <c>document.XbrlContent</c> (and its content bytes) to be loadable and
-    /// <c>document.CommonStock</c> to be set.
+    /// <c>document.Issuer</c> to be set.
     /// </summary>
     public async Task<int> Extract(Document document, CancellationToken cancellationToken)
     {
@@ -190,17 +194,41 @@ public class XbrlFactExtractionService
 
         var conceptIds = await ResolveConcepts(persistable, cancellationToken);
 
-        var stock = document.CommonStock;
+        var stock = document.Issuer;
+        var incomingAnnualPeriods = parsed
+            .Where(f =>
+                !f.IsInstant
+                && f.Dimensions.Count == 0
+                && f.PeriodEnd.DayNumber - f.PeriodStart.DayNumber is >= 350 and <= 380
+            )
+            .Select(f => (Start: f.PeriodStart, End: f.PeriodEnd))
+            .Distinct()
+            .ToArray();
+        var calendar =
+            _calendarReader == null
+                ? new HistoricalFiscalCalendar(
+                    [],
+                    [],
+                    stock.FiscalYearEndMonth,
+                    stock.FiscalYearEndDay
+                )
+                : await _calendarReader.Read(stock.Id, incomingAnnualPeriods, cancellationToken);
         var facts = new List<FinancialFact>();
         var consolidatedFills = new List<FinancialFact>();
         var dimensionsByKey = new Dictionary<string, List<ParsedXbrlDimension>>(
             StringComparer.Ordinal
         );
+        var deferredCalendarFacts = 0;
         foreach (var candidate in persistable)
         {
+            if (calendar.RefusesCalendar(candidate.Fact.PeriodStart, candidate.Fact.PeriodEnd))
+            {
+                deferredCalendarFacts++;
+                continue;
+            }
             if (!conceptIds.TryGetValue((candidate.Taxonomy, candidate.Tag), out var conceptId))
                 continue;
-            var fact = BuildFact(document, stock, candidate, conceptId);
+            var fact = BuildFact(document, stock, candidate, conceptId, calendar);
             if (candidate.Taxonomy != FactTaxonomy.Custom && candidate.DimensionsKey == "")
                 consolidatedFills.Add(fact);
             else
@@ -209,14 +237,24 @@ public class XbrlFactExtractionService
         }
 
         await BatchPersister.Persist(facts, InsertBatchSize, items => FlushFacts(items, false));
-        await BatchPersister.Persist(
-            consolidatedFills,
-            InsertBatchSize,
-            items => FlushFacts(items, true)
-        );
+        foreach (
+            var group in consolidatedFills.GroupBy(fact =>
+                calendar.Resolve(fact.PeriodStart, fact.PeriodEnd) != null
+            )
+        )
+        {
+            await BatchPersister.Persist(
+                group.ToList(),
+                InsertBatchSize,
+                items => FlushFacts(items, true, refreshFiscalIdentity: group.Key)
+            );
+        }
         await PersistDimensions(document, dimensionsByKey, cancellationToken);
 
-        return facts.Count + consolidatedFills.Count;
+        var persistedCount = facts.Count + consolidatedFills.Count;
+        if (deferredCalendarFacts > 0)
+            throw new FiscalCalendarEvidencePendingException(persistedCount, deferredCalendarFacts);
+        return persistedCount;
     }
 
     /// <summary>
@@ -291,7 +329,7 @@ public class XbrlFactExtractionService
             return false;
 
         var sourceCik = fact.ConsolidatedCik;
-        var issuerCik = document.CommonStock?.Cik;
+        var issuerCik = document.Issuer?.Cik;
         return !string.IsNullOrEmpty(sourceCik)
             && !string.IsNullOrEmpty(issuerCik)
             && sourceCik.All(char.IsAsciiDigit)
@@ -429,15 +467,20 @@ public class XbrlFactExtractionService
         DateOnly periodStart,
         DateOnly periodEnd,
         int? fiscalYearEndMonth,
-        int? fiscalYearEndDay
+        int? fiscalYearEndDay,
+        HistoricalFiscalCalendar calendar = null
     )
     {
-        var resolved = FiscalPeriodResolver.Resolve(
-            periodStart,
-            periodEnd,
-            fiscalYearEndMonth,
-            fiscalYearEndDay
-        );
+        var resolved =
+            calendar != null
+                ? calendar.Resolve(periodStart, periodEnd)
+                : FiscalPeriodResolver.Resolve(
+                    periodStart,
+                    periodEnd,
+                    fiscalYearEndMonth,
+                    fiscalYearEndDay,
+                    classifyInterimInstants: true
+                );
         if (resolved != null)
             return resolved.Value;
 
@@ -458,9 +501,10 @@ public class XbrlFactExtractionService
 
     private static FinancialFact BuildFact(
         Document document,
-        CommonStock stock,
+        EquityIssuer stock,
         PersistableXbrlFact candidate,
-        Guid conceptId
+        Guid conceptId,
+        HistoricalFiscalCalendar calendar
     )
     {
         var fact = candidate.Fact;
@@ -468,12 +512,13 @@ public class XbrlFactExtractionService
             fact.PeriodStart,
             fact.PeriodEnd,
             stock.FiscalYearEndMonth,
-            stock.FiscalYearEndDay
+            stock.FiscalYearEndDay,
+            calendar
         );
 
         return new FinancialFact
         {
-            CommonStockId = stock.Id,
+            EquityIssuerId = stock.Id,
             FinancialConceptId = conceptId,
             DocumentId = document.Id,
             Unit = fact.Unit,
@@ -550,10 +595,10 @@ public class XbrlFactExtractionService
     }
 
     /// <summary>
-    /// Upserts the filing's cover-page 12(b) rows into <see cref="ListedSecurity"/>
+    /// Upserts the filing's cover-page 12(b) rows into <see cref="IssuerSecurityRegistration"/>
     /// (per-symbol, newer filing wins — the historical drain visits old filings
     /// after new ones, so an older statement never overwrites a newer row) and
-    /// re-materializes the stock's <see cref="CommonStock.ListedSecurityType"/>
+    /// re-materializes the stock's <see cref="EquitySecurity.RegistrationType"/>
     /// from the row matching its ticker. A filing with no usable 12(b) rows
     /// leaves both untouched: absence of the table is not evidence the
     /// previously-stated rows stopped being true (many report types omit the
@@ -579,20 +624,19 @@ public class XbrlFactExtractionService
             return;
 
         using var scope = _scopeFactory.CreateScope();
-        var stockRepository = scope.ServiceProvider.GetRequiredService<CommonStockRepository>();
-        var listedRepository = scope.ServiceProvider.GetRequiredService<ListedSecurityRepository>();
+        var listedRepository =
+            scope.ServiceProvider.GetRequiredService<IssuerSecurityRegistrationRepository>();
         var evidenceRepository =
-            scope.ServiceProvider.GetRequiredService<CommonStockTickerEvidenceRepository>();
+            scope.ServiceProvider.GetRequiredService<EquityIssuerTickerEvidenceRepository>();
 
-        var stock = await stockRepository
-            .GetByIds([document.CommonStockId])
-            .FirstOrDefaultAsync(cancellationToken);
-        if (stock == null)
-            return;
+        var issuerRepository = scope.ServiceProvider.GetRequiredService<EquityIssuerRepository>();
+        var issuer =
+            await issuerRepository.Get(document.EquityIssuerId)
+            ?? throw new InvalidOperationException("The filing's native issuer is missing.");
 
-        var evidence = incoming.Keys.Select(symbol => new CommonStockTickerEvidence
+        var evidence = incoming.Keys.Select(symbol => new EquityIssuerTickerEvidence
         {
-            CommonStockId = stock.Id,
+            EquityIssuerId = issuer.Id,
             Ticker = symbol,
             FiledDate = document.ReportingDate,
             SourceDocumentId = document.Id,
@@ -601,7 +645,7 @@ public class XbrlFactExtractionService
         await evidenceRepository.UpsertRange(evidence, cancellationToken);
 
         var existingBySymbol = await listedRepository
-            .GetByStock(stock)
+            .GetByIssuerId(issuer.Id)
             .ToDictionaryAsync(row => row.TradingSymbol, StringComparer.Ordinal, cancellationToken);
 
         foreach (var (symbol, listing) in incoming)
@@ -614,7 +658,11 @@ public class XbrlFactExtractionService
             else
             {
                 row = listedRepository.Add(
-                    new ListedSecurity { CommonStockId = stock.Id, TradingSymbol = symbol }
+                    new IssuerSecurityRegistration
+                    {
+                        EquityIssuerId = issuer.Id,
+                        TradingSymbol = symbol,
+                    }
                 );
                 existingBySymbol[symbol] = row;
             }
@@ -625,13 +673,15 @@ public class XbrlFactExtractionService
             row.FiledDate = document.ReportingDate;
         }
 
-        // Classification is derived state: recompute from the freshest statement
-        // about the stock's own ticker, whichever filing this pass processed.
-        var tickerSymbol = NormalizeTradingSymbol(stock.Ticker);
+        // Apply a filed classification only to the explicitly selected native security.
+        var primaryListing = issuer.Presentation?.Listing;
+        var tickerSymbol = NormalizeTradingSymbol(primaryListing?.Ticker);
         if (tickerSymbol != null && existingBySymbol.TryGetValue(tickerSymbol, out var tickerRow))
         {
-            stock.ListedSecurityType = ListedSecurityClassifier.Classify(tickerRow.Title);
-            stock.ListedSecurityTitle = tickerRow.Title;
+            primaryListing.Security.RegistrationType = ListedSecurityClassifier.Classify(
+                tickerRow.Title
+            );
+            primaryListing.Security.RegistrationTitle = tickerRow.Title;
         }
 
         await listedRepository.SaveChanges();
@@ -668,7 +718,11 @@ public class XbrlFactExtractionService
         return value.Length <= maxLength ? value : value.Substring(0, maxLength);
     }
 
-    private async Task FlushFacts(List<FinancialFact> items, bool fillOnly)
+    private async Task FlushFacts(
+        List<FinancialFact> items,
+        bool fillOnly,
+        bool refreshFiscalIdentity = true
+    )
     {
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<EquiblesFinancialDbContext>();
@@ -680,7 +734,7 @@ public class XbrlFactExtractionService
             // DimensionsKey) or Postgres can't infer the ON CONFLICT target.
             .On(f => new
             {
-                f.CommonStockId,
+                f.EquityIssuerId,
                 f.FinancialConceptId,
                 f.Unit,
                 f.PeriodStart,
@@ -688,9 +742,26 @@ public class XbrlFactExtractionService
                 f.AccessionNumber,
                 f.DimensionsKey,
             });
+        if (fillOnly && !refreshFiscalIdentity)
+        {
+            // Calendar fallback must not replace fiscal labels supplied by the SEC.
+            await upsert.NoUpdate().RunAsync();
+            return;
+        }
         if (fillOnly)
         {
-            await upsert.NoUpdate().RunAsync();
+            // Preserve authoritative values and provenance; fiscal labels are derived
+            // from the same natural-key dates and must follow the current resolver.
+            await upsert
+                .WhenMatched(
+                    (existing, incoming) =>
+                        new FinancialFact
+                        {
+                            FiscalYear = incoming.FiscalYear,
+                            FiscalPeriod = incoming.FiscalPeriod,
+                        }
+                )
+                .RunAsync();
             return;
         }
         await upsert
@@ -698,6 +769,8 @@ public class XbrlFactExtractionService
                 (existing, incoming) =>
                     new FinancialFact
                     {
+                        FiscalYear = incoming.FiscalYear,
+                        FiscalPeriod = incoming.FiscalPeriod,
                         Value = incoming.Value,
                         FiledDate = incoming.FiledDate,
                         DocumentId = incoming.DocumentId,

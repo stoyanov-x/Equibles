@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
 using Equibles.CommonStocks.Data.Models;
 using Microsoft.EntityFrameworkCore;
@@ -8,7 +9,7 @@ namespace Equibles.Sec.FinancialFacts.Data.Models;
 /// Per-company ingestion checkpoint. Lets the scraper skip companies whose
 /// Company Facts have not changed since the last successful sync.
 /// </summary>
-[Index(nameof(CommonStockId), IsUnique = true)]
+[Index(nameof(EquityIssuerId), IsUnique = true)]
 public class FinancialFactsSyncStatus
 {
     // Client-generated Guid key. Without DatabaseGeneratedOption.None EF marks
@@ -17,8 +18,9 @@ public class FinancialFactsSyncStatus
     [DatabaseGenerated(DatabaseGeneratedOption.None)]
     public Guid Id { get; set; } = Guid.NewGuid();
 
-    public Guid CommonStockId { get; set; }
-    public virtual CommonStock CommonStock { get; set; }
+    // Retain the deployed column name until every older binary has retired.
+    public Guid EquityIssuerId { get; set; }
+    public virtual EquityIssuer Issuer { get; set; }
 
     public DateTime LastCheckedAt { get; set; }
 
@@ -30,6 +32,10 @@ public class FinancialFactsSyncStatus
     /// A lower value forces a full-history replay even when no newer filing exists.
     /// </summary>
     public int ImporterVersion { get; set; }
+
+    /// <summary>Source calendar evidence used by the last successful full-history import.</summary>
+    [MaxLength(64)]
+    public string CalendarEvidenceFingerprint { get; set; }
 
     /// <summary>
     /// When the concept-metadata sweep (labels, descriptions, balance from the

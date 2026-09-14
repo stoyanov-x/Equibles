@@ -7,6 +7,18 @@ public class InsiderTradingModuleConfiguration : Equibles.Data.IFinancialModule
 {
     public void ConfigureEntities(ModelBuilder builder)
     {
+        builder
+            .Entity<Form144Filing>()
+            .HasOne(row => row.Issuer)
+            .WithMany()
+            .HasForeignKey(row => row.EquityIssuerId)
+            .OnDelete(DeleteBehavior.Restrict);
+        builder
+            .Entity<InsiderTransaction>()
+            .HasOne(row => row.Issuer)
+            .WithMany()
+            .HasForeignKey(row => row.EquityIssuerId)
+            .OnDelete(DeleteBehavior.Restrict);
         builder.Entity<InsiderOwner>();
         builder.Entity<Form144Filing>();
         builder.Entity<Form144PriorSale>();
@@ -14,7 +26,13 @@ public class InsiderTradingModuleConfiguration : Equibles.Data.IFinancialModule
         // IsPriceValid is intentionally left with no SQL default: a freshly
         // inserted row is null ("not evaluated yet") until the parser (or a
         // maintenance recompute) cross-checks it against the market close.
-        builder.Entity<InsiderTransaction>();
+        // Retain rejected source dates for audit, but never expose them as usable trades.
+        // Replay explicitly opts into the raw rows to restore source identity.
+        builder
+            .Entity<InsiderTransaction>()
+            .HasQueryFilter(t =>
+                t.TransactionDate >= new DateOnly(1900, 1, 1) && t.TransactionDate <= t.FilingDate
+            );
         // Notes is a NOT NULL text[]; default existing rows to an empty array so
         // the column can be added without a backfill (the reprocess pass fills it).
         // IsRequired is explicit because nullable reference types are off, so EF
@@ -68,7 +86,7 @@ public class InsiderTradingModuleConfiguration : Equibles.Data.IFinancialModule
                 t.IsPriceValid,
                 t.SecurityKind,
                 t.SecurityTitle,
-                t.CommonStockId,
+                t.EquityIssuerId,
                 t.InsiderOwnerId,
                 t.TransactionCode,
                 t.IsRule10b5One,
