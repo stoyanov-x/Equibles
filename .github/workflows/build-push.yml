@@ -15,6 +15,18 @@ on:
       - "**/Dockerfile"
       - "Directory.*"
       - "*.sln"
+  # sync-upstream.yml pushes with the default GITHUB_TOKEN, and GitHub's
+  # recursion prevention means a token-pushed commit cannot trigger another
+  # workflow. So the push-trigger above never fires after an upstream sync and
+  # images silently go stale — observed 2026-09-14: upstream merged 1198 files
+  # at 03:34 while the newest images were six days old (Sep 08). workflow_run
+  # is the supported way to chain the two.
+  #
+  # Builds whatever is on main when the sync completes. A failed sync is
+  # harmless here: it would just rebuild the current main.
+  workflow_run:
+    workflows: ["Sync upstream into fork"]
+    types: [completed]
   workflow_dispatch: {}
 
 permissions:
