@@ -10,11 +10,16 @@ services:
   db:
     image: paradedb/paradedb:latest
     # Throttle the database so it cannot starve the other ~19 containers on the
-    # 2-core prod box (measured at 50% of the machine with no cgroup limit at
-    # all). A cap does NOT create capacity -- it only decides who loses the race,
-    # so memory stays generous (shared_buffers alone is ~954 MB) and only CPU is
-    # squeezed.
-    cpus: "0.5"
+    # 2-core prod box. A cap does NOT create capacity -- it only decides who
+    # loses the race, so memory stays generous (shared_buffers alone is ~954 MB)
+    # and only CPU is squeezed.
+    #
+    # 0.5 was too tight. During the 2026-09 issuer backfill migration the cgroup
+    # reported 5905 of 6326 periods throttled (93%), which stretched a ~75 minute
+    # migration out far longer and blew web's healthcheck budget. 0.75 keeps the
+    # database from winning every race while leaving burst headroom above the
+    # ~0.44 core it draws at steady state.
+    cpus: "0.75"
     # Sized from measured cgroup memory, not guesswork. Postgres is NOT
     # cgroup-aware: it will happily exceed a limit and get OOM-killed, so this
     # must clear its non-reclaimable floor (anon ~98 MB + shared_buffers
@@ -95,6 +100,21 @@ services:
       Worker__MinSyncDate: ${Worker__MinSyncDate:-}
     volumes:
       - web-keys:/app/keys
+    # Overrides the image's HEALTHCHECK (--start-period=10m). Web runs the EF
+    # migrations on boot, so /healthz stays down for the entire migration, while
+    # worker and mcp gate on `web: service_healthy`. The 2026-09 issuer backfill
+    # took ~75 minutes on this 2-core box, the 10m window expired, Coolify marked
+    # the deployment failed, and worker/mcp were never started -- even though the
+    # migration itself finished cleanly. A long start period cannot slow a
+    # healthy start (Docker only uses it to suppress failures for a container
+    # that is still starting), so this is deliberate headroom above the observed
+    # worst case rather than a workaround.
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 7200s
     depends_on:
       db:
         condition: service_healthy

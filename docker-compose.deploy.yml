@@ -1,7 +1,7 @@
 services:
   db:
     image: paradedb/paradedb:latest
-    cpus: '0.5'
+    cpus: '0.75'
     mem_limit: 2048m
     command:
     - postgres
@@ -67,6 +67,14 @@ services:
       Worker__MinSyncDate: ${Worker__MinSyncDate:-}
     volumes:
     - web-keys:/app/keys
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl --fail http://localhost:8080/healthz || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 7200s
     depends_on:
       db:
         condition: service_healthy
