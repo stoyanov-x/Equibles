@@ -1,6 +1,14 @@
 services:
   db:
     image: paradedb/paradedb:latest
+    cpus: '0.5'
+    mem_limit: 1536m
+    command:
+    - postgres
+    - -c
+    - max_parallel_workers=2
+    - -c
+    - max_parallel_maintenance_workers=1
     ports:
     - ${EQUIBLES_DB_EXPOSE_PORT:-15432}:5432
     environment:
@@ -64,6 +72,8 @@ services:
         condition: service_healthy
     image: ghcr.io/stoyanov-x/equibles-web:main
   worker:
+    cpus: '0.5'
+    mem_limit: 1024m
     env_file:
     - path: .env
       required: false

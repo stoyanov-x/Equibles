@@ -9,6 +9,24 @@ x-embedding-environment: &embedding-environment
 services:
   db:
     image: paradedb/paradedb:latest
+    # Throttle the database so it cannot starve the other ~19 containers on the
+    # 2-core prod box (measured at 50% of the machine with no cgroup limit at
+    # all). A cap does NOT create capacity -- it only decides who loses the race,
+    # so memory stays generous (shared_buffers alone is ~954 MB) and only CPU is
+    # squeezed.
+    cpus: "0.5"
+    mem_limit: 1536m
+    # ParadeDB ships max_parallel_workers=10. On 2 cores that lets many concurrent
+    # sessions each claim a parallel worker and saturate the CPU. Cap the global
+    # pool (max_parallel_workers_per_gather is already 1) and maintenance too.
+    # shared_preload_libraries (pg_search,pg_cron,pg_stat_statements) comes from
+    # the image's config files, not from this command, so it is unaffected.
+    command:
+      - postgres
+      - -c
+      - max_parallel_workers=2
+      - -c
+      - max_parallel_maintenance_workers=1
     ports:
       - "5432:5432"
     environment:
@@ -79,6 +97,13 @@ services:
     build:
       context: .
       dockerfile: src/Equibles.Worker.Host/Dockerfile
+    # Background consumer, not latency-sensitive -- the cheapest place to reclaim
+    # CPU. It measured ~57% of the entire 2-core box (the single largest
+    # consumer) once the low-disk guard stopped holding it paused, so it is capped
+    # harder than the database. mem_limit stays above its observed ~678 MB so this
+    # cannot turn into an OOM-kill loop.
+    cpus: "0.5"
+    mem_limit: 1024m
     env_file:
       - path: .env
         required: false
