@@ -15,8 +15,14 @@ EQUIBLES_CLOAK, default on):
     docker-compose.embedding.yml  embeddings ON + Ollama services  (EQUIBLES_EMBEDDINGS)
     docker-compose.stealth.yml    CloakBrowser sidecar + stealth    (EQUIBLES_CLOAK)
 
-Meridian-only change applied here (NOT in any upstream file): db host port ->
-${EQUIBLES_DB_EXPOSE_PORT:-5432}:5432 so it can't collide with the host's Postgres.
+Meridian-only changes applied here (NOT in any upstream file):
+  1. db host port -> ${EQUIBLES_DB_EXPOSE_PORT:-5432}:5432 so it can't collide
+     with the host's Postgres.
+  2. `restart: unless-stopped` on every long-running service. Upstream sets no
+     restart policy on db/web/mcp/worker, so a crash left the container stopped
+     and Coolify's nightly docker cleanup then deleted it outright -- the whole
+     scraper fleet vanished while /status still reported "7/8 workers active"
+     (that page reads configuration, not container state).
 """
 from __future__ import annotations
 
@@ -108,6 +114,16 @@ def main() -> int:
     }.items():
         if svc in services:
             services[svc]["ports"] = [f"${{{env}:-{default}}}:{container}"]
+
+    # Meridian-only change #2: a crash must not silently retire a service.
+    # On 2026-09-14 the worker OOM-killed, nothing restarted it, and Coolify's
+    # 00:00 docker cleanup pruned the stopped container *and* its image, so the
+    # box served a stack with no scraper at all until someone noticed the data
+    # had stopped. `unless-stopped` restarts a crash without resurrecting a
+    # service an operator deliberately stopped. cloakbrowser already sets it.
+    for svc in ("worker", "web", "mcp", "db"):
+        if svc in services:
+            services[svc]["restart"] = "unless-stopped"
 
     # Optional: serve prebuilt GHCR images instead of building from source.
     rewrite_to_images(services)

@@ -25,6 +25,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
   mcp:
     ports:
     - ${EQUIBLES_MCP_EXPOSE_PORT:-8081}:8080
@@ -42,6 +43,7 @@ services:
     depends_on:
       web:
         condition: service_healthy
+    restart: unless-stopped
     image: ghcr.io/stoyanov-x/equibles-mcp:main
   web:
     ports:
@@ -78,6 +80,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    restart: unless-stopped
     image: ghcr.io/stoyanov-x/equibles-web:main
   worker:
     cpus: '0.5'
@@ -105,6 +108,7 @@ services:
         condition: service_healthy
       cloakbrowser:
         condition: service_started
+    restart: unless-stopped
     image: ghcr.io/stoyanov-x/equibles-worker:main
   cloakbrowser:
     image: cloakhq/cloakbrowser:0.3.31@sha256:61dee1b490ee8f74b040bc02c3d5384c7f64420b87ccaa26a33f213d07df3f73
