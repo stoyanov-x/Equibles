@@ -4,8 +4,8 @@ Target: `daniel3303/Equibles` (we run a self-hosted fork).
 
 ## Title
 
-**13F ingest can sit at zero holdings forever with an empty error log — every
-zero-result path in FTD CUSIP seeding is silent**
+**[Bug]: FTD CUSIP seeding gives up silently — five zero-result paths log
+nothing, so 13F ingest stays at 0 holdings with an empty error log**
 
 ## Body
 
@@ -21,6 +21,25 @@ Concretely: `FtdScraperWorker` runs on schedule, FTD data imports fine
 (1.1M rows), the realtime 13F sweep discovers and parses filings correctly, and
 every single one is dropped with an `INF`-level line at most. From the operator's
 side the system looks healthy; only the data is missing.
+
+### Relation to existing issues
+
+Not a duplicate of the two closed cold-start reports, both of which are fixed in
+the current code:
+
+* **#817** covered the *bulk* path marking a data set processed with 0 holdings.
+  Fixed: `CusipMappingOutcome.NoTrackedStocks` now returns `IsComplete: false`.
+  Verifiable in our DB — the newest data set is deliberately *not* marked, and
+  the pre-seeded rows all carry `SubmissionCount = 0`.
+* **#851** covered the FTD/Yahoo no-op when `CompanySync` has not populated
+  `CommonStock` yet. Fixed: the empty ticker map now logs `"tracked stock
+  universe is empty (company sync pending) — skipping"` and retries soon. We do
+  **not** hit this — 7,842 `CommonStock` rows exist.
+
+What is left is the step *upstream of both*: the FTD scraper importing 1.1M FTD
+rows over a week while seeding **0** CUSIPs, and logging nothing about why — no
+`Errors` row, and nothing at `Warning`. #817's fix correctly stops the harvest
+from being consumed; it does not make the empty harvest visible.
 
 ### Impact
 
