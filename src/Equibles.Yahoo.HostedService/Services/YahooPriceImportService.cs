@@ -8,6 +8,7 @@ using Equibles.Core.Configuration;
 using Equibles.CorporateActions.BusinessLogic;
 using Equibles.CorporateActions.Data.Models;
 using Equibles.CorporateActions.Repositories;
+using Equibles.EquityMarkets.Data.Catalog;
 using Equibles.Errors.BusinessLogic;
 using Equibles.Errors.Data.Models;
 using Equibles.Integrations.Yahoo.Contracts;
@@ -15,10 +16,10 @@ using Equibles.Integrations.Yahoo.Models;
 using Equibles.Sec.FinancialFacts.BusinessLogic;
 using Equibles.Worker;
 using Equibles.Yahoo.Data.Models;
+using Equibles.Yahoo.Data.Prices;
 using Equibles.Yahoo.HostedService.Configuration;
 using Equibles.Yahoo.Repositories;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -30,6 +31,9 @@ internal readonly record struct LockedPriceSeries(
     bool IsPrimary,
     EquityListingRetirementEvidence HistoricalListing = null
 );
+
+// What a series replacement did with the venue-derived bars it found in its window.
+internal readonly record struct VenueRowReconciliation(int Retained, int Rebased, int Unrefreshed);
 
 internal readonly record struct AppliedSplitBoundary(
     Guid SplitId,
@@ -56,7 +60,6 @@ public class YahooPriceImportService
     private const decimal MaterialSplitRatioFloor = 0.5m;
     private const decimal MaterialSplitRatioCeiling = 2m;
     private const decimal SplitRatioMatchTolerance = 0.25m;
-    private const decimal MaxPriceValue = 99_999_999_999_999.9999m; // numeric(18,4) ceiling
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<YahooPriceImportService> _logger;
@@ -65,7 +68,6 @@ public class YahooPriceImportService
     private readonly ErrorReporter _errorReporter;
     private readonly WorkerOptions _workerOptions;
     private readonly YahooPriceScraperOptions _scraperOptions;
-    private readonly bool _lisbonEnabled;
 
     public bool HasEnrichmentBacklog { get; private set; }
 
@@ -76,8 +78,7 @@ public class YahooPriceImportService
         TickerMapService tickerMapService,
         ErrorReporter errorReporter,
         IOptions<WorkerOptions> workerOptions,
-        IOptions<YahooPriceScraperOptions> scraperOptions,
-        IConfiguration configuration = null
+        IOptions<YahooPriceScraperOptions> scraperOptions
     )
     {
         _scopeFactory = scopeFactory;
@@ -87,7 +88,6 @@ public class YahooPriceImportService
         _errorReporter = errorReporter;
         _workerOptions = workerOptions.Value;
         _scraperOptions = scraperOptions.Value;
-        _lisbonEnabled = configuration?.GetValue<bool>("EquityMarkets:LisbonEnabled") == true;
     }
 
     public Task Import(CancellationToken cancellationToken) =>
@@ -113,7 +113,7 @@ public class YahooPriceImportService
             cancellationToken
         );
         priceTargets.AddRange(await BuildHistoricalPriceTargets(cancellationToken));
-        priceTargets.AddRange(await BuildLisbonPriceTargets(cancellationToken));
+        priceTargets.AddRange(await BuildCatalogPriceTargets(cancellationToken));
         _logger.LogInformation(
             "Starting Yahoo price sync for {SeriesCount} listed symbols across {StockCount} stocks (enrichment: {Enrichment})",
             priceTargets.Count,
@@ -251,41 +251,51 @@ public class YahooPriceImportService
         return targets;
     }
 
-    private bool IsMarketEnabled(PriceSeriesTarget target) =>
-        target.IsUs || _lisbonEnabled && YahooListingSource.IsLisbon(target);
+    // The lane serves US listings and every catalog market; a verified listing only exists because an adapter created it.
+    private static bool IsCatalogMarket(PriceSeriesTarget target) =>
+        target.IsUs || YahooListingSource.Market(target) != null;
 
-    private async Task<List<PriceSeriesTarget>> BuildLisbonPriceTargets(
+    private async Task<List<PriceSeriesTarget>> BuildCatalogPriceTargets(
         CancellationToken cancellationToken
     )
     {
         using var scope = _scopeFactory.CreateScope();
         var repository = scope.ServiceProvider.GetRequiredService<EquityIssuerRepository>();
-        if (!_lisbonEnabled)
-            return [];
-        var claims = LisbonClaims(repository);
-        var rows = await claims
-            .Where(listing =>
-                listing.IdentityState == EquityIdentityState.Verified
-                && listing.TradingCurrency == "EUR"
-                && listing.QuoteUnitMultiplier == 1m
-                && listing.Security.Isin != null
-                && claims.Count(other => other.Ticker == listing.Ticker) == 1
-            )
-            .Select(listing => new PriceSeriesTarget(
-                listing.Ticker,
-                listing.Security.EquityIssuerId,
-                listing.Id,
-                false,
-                false,
-                null,
-                false,
-                null,
-                null,
-                listing.MarketCountryCode,
-                listing.MarketIdentifierCode,
-                listing.Security.Isin
-            ))
-            .ToListAsync(cancellationToken);
+        var rows = new List<PriceSeriesTarget>();
+        foreach (var market in EquityMarketCatalog.All)
+        {
+            var claims = MarketClaims(repository, market);
+            rows.AddRange(
+                await claims
+                    .Where(listing =>
+                        listing.IdentityState == EquityIdentityState.Verified
+                        && listing.TradingCurrency != null
+                        && listing.QuoteUnitMultiplier != null
+                        && listing.Security.Isin != null
+                        && claims.Count(other => other.Ticker == listing.Ticker) == 1
+                    )
+                    // The presentation listing is the issuer's enrichment target and carries the
+                    // attempt stamp, so a verified venue issuer enriches once per interval, not per pass.
+                    .Select(listing => new PriceSeriesTarget(
+                        listing.Ticker,
+                        listing.Security.EquityIssuerId,
+                        listing.Id,
+                        listing.Presentation != null,
+                        false,
+                        listing.Presentation != null ? listing.YahooEnrichmentAttemptedAt : null,
+                        false,
+                        null,
+                        null,
+                        listing.MarketCountryCode,
+                        listing.MarketIdentifierCode,
+                        listing.Security.Isin,
+                        listing.TradingCurrency,
+                        listing.QuoteUnitMultiplier,
+                        listing.YahooPriceSyncAttemptedAt
+                    ))
+                    .ToListAsync(cancellationToken)
+            );
+        }
         if (_workerOptions.TickersToSync.Count == 0)
             return rows;
         var requested = _workerOptions.TickersToSync.ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -295,15 +305,22 @@ public class YahooPriceImportService
             .ToList();
     }
 
-    private static IQueryable<EquityListing> LisbonClaims(EquityIssuerRepository repository) =>
-        repository
+    // Every active claim on the market's venues; a symbol claimed twice stays unpriced until one retires.
+    private static IQueryable<EquityListing> MarketClaims(
+        EquityIssuerRepository repository,
+        EquityMarket market
+    )
+    {
+        var mics = market.MarketIdentifierCodes.ToList();
+        return repository
             .GetSecurities()
             .SelectMany(security => security.Listings)
             .Where(listing =>
                 listing.Active
-                && listing.MarketCountryCode == "PT"
-                && YahooListingSource.LisbonMarkets.Contains(listing.MarketIdentifierCode)
+                && listing.MarketCountryCode == market.CountryCode
+                && mics.Contains(listing.MarketIdentifierCode)
             );
+    }
 
     private static async Task<bool> HasCurrentIdentity(
         EquityIssuerRepository repository,
@@ -314,9 +331,10 @@ public class YahooPriceImportService
         if (target.IsUs)
             return await repository.GetEquityListingId(target.EquityIssuerId, target.Ticker)
                 == target.EquityListingId;
-        if (!YahooListingSource.IsLisbon(target) || target.IsHistorical)
+        var market = YahooListingSource.Market(target);
+        if (market == null || target.IsHistorical)
             return false;
-        var claims = await LisbonClaims(repository)
+        var claims = await MarketClaims(repository, market)
             .Where(listing => listing.Ticker == target.Ticker)
             .Include(listing => listing.Security)
             .Take(2)
@@ -374,7 +392,7 @@ public class YahooPriceImportService
                 row.Listing.Ticker,
                 row.Evidence.EquityIssuerId,
                 row.Listing.Id,
-                IsPrimary: row.Listing.Id == row.Evidence.Issuer.Presentation.EquityListingId,
+                IsPrimary: row.Listing.Presentation != null,
                 RequiresFullHistory: true,
                 YahooEnrichmentAttemptedAt: null,
                 IsHistorical: true,
@@ -406,7 +424,10 @@ public class YahooPriceImportService
         )
             return null;
         if (!target.IsUs)
-            return new LockedPriceSeries(stock, false);
+            return new LockedPriceSeries(
+                stock,
+                stock.Presentation?.EquityListingId == target.EquityListingId
+            );
         EquityListingRetirementEvidence historicalListing = null;
         if (target.IsHistorical)
         {
@@ -482,8 +503,7 @@ public class YahooPriceImportService
             catch (HttpRequestException ex)
             {
                 _logger.LogWarning(ex, "Failed to fetch prices for {Ticker}, skipping", ticker);
-                if (target.IsHistorical)
-                    await StampHistoricalBackfillAttempt(target, cancellationToken);
+                await StampFailedAttempt(target, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -494,8 +514,7 @@ public class YahooPriceImportService
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error importing prices for {Ticker}", ticker);
-                if (target.IsHistorical)
-                    await StampHistoricalBackfillAttempt(target, cancellationToken);
+                await StampFailedAttempt(target, cancellationToken);
                 await _errorReporter.Report(
                     ErrorSource.YahooPriceScraper,
                     $"ImportTicker({ticker})",
@@ -619,7 +638,7 @@ public class YahooPriceImportService
 
     private async Task EnrichTarget(PriceSeriesTarget target, CancellationToken cancellationToken)
     {
-        var ticker = target.Ticker;
+        var ticker = target.ProviderSymbol ?? target.Ticker;
 
         try
         {
@@ -640,7 +659,25 @@ public class YahooPriceImportService
             await _errorReporter.Report(ErrorSource.YahooPriceScraper, $"Enrich({ticker})", ex);
         }
 
-        await StampEnrichmentAttempt(target, DateTime.UtcNow, cancellationToken);
+        // A venue target stamps under the directory-identity lock, which a long reference pass can
+        // hold past the command timeout; that failure costs this target its stamp, not the batch.
+        try
+        {
+            await StampEnrichmentAttempt(target, DateTime.UtcNow, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error stamping the enrichment attempt for {Ticker}", ticker);
+            await _errorReporter.Report(
+                ErrorSource.YahooPriceScraper,
+                $"StampEnrichmentAttempt({ticker})",
+                ex
+            );
+        }
     }
 
     private async Task StampEnrichmentAttempt(
@@ -674,6 +711,49 @@ public class YahooPriceImportService
         )
             return;
         await transaction.CommitAsync(cancellationToken);
+    }
+
+    private async Task StampPriceSyncAttempt(
+        PriceSeriesTarget target,
+        CancellationToken cancellationToken
+    )
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var listings = scope.ServiceProvider.GetRequiredService<EquityListingRepository>();
+            await listings.StampPriceSyncAttempt(
+                target.EquityListingId,
+                target.MarketIdentifierCode,
+                target.Ticker,
+                DateTime.UtcNow,
+                cancellationToken
+            );
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                exception,
+                "Error stamping the price sync attempt for {Ticker}",
+                target.ProviderSymbol
+            );
+        }
+    }
+
+    // A failed fetch is still an attempt: an unserved venue symbol would otherwise refetch from the floor every cycle.
+    private async Task StampFailedAttempt(
+        PriceSeriesTarget target,
+        CancellationToken cancellationToken
+    )
+    {
+        if (target.IsHistorical)
+            await StampHistoricalBackfillAttempt(target, cancellationToken);
+        if (!target.IsUs)
+            await StampPriceSyncAttempt(target, cancellationToken);
     }
 
     private async Task StampHistoricalBackfillAttempt(
@@ -888,10 +968,12 @@ public class YahooPriceImportService
                 HistoricalEvidenceId: evidence?.Id,
                 MarketCountryCode: listing.MarketCountryCode,
                 MarketIdentifierCode: listing.MarketIdentifierCode,
-                Isin: listing.Security.Isin
+                Isin: listing.Security.Isin,
+                TradingCurrency: listing.TradingCurrency,
+                QuoteUnitMultiplier: listing.QuoteUnitMultiplier
             );
             if (
-                !IsMarketEnabled(target)
+                !IsCatalogMarket(target)
                 || !YahooListingSource.MatchesListing(target, listing)
                 || !await HasCurrentIdentity(stockRepository, target, cancellationToken)
             )
@@ -1018,6 +1100,9 @@ public class YahooPriceImportService
         EquityDailyStockPriceRepository priceRepository =
             scope.ServiceProvider.GetRequiredService<EquityDailyStockPriceRepository>();
         var appliedSince = DateTime.UtcNow.AddDays(-AppliedSplitBasisAuditLookbackDays);
+        var catalogMics = EquityMarketCatalog
+            .All.SelectMany(market => market.MarketIdentifierCodes)
+            .ToList();
 
         var boundaries = await splitRepository
             .GetAll()
@@ -1026,11 +1111,7 @@ public class YahooPriceImportService
                 && split.EquityListingId != null
                 && (
                     split.Listing.MarketCountryCode == "US"
-                    || _lisbonEnabled
-                        && split.Listing.MarketCountryCode == "PT"
-                        && YahooListingSource.LisbonMarkets.Contains(
-                            split.Listing.MarketIdentifierCode
-                        )
+                    || catalogMics.Contains(split.Listing.MarketIdentifierCode)
                         && split.Listing.Security.Isin != null
                 )
                 && split.EffectiveDate < today
@@ -1429,6 +1510,7 @@ public class YahooPriceImportService
                 replaceThrough,
                 freshRows,
                 currentSeries,
+                _logger,
                 cancellationToken
             );
             await transaction.CommitAsync(cancellationToken);
@@ -1512,6 +1594,7 @@ public class YahooPriceImportService
         }
 
         var recycledRows = await repo.GetByListing(target.EquityListingId)
+            .YahooOwned()
             .Where(price => price.Date > target.HistoryEndDate!.Value)
             .ToListAsync(cancellationToken);
         if (recycledRows.Count > 0)
@@ -1563,6 +1646,7 @@ public class YahooPriceImportService
                 replaceThrough,
                 freshRows,
                 lockedSeries.Value,
+                logger: null,
                 cancellationToken
             );
 
@@ -1576,7 +1660,11 @@ public class YahooPriceImportService
         }
     }
 
-    private static async Task ReplaceLockedPriceRows(
+    // Swaps the Yahoo-owned rows in the window for the fresh series while keeping venue-derived
+    // bars: a same-basis venue row takes the fresh AdjustedClose and its date is not reinserted,
+    // and a venue row whose close no longer matches the restated series is deleted, because the
+    // venue cannot re-derive an old session on the new basis.
+    private static async Task<VenueRowReconciliation> ReplaceLockedPriceRows(
         EquityDailyStockPriceRepository repo,
         EquityIssuerRepository stockRepo,
         PriceSeriesTarget target,
@@ -1584,6 +1672,7 @@ public class YahooPriceImportService
         DateOnly replaceThrough,
         List<EquityDailyStockPrice> freshRows,
         LockedPriceSeries lockedSeries,
+        ILogger logger,
         CancellationToken cancellationToken
     )
     {
@@ -1605,13 +1694,47 @@ public class YahooPriceImportService
                 )
             )
             .ToListAsync(cancellationToken);
-        if (existing.Count > 0)
+
+        var freshByDate = new Dictionary<DateOnly, EquityDailyStockPrice>();
+        foreach (EquityDailyStockPrice row in freshRows)
+            freshByDate[row.Date] = row;
+
+        var toDelete = new List<EquityDailyStockPrice>();
+        var retainedDates = new HashSet<DateOnly>();
+        var rebased = 0;
+        var unrefreshed = 0;
+        foreach (EquityDailyStockPrice row in existing)
         {
-            repo.Delete(existing);
-            await repo.SaveChanges();
+            if (!VenuePriceSource.IsVenueOwned(row))
+            {
+                toDelete.Add(row);
+                continue;
+            }
+            if (!freshByDate.TryGetValue(row.Date, out EquityDailyStockPrice fresh))
+            {
+                unrefreshed++;
+                continue;
+            }
+            if (DailyBarGuards.IsSameSplitBasis(row.Close, fresh.Close))
+            {
+                row.AdjustedClose = fresh.AdjustedClose;
+                retainedDates.Add(row.Date);
+                continue;
+            }
+            toDelete.Add(row);
+            rebased++;
         }
 
-        foreach (var batch in freshRows.Chunk(InsertBatchSize))
+        if (toDelete.Count > 0)
+            repo.Delete(toDelete);
+        if (toDelete.Count > 0 || retainedDates.Count > 0)
+            await repo.SaveChanges();
+
+        foreach (
+            var batch in freshRows
+                .Where(row => !retainedDates.Contains(row.Date))
+                .Chunk(InsertBatchSize)
+        )
         {
             repo.AddRange(batch);
             await repo.SaveChanges();
@@ -1625,6 +1748,20 @@ public class YahooPriceImportService
             completedListing.PriceHistoryBackfilled = true;
             await stockRepo.SaveChanges();
         }
+
+        if (rebased > 0)
+            logger?.LogWarning(
+                "Deleted {Count} venue bars for {Ticker}: their close no longer matches the restated series",
+                rebased,
+                target.Ticker
+            );
+        if (unrefreshed > 0)
+            logger?.LogInformation(
+                "Kept {Count} venue bars for {Ticker} on dates the restated series did not serve",
+                unrefreshed,
+                target.Ticker
+            );
+        return new VenueRowReconciliation(retainedDates.Count, rebased, unrefreshed);
     }
 
     private async Task<bool> CaptureQuotationBasis(
@@ -1633,7 +1770,7 @@ public class YahooPriceImportService
         CancellationToken cancellationToken
     )
     {
-        if (!IsMarketEnabled(target))
+        if (!IsCatalogMarket(target))
             return false;
         if (!target.IsUs)
         {
@@ -1704,14 +1841,10 @@ public class YahooPriceImportService
             .ToList();
     }
 
-    // Yahoo's daily chart includes the current, still-open trading day as a live candle: a partial
-    // OHLC quartet and partial volume that keep changing until the session closes. Persisting it is
-    // wrong twice over — the "Close" is really an intraday snapshot, and the importer is insert-only
-    // (a date already present is never updated, see PersistPrices), so that partial bar freezes and
-    // the real close never overwrites it. Only store bars strictly before the current UTC date; the
-    // day's settled bar is appended by the first pass over the stock after the date has rolled over
-    // (always after a US market close), so the daily series holds settled closes only.
-    private static bool IsSettledDailyBar(DateOnly barDate, DateOnly today) => barDate < today;
+    // Forwarder kept by name for the reflection tests; the rule lives in DailyBarGuards. Only
+    // settled bars are stored because the importer is insert-only, so a partial bar would freeze.
+    private static bool IsSettledDailyBar(DateOnly barDate, DateOnly today) =>
+        DailyBarGuards.IsSettledDailyBar(barDate, today);
 
     // A chart fetch can only yield new rows when at least one NYSE trading day lies in
     // [startDate, today) — the dates that are both unsynced and already settled. Gating the fetch
@@ -1763,7 +1896,7 @@ public class YahooPriceImportService
         CancellationToken cancellationToken
     )
     {
-        if (!IsMarketEnabled(target))
+        if (!IsCatalogMarket(target))
             return NoFetchNeeded;
         using (var identityScope = _scopeFactory.CreateScope())
         {
@@ -1784,6 +1917,9 @@ public class YahooPriceImportService
         // events for the window — capture both off the same response, no extra
         // HTTP.
         var chartData = await _yahooClient.GetChart(target.ProviderSymbol, startDate, chartEnd);
+        // Stamped on the attempt, whatever it returned (the failure paths stamp too), or a symbol the feed never serves refetches every cycle.
+        if (!target.IsUs)
+            await StampPriceSyncAttempt(target, cancellationToken);
         if (!await CaptureQuotationBasis(target, chartData.SourceIdentity, cancellationToken))
             return new TickerImportResult(Fetched: true, Inserted: 0);
         if (target.IsHistorical)
@@ -1836,6 +1972,15 @@ public class YahooPriceImportService
         if (startDate == floor)
         {
             await CaptureSplits(target, chartData.Splits, cancellationToken);
+            // A catalog listing's first history is installed whole, so its leading edge is checked here.
+            if (!target.IsUs && !HasCompleteLeadingEdge(chartData, floor, today))
+            {
+                _logger.LogWarning(
+                    "Yahoo returned a full history for {Ticker} that starts after its first trade date; keeping the series pending",
+                    target.ProviderSymbol
+                );
+                return new TickerImportResult(Fetched: true, Inserted: 0);
+            }
             var replaced = await ReplaceStoredPrices(
                 target,
                 floor,
@@ -1969,6 +2114,32 @@ public class YahooPriceImportService
             >= (int)Math.Ceiling(expectedSessions * MinimumReferenceHistoryCoverageShare);
     }
 
+    // Calendar days of slack between the chart's first trade date and its first storable bar.
+    private const int LeadingEdgeToleranceDays = 7;
+
+    // The feed's known failure on a full history is a missing leading edge, so that is all a catalog
+    // listing is gated on: there is no venue calendar to count sessions against. An unknown first
+    // trade date installs as before, because refusing it would leave every recent venue IPO unpriced.
+    internal static bool HasCompleteLeadingEdge(
+        YahooChartData chartData,
+        DateOnly floor,
+        DateOnly today
+    )
+    {
+        var storableDates = chartData
+            .Prices.Where(price => !HasOverflowPrice(price))
+            .Where(price => !IsInvalidOhlc(price))
+            .Where(price => IsSettledDailyBar(price.Date, today))
+            .Select(price => price.Date)
+            .ToList();
+        if (storableDates.Count == 0)
+            return false;
+        if (chartData.FirstTradeDate is not { } firstTradeDate)
+            return true;
+        var expectedFirst = firstTradeDate > floor ? firstTradeDate : floor;
+        return storableDates.Min() <= expectedFirst.AddDays(LeadingEdgeToleranceDays);
+    }
+
     private async Task<int> PersistPrices(
         PriceSeriesTarget target,
         List<HistoricalPrice> prices,
@@ -2034,7 +2205,10 @@ public class YahooPriceImportService
         using var scope = _scopeFactory.CreateScope();
         EquityDailyStockPriceRepository repo =
             scope.ServiceProvider.GetRequiredService<EquityDailyStockPriceRepository>();
-        return await repo.GetByListing(target.EquityListingId).AnyAsync(cancellationToken);
+        // Only Yahoo-owned rows count: a venue bar written first must not stop the deep backfill.
+        return await repo.GetByListing(target.EquityListingId)
+            .YahooOwned()
+            .AnyAsync(cancellationToken);
     }
 
     // Corrects stored bars that were captured before the feed settled them.
@@ -2088,7 +2262,9 @@ public class YahooPriceImportService
             );
             return 0;
         }
+        // Venue-derived bars are the venue's own settled figures; the feed never resettles them.
         var stored = await repo.GetByListing(target.EquityListingId)
+            .YahooOwned()
             .Where(p => p.Date >= windowStart && p.Date < today)
             .ToListAsync(cancellationToken);
 
@@ -2175,6 +2351,7 @@ public class YahooPriceImportService
             EquityDailyStockPriceRepository repo =
                 scope.ServiceProvider.GetRequiredService<EquityDailyStockPriceRepository>();
             targets = await repo.GetUsSeries()
+                .YahooOwned()
                 .AsNoTracking()
                 .Where(p =>
                     (
@@ -2294,6 +2471,7 @@ public class YahooPriceImportService
                     validSeries.Add(series.EquityListingId);
             }
             var storedRows = await repo.GetUsSeries()
+                .YahooOwned()
                 .Where(p => targetIds.Contains(p.Id))
                 .ToListAsync(cancellationToken);
 
@@ -2352,56 +2530,12 @@ public class YahooPriceImportService
         DateOnly Date
     );
 
-    // Settled volume only ever accrues, so a fetched figure below the stored one is a degraded
-    // response (a partial re-serve, a venue dropping out), never a correction. Accepting only
-    // upgrades makes the repair monotone: a flaky feed can never walk a good figure back down.
-    private static bool IsVolumeUpgrade(long stored, long fetched) => fetched > stored;
+    // Forwarders kept by name for the reflection tests; both rules live in DailyBarGuards.
+    private static bool IsVolumeUpgrade(long stored, long fetched) =>
+        DailyBarGuards.IsVolumeUpgrade(stored, fetched);
 
-    // Relative half-width of the same-basis close comparison; full rationale on IsSameSplitBasis.
-    private const decimal SameBasisCloseTolerance = 0.01m;
-
-    // One last-digit tick of absolute headroom on top of the relative tolerance. Both closes are
-    // rounded to 4 decimals at ingest, so a genuine minor revision of a sub-cent close moves it by
-    // a full 0.0001 — more than 1% of the price — and a purely relative tolerance would freeze the
-    // resettle out of the OTC tail. One tick stays orders of magnitude below any split ratio.
-    private const decimal SameBasisCloseTickHeadroom = 0.0001m;
-
-    // Two records of the same session are only comparable when they are on the same split basis,
-    // and the close is what proves it: a split moves price and volume by the SAME ratio in
-    // opposite directions, so a basis mismatch shows up as a close that differs by that ratio.
-    //
-    // The stored series and the feed genuinely disagree here, in BOTH orderings — the guard must
-    // stay direction-agnostic:
-    //  - Pre-reconcile (the window EVERY split passes through): CaptureSplits records a split at
-    //    the end of the same cycle whose ReconcilePendingCorporateActions pass already ran, so until the
-    //    next cycle the stored pre-split rows are still as-traded while the feed already serves
-    //    them adjusted. On a forward split the adjusted volume is ratio-times LARGER, so it reads
-    //    as a settlement upgrade and would leave a row whose volume is adjusted under an as-traded
-    //    close.
-    //  - Post-reconcile (observed on WLFC's 3:1): the reconcile stored the adjusted basis and the
-    //    feed later went back to serving the window as-traded. On a reverse split the as-traded
-    //    volume is ratio-times larger than the stored adjusted one, so it reads as an upgrade and
-    //    would inflate the stock's volume history by the split ratio.
-    // Which basis each side holds varies by stock and over time (PRPL's reconciled series is
-    // as-traded while WLFC's is adjusted, minutes apart), so only this value comparison is safe —
-    // a split-table lookup would guess wrong on real data. A mismatch means skip, never rewrite:
-    // volume basis belongs to the split reconcile, which rewrites the series as a whole.
-    //
-    // Tolerance: both closes are rounded to 4 decimals at ingest, so same-basis values differ only
-    // by a genuine minor revision — well inside 1% — while the split ratios Yahoo emits for real
-    // splits (5:4 = 25%, 21:20 = 4.76%) sit far outside it. The one family inside the tolerance is
-    // a tiny stock dividend recorded as a split (101:100 = 0.99%); accepting it bounds the volume
-    // error at ~1%, negligible against the 10-29% unsettled shortfall the resettle exists to fix.
-    private static bool IsSameSplitBasis(decimal storedClose, decimal fetchedClose)
-    {
-        // Nothing to compare against, so the basis is unproven rather than matching — and a zero
-        // stored close would collapse the relative tolerance to exact equality.
-        if (storedClose <= 0m || fetchedClose <= 0m)
-            return false;
-
-        return Math.Abs(fetchedClose - storedClose)
-            <= storedClose * SameBasisCloseTolerance + SameBasisCloseTickHeadroom;
-    }
+    private static bool IsSameSplitBasis(decimal storedClose, decimal fetchedClose) =>
+        DailyBarGuards.IsSameSplitBasis(storedClose, fetchedClose);
 
     // The oldest date whose stored volume is still re-read. Pure so the boundary is pinnable, and
     // clamped so a zero or negative setting degrades to "today only" — which the settled-bar guard
@@ -2419,7 +2553,7 @@ public class YahooPriceImportService
         CancellationToken cancellationToken
     )
     {
-        if (!IsMarketEnabled(target) || splits.Count == 0)
+        if (splits.Count == 0 || !IsCatalogMarket(target))
             return;
 
         // Map Yahoo's split shape onto the source-neutral capture DTO at the
@@ -2479,8 +2613,8 @@ public class YahooPriceImportService
     {
         // Cash amounts require explicit source currency independently of stored price history.
         if (
-            !IsMarketEnabled(target)
-            || chartData.Dividends.Count == 0
+            chartData.Dividends.Count == 0
+            || !IsCatalogMarket(target)
             || !(
                 target.IsUs
                     ? YahooQuotationIdentity.HasUsDollarEvidence(
@@ -2598,7 +2732,11 @@ public class YahooPriceImportService
         CancellationToken cancellationToken
     )
     {
-        var ticker = target.Ticker;
+        // Yahoo is asked by the venue-qualified symbol: the bare ticker of a Paris listing names
+        // another market's company. A listing outside the catalog has no symbol and is skipped.
+        var ticker = target.ProviderSymbol;
+        if (ticker == null)
+            return;
         // Yahoo has NOTHING for some listings (closed-end funds like PSUS, fresh IPOs): no stats
         // modules at all, or every field zero. That used to end the sync, leaving the stored pair
         // at 0/0 forever — even when EDGAR carries an authoritative cover-page count and this same
@@ -2831,7 +2969,9 @@ public class YahooPriceImportService
         CancellationToken cancellationToken
     )
     {
-        var ticker = target.Ticker;
+        var ticker = target.ProviderSymbol;
+        if (ticker == null)
+            return;
         var profile = await _yahooClient.GetCompanyProfile(ticker);
         if (profile == null || string.IsNullOrWhiteSpace(profile.Industry))
             return;
@@ -2903,7 +3043,7 @@ public class YahooPriceImportService
         catch (DbUpdateConcurrencyException)
         {
             var stillExists = await stockRepo
-                .GetCurrentUsDirectory()
+                .GetCurrentDirectory()
                 .AsNoTracking()
                 .AnyAsync(s => s.Id == commonStockId, cancellationToken);
             if (stillExists)
@@ -2988,6 +3128,9 @@ public class YahooPriceImportService
         if (target.RequiresFullHistory)
             return PriceHistoryFloor();
 
+        if (!target.IsUs)
+            return await ResolveCatalogStartDate(target, today, cancellationToken);
+
         var forwardOnly = await GetSyncStartDate(target, cancellationToken);
 
         // The heal only ever RIDES a fetch the forward-only date already demands — it must never
@@ -3013,11 +3156,6 @@ public class YahooPriceImportService
             forwardOnly,
             ResettleWindowStart(today, _scraperOptions.VolumeResettleWindowDays)
         );
-
-        // Re-request the bounded window; only returned bars prove Lisbon trading dates.
-        // U.S. calendar gaps cannot classify another market's absent observations.
-        if (!target.IsUs)
-            return Min(startDate, today.AddDays(-GapHealWindowDays));
 
         var windowStart = today.AddDays(-GapHealWindowDays);
         // Already reaching back past the window (a never-synced stock, one mid-backfill, or a
@@ -3053,6 +3191,78 @@ public class YahooPriceImportService
     }
 
     private static DateOnly Min(DateOnly left, DateOnly right) => left < right ? left : right;
+
+    // The catalog-market twin of the US rule above, with one more case. Once a venue keeps a listing's
+    // series current the Yahoo-owned latest date freezes, so the forward-only start would open a window
+    // on every cycle over a range growing by one session a day; a covered listing instead fetches the
+    // bounded resettle-and-heal window once per CoveredListingFetchIntervalHours, and still fetches
+    // from the floor while it has no Yahoo-owned rows at all. There is no venue calendar, so the
+    // window is re-requested as a whole and only returned bars prove the venue's trading dates.
+    private async Task<DateOnly> ResolveCatalogStartDate(
+        PriceSeriesTarget target,
+        DateOnly today,
+        CancellationToken cancellationToken
+    )
+    {
+        DateOnly? latestYahoo;
+        DateOnly? latestVenue;
+        using (var scope = _scopeFactory.CreateScope())
+        {
+            var repo = scope.ServiceProvider.GetRequiredService<EquityDailyStockPriceRepository>();
+            latestYahoo = await repo.GetByListing(target.EquityListingId)
+                .YahooOwned()
+                .MaxAsync(p => (DateOnly?)p.Date, cancellationToken);
+            latestVenue = await repo.GetByListing(target.EquityListingId)
+                .VenueOwned()
+                .MaxAsync(p => (DateOnly?)p.Date, cancellationToken);
+        }
+        return ResolveCatalogStartDate(
+            latestYahoo,
+            latestVenue,
+            target.YahooPriceSyncAttemptedAt,
+            today,
+            DateTime.UtcNow,
+            PriceHistoryFloor(),
+            _scraperOptions
+        );
+    }
+
+    // Pure so the cadence rule is pinnable without a database. Returns today when no fetch is due:
+    // HasFetchWindow treats a start on or after today as "already current" for a catalog market.
+    internal static DateOnly ResolveCatalogStartDate(
+        DateOnly? latestYahooOwned,
+        DateOnly? latestVenueOwned,
+        DateTime? syncAttemptedAt,
+        DateOnly today,
+        DateTime utcNow,
+        DateOnly floor,
+        YahooPriceScraperOptions options
+    )
+    {
+        var covered =
+            latestVenueOwned != null
+            && (latestYahooOwned == null || latestVenueOwned > latestYahooOwned);
+        if (covered)
+        {
+            var interval = TimeSpan.FromHours(
+                Math.Max(1, options.CoveredListingFetchIntervalHours)
+            );
+            if (syncAttemptedAt != null && syncAttemptedAt > utcNow - interval)
+                return today;
+        }
+        if (latestYahooOwned == null)
+            return floor;
+        var bounded = Min(
+            ResettleWindowStart(today, options.VolumeResettleWindowDays),
+            today.AddDays(-GapHealWindowDays)
+        );
+        // A covered listing's feed rows are only ever the pre-venue tail, so its fetch is the recent
+        // window alone instead of everything since the frozen latest date.
+        if (covered)
+            return bounded;
+        var forwardOnly = latestYahooOwned.Value.AddDays(1);
+        return forwardOnly < today ? Min(forwardOnly, bounded) : forwardOnly;
+    }
 
     // The earliest settled trading day in [windowStart, today) with no stored bar, or null when the
     // window is complete. Pure so the rule is pinnable without a database.
@@ -3094,8 +3304,11 @@ public class YahooPriceImportService
         return await SyncStartDate.Resolve<EquityDailyStockPriceRepository>(
             _scopeFactory,
             _workerOptions,
+            // A venue bar lands on the session's own UTC date, one day ahead of what the feed
+            // admits, so an unscoped latest date would close the fetch window for ever.
             repo =>
                 repo.GetByListing(target.EquityListingId)
+                    .YahooOwned()
                     .Select(p => p.Date)
                     .OrderByDescending(d => d),
             cancellationToken
@@ -3154,22 +3367,14 @@ public class YahooPriceImportService
     }
 
     private static bool IsInvalidOhlc(HistoricalPrice price) =>
-        price.Open <= 0
-        || price.High <= 0
-        || price.Low <= 0
-        || price.Close <= 0
-        || price.High < price.Open
-        || price.High < price.Close
-        || price.Low > price.Open
-        || price.Low > price.Close
-        || price.High < price.Low;
+        !DailyBarGuards.IsValidOhlc(price.Open, price.High, price.Low, price.Close);
 
     private static bool HasOverflowPrice(HistoricalPrice p) =>
-        Math.Abs(p.Open) > MaxPriceValue
-        || Math.Abs(p.High) > MaxPriceValue
-        || Math.Abs(p.Low) > MaxPriceValue
-        || Math.Abs(p.Close) > MaxPriceValue
-        || Math.Abs(p.AdjustedClose) > MaxPriceValue;
+        DailyBarGuards.ExceedsPriceRange(p.Open)
+        || DailyBarGuards.ExceedsPriceRange(p.High)
+        || DailyBarGuards.ExceedsPriceRange(p.Low)
+        || DailyBarGuards.ExceedsPriceRange(p.Close)
+        || DailyBarGuards.ExceedsPriceRange(p.AdjustedClose);
 
     private async Task<HashSet<DateOnly>> GetExistingDates(
         PriceSeriesTarget target,

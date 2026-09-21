@@ -50,17 +50,20 @@
 - Currency evidence does not verify a MIC or classify the security; current metadata never establishes retired-symbol denomination.
 - Capture rides existing chart requests; a finite source-metadata backfill remains a rollout prerequisite for consumers requiring explicit units.
 
-## Source issuer identifiers and Lisbon import
+## Source issuer identifiers and market directory import
 
 - `EquityIssuerSourceIdentifier` binds an exact provider issuer code to a native issuer and immutable capture evidence; it contains no route records.
 - Match existing issuers by exact source identifier, LEI, ISIN, or a current U.S. security CUSIP explicitly connected through GLEIF's complete ISIN-to-LEI relationship set; never match names or old CUSIP aliases.
 - Conflicting owners, legal identifiers, venue symbols, or quotation units reject the identity write atomically; a failed import discards its tracked graph.
 - Securities remain distinct by ISIN; a shared issuer never merges an ADR with its underlying share, and the source's broad `STOCK` type remains unclassified.
 - Preserve existing issuer profiles and presentation listings; new venues retain their own prices and symbols, and native rename history remains intact.
-- GLEIF capture requires exact issuer identity, complete unique related ISINs, stable publication/total metadata, and source-provided same-origin pagination without added filters.
+- GLEIF capture requires exact issuer identity, complete unique related ISINs, stable publication/total metadata, and source-provided same-origin pagination without added filters; related ISINs are read 200 a page at a shared pace of 60 requests a minute, with throttled and failed requests retried after an exponential backoff.
+- An issuer whose reported ISIN total exceeds 2,000 is not enumerated: the capture records only the requested ISIN, which the lookup itself confirmed, plus the reported total. Such an issuer still joins an existing row by source identifier, LEI or the exact ISIN, but not through a sibling ISIN or a sibling's embedded CUSIP, so a row known only under a sibling identifier (a depositary receipt captured without an LEI) would be created a second time rather than joined or refused.
 - Validate ISIN check digits and LEI MOD 97-10 at both source and native-import boundaries; malformed related identifiers cannot establish ownership through an embedded CUSIP.
-- `EquityMarkets:LisbonEnabled` (`EQUITY_MARKETS_LISBON_ENABLED` in Compose) enables daily source reconciliation; unresolved records retry after fifteen minutes without deleting retained identities.
-- Enable the worker only after native migrations and exchange-qualified MVC surfaces have passed verification; source acquisition and import alone do not complete the whole-database cutover.
+- Markets are code-owned in `EquityMarketCatalog` (venue set, country, currency, provider identity, session times); each has one `EquityMarketRegistration` row recording its pass state, and `DirectoryRefreshRequestedAt` forces an early pass. Workers read the table every cycle, never a host setting.
+- A directory row becomes a listing only when the FIRDS universe (ESMA plus FCA, refreshed by `FirdsUniverseWorker`) lists its ISIN as a live share (CFI `ES*` or `EP*`) on one of the market's venue codes (`EquityMarket.FirdsVenueCodes`; FIRDS files Xetra by segment, never as `XETR`, a Nasdaq Nordic line under its lit book, Nordic@Mid and Auction on Demand segments or the First North SME growth-market code, and a Madrid line on XMAD or its dark midpoint book) and `EquityMarketDirectoryGate` confirms the market is the share's home: a directory that states a primary market (Xetra's `Primary Market MIC Code`) decides, unless FIRDS places the share's relevant venue outside the market's home venues and its competent authority in another country; Euronext's product link names the venue it homes each line on (a cross-listed line's market cell lists every Euronext venue quoting it, `XBRU, XPAR`, and links the home venue), and the Euronext source states a primary market only when that venue is a sibling market's, so such a row is skipped as that market's, while a line homed on the market defers to FIRDS' relevant trading venue rather than engaging the authority escape, which a Euronext link says nothing about. Every other row is counted as skipped, never failed, and unresolved rows retry on the next pass without deleting retained identities.
+- A verified listing whose directory row, product URL and symbol are unchanged is re-verified against the product page and GLEIF every thirty days; any change re-verifies at once.
+- Give a catalog market a `DirectorySource` only after native migrations and exchange-qualified MVC surfaces have passed verification, because that is what starts its capture; source acquisition and import alone do not complete the whole-database cutover.
 
 ## Corporate action source listings
 
@@ -84,10 +87,20 @@
 - Independent reference coverage protects its exact listing; foreign listings and all historical observations remain intact.
 - A newly acquired reference claim on the displaced symbol refuses retirement when the locked graph is refreshed.
 
-## Lisbon capture switch
+## Market capture
 
-- `EquityMarkets:LisbonEnabled=false` prevents prices, quotation evidence and corporate actions from being captured for retained verified Lisbon listings.
-- Disabled-market history reconciliation and applied-split audits leave stored observations and applied markers unchanged.
+- Every catalog market with a directory adapter is captured; there is no per-market switch. `EquityMarketDirectoryWorker` runs each such market's directory pass within a minute of start-up, once `FirdsUniverseWorker` has stored a full set for the market's authority, and again once a day.
+- Prices, quotation evidence and corporate actions are captured for every verified listing on a catalog market; a verified listing only exists because a directory pass created it.
+- `EquityMarketRegistration` holds one row per catalog market recording pass state only: the last refresh, the last directory counts, the last error, and a refresh request. Setting `DirectoryRefreshRequestedAt = now()` on an adapter market's row runs its pass on the next control tick.
+- The `Enabled` column is retired and unread; a later migration drops it.
+
+## Current directory across markets
+
+- `EquityIssuerRepository.GetCurrentDirectory()` is the live directory across every market: an issuer whose presentation listing is active and is either a US listing or a venue listing a directory adapter verified (`IdentityState == Verified`). A legacy non-US presentation belongs to neither directory. `GetCurrentUsDirectory()` keeps its US-only universe for the surfaces that are US by contract (screener, indexes, MCP, REST, ALVIS, sitemaps).
+- `GetCurrentDirectoryIssuer(id)` and `GetCurrentDirectoryByIds(ids)` are the single-issuer and batch forms; `IsCurrentDirectoryIssuer(issuer)` is the in-memory twin for an already loaded graph.
+- `EquityListingSymbol` is the one spelling of a listing for people, logs and file names: the bare ticker for a US listing, `MIC:TICKER` for a venue listing (`MIC-TICKER` where a file name needs it). A directory ticker never contains a colon, so the display form cannot collide with a ticker.
+- Website discovery draws its candidates from the current directory and hands each source the issuer's LEI, ISIN, venue code and market country. The SEC filings source skips a CIK-less issuer, Wikidata joins a CIK-less issuer on its LEI (property P1278) and an SEC registrant on its CIK only, and the Yahoo profile source asks by the catalog provider symbol (`AIR.PA`), never the bare ticker. `StockWebsiteDiscovered` carries the venue code of a verified listing and null for a US listing.
+- Yahoo enrichment (key statistics and company profile) targets the presentation listing of every verified venue issuer, stamped through the same `YahooEnrichmentAttemptedAt` cadence as US listings, and asks Yahoo by the provider symbol; a listing outside the catalog has no symbol and is skipped. `EquitySecurity.MarketCapitalization` is stored as reported, in major units of the presentation listing's trading currency, so rank-only readers tolerate the mix and sums across markets may not.
 
 ## Holdings replay identity
 

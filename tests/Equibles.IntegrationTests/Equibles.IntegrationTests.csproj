@@ -11,6 +11,11 @@
 
   <ItemGroup>
     <Content
+      Include="../Equibles.UnitTests/TestAssets/Esef/ctt-2022-json-excerpt.json"
+      Link="TestAssets/Esef/ctt-2022-json-excerpt.json"
+      CopyToOutputDirectory="PreserveNewest"
+    />
+    <Content
       Include="../Equibles.UnitTests/TestAssets/InsiderTrading/InvalidDates/oprx.xml"
       Link="TestAssets/oprx-invalid-dates.xml"
       CopyToOutputDirectory="PreserveNewest"
@@ -18,6 +23,11 @@
     <Content
       Include="../Equibles.UnitTests/TestAssets/InsiderTrading/InvalidDates/snex.xml"
       Link="TestAssets/snex-invalid-dates.xml"
+      CopyToOutputDirectory="PreserveNewest"
+    />
+    <Content
+      Include="../Equibles.UnitTests/TestAssets/EquityMarkets/Firds/*.xml"
+      Link="TestAssets/EquityMarkets/Firds/%(Filename)%(Extension)"
       CopyToOutputDirectory="PreserveNewest"
     />
     <Content Include="TestAssets\**\*">
@@ -83,6 +93,10 @@
     <ProjectReference Include="..\..\src\Equibles.Yahoo.Data\Equibles.Yahoo.Data.csproj" />
     <ProjectReference Include="..\..\src\Equibles.Yahoo.Repositories\Equibles.Yahoo.Repositories.csproj" />
     <ProjectReference Include="..\..\src\Equibles.Yahoo.HostedService\Equibles.Yahoo.HostedService.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.EquityMarkets.Data\Equibles.EquityMarkets.Data.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.EquityMarkets.Repositories\Equibles.EquityMarkets.Repositories.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.EquityMarkets.BusinessLogic\Equibles.EquityMarkets.BusinessLogic.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.Integrations.Esma\Equibles.Integrations.Esma.csproj" />
     <ProjectReference Include="..\..\src\Equibles.Finra.Data\Equibles.Finra.Data.csproj" />
     <ProjectReference Include="..\..\src\Equibles.Finra.Repositories\Equibles.Finra.Repositories.csproj" />
     <ProjectReference Include="..\..\src\Equibles.Finra.HostedService\Equibles.Finra.HostedService.csproj" />
@@ -130,6 +144,12 @@
     <Compile
       Include="../Shared/FinancialEquityRetirementProbe.cs"
       Link="Helpers/FinancialEquityRetirementProbe.cs"
+    />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile
+      Include="../Shared/HoldingsCorrectionRetirementProbe.cs"
+      Link="Helpers/HoldingsCorrectionRetirementProbe.cs"
     />
   </ItemGroup>
 </Project>

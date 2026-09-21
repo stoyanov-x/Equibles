@@ -26,6 +26,38 @@ public class EquityIssuerRepository : BaseRepository<EquityIssuer>
                 && issuer.Presentation.Listing.Active
             );
 
+    /// <summary>
+    /// The live stock directory across every market: an issuer whose presentation listing is
+    /// active and is either a US listing or a venue listing a directory adapter verified.
+    /// </summary>
+    public virtual IQueryable<EquityIssuer> GetCurrentDirectory() =>
+        GetAll()
+            .Where(issuer =>
+                issuer.Presentation != null
+                && issuer.Presentation.Listing.Active
+                && (
+                    issuer.Presentation.Listing.MarketCountryCode == "US"
+                    || issuer.Presentation.Listing.IdentityState == EquityIdentityState.Verified
+                )
+            );
+
+    public virtual IQueryable<EquityIssuer> GetCurrentDirectoryByIds(IEnumerable<Guid> ids) =>
+        GetCurrentDirectory().Where(issuer => ids.Contains(issuer.Id));
+
+    public virtual async Task<EquityIssuer> GetCurrentDirectoryIssuer(params object[] key)
+    {
+        EquityIssuer issuer = await Get(key);
+        return IsCurrentDirectoryIssuer(issuer) ? issuer : null;
+    }
+
+    // The in-memory twin of GetCurrentDirectory for an already loaded issuer graph.
+    public static bool IsCurrentDirectoryIssuer(EquityIssuer issuer) =>
+        issuer?.Presentation?.Listing is { Active: true } listing
+        && (
+            listing.MarketCountryCode == "US"
+            || listing.IdentityState == EquityIdentityState.Verified
+        );
+
     public IQueryable<EquityIssuerSourceIdentifier> GetSourceIdentifiers() =>
         DbContext.Set<EquityIssuerSourceIdentifier>();
 
@@ -71,7 +103,7 @@ public class EquityIssuerRepository : BaseRepository<EquityIssuer>
         return ownedTransaction;
     }
 
-    public async Task<IDbContextTransaction> BeginDirectoryIdentityWrite(
+    public virtual async Task<IDbContextTransaction> BeginDirectoryIdentityWrite(
         CancellationToken cancellationToken = default
     )
     {
@@ -101,6 +133,31 @@ public class EquityIssuerRepository : BaseRepository<EquityIssuer>
                 $"SELECT 1 FROM \"EquityIssuer\" WHERE \"Id\" = {issuerId} FOR UPDATE",
                 cancellationToken
             );
+
+    /// <summary>
+    /// Locks a batch of issuer rows with one set-based FOR NO KEY UPDATE, in Id order. A caller
+    /// that already holds the directory-identity advisory lock needs no reload, and one statement
+    /// avoids the per-row helper's change detection over every tracked entity.
+    /// </summary>
+    public Task LockIssuersForNoKeyUpdate(
+        IReadOnlyCollection<Guid> issuerIds,
+        CancellationToken cancellationToken = default
+    )
+    {
+        if (issuerIds == null || issuerIds.Count == 0)
+            return Task.CompletedTask;
+        if (DbContext == null || !DbContext.Database.IsRelational())
+            return Task.CompletedTask;
+        if (DbContext.Database.CurrentTransaction == null)
+            throw new InvalidOperationException(
+                $"{nameof(LockIssuersForNoKeyUpdate)} requires an active transaction"
+            );
+        var ids = issuerIds.ToArray();
+        return DbContext.Database.ExecuteSqlInterpolatedAsync(
+            $"SELECT 1 FROM \"EquityIssuer\" WHERE \"Id\" = ANY({ids}) ORDER BY \"Id\" FOR NO KEY UPDATE",
+            cancellationToken
+        );
+    }
 
     public virtual async Task<EquityIssuer> GetCurrentUsDirectoryIssuer(params object[] key)
     {
@@ -291,7 +348,7 @@ public class EquityIssuerRepository : BaseRepository<EquityIssuer>
                 )
             );
 
-    public IQueryable<EquityIssuer> GetCurrentUsDirectoryByIds(IEnumerable<Guid> ids)
+    public virtual IQueryable<EquityIssuer> GetCurrentUsDirectoryByIds(IEnumerable<Guid> ids)
     {
         return GetCurrentUsDirectory().Where(cs => ids.Contains(cs.Id));
     }
@@ -418,7 +475,7 @@ public class EquityIssuerRepository : BaseRepository<EquityIssuer>
             .Where(listing =>
                 listing.MarketCountryCode == "US"
                 && listing.IsDirectoryListed
-                && listing.Id != listing.Security.Issuer.Presentation.EquityListingId
+                && listing.Presentation == null
             )
             .Select(listing => listing.Ticker);
 

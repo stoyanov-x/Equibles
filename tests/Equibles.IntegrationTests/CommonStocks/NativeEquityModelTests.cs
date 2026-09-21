@@ -6,13 +6,20 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Equibles.IntegrationTests.CommonStocks;
 
-[Collection(ParadeDbCollection.Name)]
-public class NativeEquityModelTests(ParadeDbFixture fixture) : ParadeDbMcpTestBase(fixture)
+[Collection(HistoricalEquityDbCollection.Name)]
+public class NativeEquityModelTests(HistoricalEquityDbFixture fixture)
+    : ParadeDbMcpTestBase(fixture)
 {
     [Fact]
     public async Task ProductionModel_HasNoRetiredStorage_AndMatchesItsMigrationSnapshot()
     {
-        await using var native = fixture.CreateNativeDbContext();
+        // The full production model, not the pinned-schema one the fixture hands out for writes.
+        await using var native = fixture.CreateDbContext(
+            null,
+            null,
+            includeLegacyMappings: false,
+            pinnedSchema: false
+        );
         var retired = new[]
         {
             "CommonStock",

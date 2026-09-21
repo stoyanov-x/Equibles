@@ -5,6 +5,8 @@ using Equibles.CommonStocks.Data;
 using Equibles.Congress.Data;
 using Equibles.CorporateActions.Data;
 using Equibles.Data;
+using Equibles.DelayedTrades.Data;
+using Equibles.EquityMarkets.Data;
 using Equibles.Errors.Data;
 using Equibles.FdaCatalysts.Data;
 using Equibles.Finra.Data;
@@ -206,6 +208,8 @@ public class McpServerAppFixture : IAsyncLifetime
             new CorporateActionsModuleConfiguration(),
             new FdaCatalystsModuleConfiguration(),
             new GovernmentContractsModuleConfiguration(),
+            new EquityMarketsModuleConfiguration(),
+            new DelayedTradesModuleConfiguration(),
             new SecModuleConfiguration(),
             new FinancialFactsModuleConfiguration(),
             new MediaModuleConfiguration(),

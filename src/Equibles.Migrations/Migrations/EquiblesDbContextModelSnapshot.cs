@@ -394,7 +394,8 @@ namespace Equibles.Migrations.Migrations
 
                     b.HasKey("EquityIssuerId");
 
-                    b.HasIndex("EquityListingId");
+                    b.HasIndex("EquityListingId")
+                        .IsUnique();
 
                     b.ToTable("EquityIssuerPresentation");
                 });
@@ -567,6 +568,9 @@ namespace Equibles.Migrations.Migrations
                         .HasColumnType("character varying(3)");
 
                     b.Property<DateTime?>("YahooEnrichmentAttemptedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime?>("YahooPriceSyncAttemptedAt")
                         .HasColumnType("timestamp with time zone");
 
                     b.HasKey("Id");
@@ -1192,6 +1196,433 @@ namespace Equibles.Migrations.Migrations
                         .HasFilter("\"PriceSeriesTicker\" IS NOT NULL AND \"EquityListingId\" IS NULL");
 
                     b.ToTable("StockSplit");
+                });
+
+            modelBuilder.Entity("Equibles.DelayedTrades.Data.Models.DelayedTradeFileCapture", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<long>("Bytes")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTime>("FetchedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("LocationCode")
+                        .IsRequired()
+                        .HasMaxLength(8)
+                        .HasColumnType("character varying(8)");
+
+                    b.Property<string>("MarketCode")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<int>("Outcome")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("Rows")
+                        .HasColumnType("integer");
+
+                    b.Property<DateOnly?>("SessionDate")
+                        .HasColumnType("date");
+
+                    b.Property<string>("Sha256")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("SourceKey")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<string>("SourceUrl")
+                        .IsRequired()
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<string>("TermsUrl")
+                        .IsRequired()
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<int>("Window")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("FetchedAtUtc");
+
+                    b.HasIndex("MarketCode", "FetchedAtUtc");
+
+                    b.ToTable("DelayedTradeFileCapture");
+                });
+
+            modelBuilder.Entity("Equibles.DelayedTrades.Data.Models.DelayedTradeImportPartition", b =>
+                {
+                    b.Property<string>("Dataset")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateOnly>("PartitionDate")
+                        .HasColumnType("date");
+
+                    b.Property<string>("ScopeKey")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)");
+
+                    b.Property<int>("AmbiguousCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("AmendedCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("BarsInserted")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("BarsOverwroteYahoo")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("BarsRederived")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("BarsSkippedBasis")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("BarsSkippedIdentity")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("BarsSkippedInvalid")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("BarsUnsettled")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("CancelledCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("CurrencyMismatchCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("DarkPrintCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("DuplicateCount")
+                        .HasColumnType("integer");
+
+                    b.Property<long>("FileBytes")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("FileSha256")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTime>("ImportedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("IsinCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("LitPrintCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("MatchedCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("OutOfSessionCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("PrintCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("RederivedCount")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("SourceUrl")
+                        .IsRequired()
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<string>("TermsUrl")
+                        .IsRequired()
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<int>("UnmatchedCount")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Dataset", "PartitionDate", "ScopeKey");
+
+                    b.HasIndex("Dataset", "ScopeKey", "PartitionDate");
+
+                    b.ToTable("DelayedTradeImportPartition");
+                });
+
+            modelBuilder.Entity("Equibles.DelayedTrades.Data.Models.LatestDelayedTrade", b =>
+                {
+                    b.Property<Guid>("EquityListingId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("CapturedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Currency")
+                        .IsRequired()
+                        .HasMaxLength(3)
+                        .HasColumnType("character varying(3)");
+
+                    b.Property<string>("FileSha256")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<bool>("IsSessionComplete")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("Isin")
+                        .IsRequired()
+                        .HasMaxLength(12)
+                        .HasColumnType("character varying(12)");
+
+                    b.Property<decimal>("LastPrice")
+                        .HasPrecision(18, 4)
+                        .HasColumnType("numeric(18,4)");
+
+                    b.Property<DateTime>("LastPublishedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<decimal>("LastQuantity")
+                        .HasPrecision(18, 4)
+                        .HasColumnType("numeric(18,4)");
+
+                    b.Property<string>("LastTradeId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTime>("LastTradedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("LitVolume")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("MarketCode")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<string>("Mic")
+                        .IsRequired()
+                        .HasMaxLength(4)
+                        .HasColumnType("character varying(4)");
+
+                    b.Property<int>("PrintCount")
+                        .HasColumnType("integer");
+
+                    b.Property<DateOnly>("SessionDate")
+                        .HasColumnType("date");
+
+                    b.Property<decimal>("SessionHigh")
+                        .HasPrecision(18, 4)
+                        .HasColumnType("numeric(18,4)");
+
+                    b.Property<decimal>("SessionLow")
+                        .HasPrecision(18, 4)
+                        .HasColumnType("numeric(18,4)");
+
+                    b.Property<decimal>("SessionOpen")
+                        .HasPrecision(18, 4)
+                        .HasColumnType("numeric(18,4)");
+
+                    b.Property<string>("SourceKey")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<string>("SourceUrl")
+                        .IsRequired()
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<string>("TermsUrl")
+                        .IsRequired()
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("Volume")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("EquityListingId");
+
+                    b.HasIndex("MarketCode");
+
+                    b.ToTable("LatestDelayedTrade");
+                });
+
+            modelBuilder.Entity("Equibles.EquityMarkets.Data.Models.EquityMarketRegistration", b =>
+                {
+                    b.Property<string>("Code")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<DateTime?>("DelayedTradesCapturedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("DelayedTradesLastError")
+                        .HasMaxLength(1000)
+                        .HasColumnType("character varying(1000)");
+
+                    b.Property<DateOnly?>("DelayedTradesSessionDate")
+                        .HasColumnType("date");
+
+                    b.Property<int>("DirectoryCurrentCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("DirectoryFailedCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("DirectoryImportedCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("DirectoryListingCount")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTime?>("DirectoryRefreshRequestedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime?>("DirectoryRefreshedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("DirectorySkippedCount")
+                        .HasColumnType("integer");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("LastError")
+                        .HasMaxLength(1000)
+                        .HasColumnType("character varying(1000)");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Code");
+
+                    b.ToTable("EquityMarketRegistration");
+                });
+
+            modelBuilder.Entity("Equibles.EquityMarkets.Data.Models.FirdsImportRun", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Authority")
+                        .IsRequired()
+                        .HasMaxLength(4)
+                        .HasColumnType("character varying(4)");
+
+                    b.Property<string>("Checksum")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("FileName")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTime>("ImportedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("Kind")
+                        .HasColumnType("integer");
+
+                    b.Property<DateOnly>("PublishedOn")
+                        .HasColumnType("date");
+
+                    b.Property<int>("RowsRead")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("RowsStored")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Authority", "FileName")
+                        .IsUnique();
+
+                    b.HasIndex("Authority", "Kind", "PublishedOn");
+
+                    b.ToTable("FirdsImportRun");
+                });
+
+            modelBuilder.Entity("Equibles.EquityMarkets.Data.Models.FirdsInstrumentRecord", b =>
+                {
+                    b.Property<string>("Authority")
+                        .HasMaxLength(4)
+                        .HasColumnType("character varying(4)");
+
+                    b.Property<string>("Isin")
+                        .HasMaxLength(12)
+                        .HasColumnType("character varying(12)");
+
+                    b.Property<string>("Mic")
+                        .HasMaxLength(4)
+                        .HasColumnType("character varying(4)");
+
+                    b.Property<string>("Cfi")
+                        .IsRequired()
+                        .HasMaxLength(6)
+                        .HasColumnType("character varying(6)");
+
+                    b.Property<string>("Currency")
+                        .HasMaxLength(3)
+                        .HasColumnType("character varying(3)");
+
+                    b.Property<DateTime?>("FirstTradeDate")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("FullName")
+                        .HasMaxLength(350)
+                        .HasColumnType("character varying(350)");
+
+                    b.Property<string>("Lei")
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
+                    b.Property<DateTime>("ObservedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("RelevantCompetentAuthority")
+                        .HasMaxLength(2)
+                        .HasColumnType("character varying(2)");
+
+                    b.Property<string>("RelevantTradingVenue")
+                        .HasMaxLength(4)
+                        .HasColumnType("character varying(4)");
+
+                    b.Property<DateTime?>("RemovedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("ShortName")
+                        .HasMaxLength(35)
+                        .HasColumnType("character varying(35)");
+
+                    b.Property<DateTime?>("TerminationDate")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Authority", "Isin", "Mic");
+
+                    b.HasIndex("Isin");
+
+                    b.HasIndex("Lei");
+
+                    b.HasIndex("Authority", "RelevantTradingVenue");
+
+                    b.ToTable("FirdsInstrumentRecord");
                 });
 
             modelBuilder.Entity("Equibles.Errors.Data.Models.Error", b =>
@@ -1891,6 +2322,44 @@ namespace Equibles.Migrations.Migrations
                     b.ToTable("HolderQuarterlySnapshot");
                 });
 
+            modelBuilder.Entity("Equibles.Holdings.Data.Models.HoldingsCorrectionEvidence", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("CorrectionKey")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)");
+
+                    b.Property<DateTime>("MigratedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("OriginalRow")
+                        .IsRequired()
+                        .HasColumnType("jsonb");
+
+                    b.Property<string>("SourceRecordId")
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)");
+
+                    b.Property<string>("SourceSchema")
+                        .IsRequired()
+                        .HasColumnType("jsonb");
+
+                    b.Property<string>("SourceTable")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CorrectionKey", "SourceTable", "SourceRecordId");
+
+                    b.ToTable("HoldingsCorrectionEvidence");
+                });
+
             modelBuilder.Entity("Equibles.Holdings.Data.Models.HoldingsReconciliationLog", b =>
                 {
                     b.Property<Guid>("Id")
@@ -2178,6 +2647,16 @@ namespace Equibles.Migrations.Migrations
                         .IsUnique();
 
                     NpgsqlIndexBuilderExtensions.AreNullsDistinct(b.HasIndex("EquityIssuerId", "InstitutionalHolderId", "ReportDate", "ShareType", "OptionType", "FilingType", "ListedTicker"), false);
+
+                    b.HasIndex(new[] { "Id" }, "IX_InstitutionalHolding_ImplausibleDerivationRepair")
+                        .HasDatabaseName("IX_InstitutionalHolding_ImplausibleDerivationRepair")
+                        .HasFilter("NOT \"ValuePending\" AND \"ShareType\" = 0 AND \"ValueSource\" <> 1 AND \"Shares\" > 0 AND \"Value\"::numeric > 1000000.0 * \"Shares\"::numeric")
+                        .HasAnnotation("Npgsql:CreatedConcurrently", true);
+
+                    b.HasIndex(new[] { "EquityIssuerId", "Shares" }, "IX_InstitutionalHolding_ImpossiblePositionRepair")
+                        .HasDatabaseName("IX_InstitutionalHolding_ImpossiblePositionRepair")
+                        .HasFilter("\"ShareType\" = 0 AND NOT \"ValueUnavailable\" AND \"Shares\" > 1000000")
+                        .HasAnnotation("Npgsql:CreatedConcurrently", true);
 
                     b.ToTable("InstitutionalHolding");
                 });
@@ -3154,6 +3633,35 @@ namespace Equibles.Migrations.Migrations
                         .IsUnique();
 
                     b.ToTable("DocumentImage");
+                });
+
+            modelBuilder.Entity("Equibles.Sec.Data.Models.EsefOversizedReport", b =>
+                {
+                    b.Property<string>("Reference")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<int>("CeilingBytes")
+                        .HasColumnType("integer");
+
+                    b.Property<int?>("HtmlCeilingBytes")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("HtmlSourceUrl")
+                        .HasMaxLength(1000)
+                        .HasColumnType("character varying(1000)");
+
+                    b.Property<DateTime>("RefusedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("SourceUrl")
+                        .IsRequired()
+                        .HasMaxLength(1000)
+                        .HasColumnType("character varying(1000)");
+
+                    b.HasKey("Reference");
+
+                    b.ToTable("EsefOversizedReport");
                 });
 
             modelBuilder.Entity("Equibles.Sec.Data.Models.FailToDeliver", b =>
@@ -4352,8 +4860,8 @@ namespace Equibles.Migrations.Migrations
                         .IsRequired();
 
                     b.HasOne("Equibles.CommonStocks.Data.Models.EquityListing", "Listing")
-                        .WithMany()
-                        .HasForeignKey("EquityListingId")
+                        .WithOne("Presentation")
+                        .HasForeignKey("Equibles.CommonStocks.Data.Models.EquityIssuerPresentation", "EquityListingId")
                         .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired();
 
@@ -4550,6 +5058,17 @@ namespace Equibles.Migrations.Migrations
                         .OnDelete(DeleteBehavior.Restrict);
 
                     b.Navigation("Issuer");
+
+                    b.Navigation("Listing");
+                });
+
+            modelBuilder.Entity("Equibles.DelayedTrades.Data.Models.LatestDelayedTrade", b =>
+                {
+                    b.HasOne("Equibles.CommonStocks.Data.Models.EquityListing", "Listing")
+                        .WithMany()
+                        .HasForeignKey("EquityListingId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
 
                     b.Navigation("Listing");
                 });
@@ -5119,6 +5638,8 @@ namespace Equibles.Migrations.Migrations
 
             modelBuilder.Entity("Equibles.CommonStocks.Data.Models.EquityListing", b =>
                 {
+                    b.Navigation("Presentation");
+
                     b.Navigation("TickerAliases");
                 });
 

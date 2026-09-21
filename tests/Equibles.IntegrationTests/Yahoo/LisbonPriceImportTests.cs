@@ -6,6 +6,8 @@ using Equibles.Core.Configuration;
 using Equibles.CorporateActions.BusinessLogic;
 using Equibles.CorporateActions.Data.Models;
 using Equibles.CorporateActions.Repositories;
+using Equibles.EquityMarkets.Data.Catalog;
+using Equibles.EquityMarkets.Repositories;
 using Equibles.Errors.BusinessLogic;
 using Equibles.Integrations.Yahoo.Contracts;
 using Equibles.Integrations.Yahoo.Models;
@@ -16,7 +18,6 @@ using Equibles.Yahoo.HostedService.Configuration;
 using Equibles.Yahoo.HostedService.Services;
 using Equibles.Yahoo.Repositories;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -31,13 +32,21 @@ public class LisbonPriceImportTests(ParadeDbFixture fixture) : ParadeDbMcpTestBa
     private readonly IYahooFinanceClient _client = Substitute.For<IYahooFinanceClient>();
     private readonly WorkerOptions _options = new() { MinSyncDate = new(2025, 7, 1) };
 
-    private YahooPriceImportService Service(bool enabled = true)
+    private static readonly string LisbonEvidenceSource = YahooListingSource.EvidenceSource(
+        EquityMarketCatalog.TryGet("euronext-lisbon")
+    );
+
+    private YahooPriceImportService Service()
     {
         var issuers = new EquityIssuerRepository(DbContext);
         var splits = new StockSplitRepository(DbContext);
         var dividends = new CashDividendRepository(DbContext);
         var scope = ServiceScopeSubstitute.Create(
             (typeof(EquityIssuerRepository), issuers),
+            (
+                typeof(EquityMarketRegistrationRepository),
+                new EquityMarketRegistrationRepository(DbContext)
+            ),
             (typeof(EquityListingRepository), new EquityListingRepository(DbContext)),
             (
                 typeof(EquityDailyStockPriceRepository),
@@ -70,106 +79,8 @@ public class LisbonPriceImportTests(ParadeDbFixture fixture) : ParadeDbMcpTestBa
                 Substitute.For<ILogger<ErrorReporter>>()
             ),
             Options.Create(_options),
-            Options.Create(new YahooPriceScraperOptions()),
-            new ConfigurationBuilder()
-                .AddInMemoryCollection(
-                    new Dictionary<string, string>
-                    {
-                        ["EquityMarkets:LisbonEnabled"] = enabled.ToString(),
-                    }
-                )
-                .Build()
+            Options.Create(new YahooPriceScraperOptions())
         );
-    }
-
-    [Fact]
-    public async Task Disabled_RetainedVerifiedListingDoesNotFetchOrCapturePricesAndActions()
-    {
-        var listing = await SeedLisbon();
-        var service = Service(enabled: false);
-        var target = Target(listing);
-        var chart = Chart();
-        (await Targets(service)).Should().BeEmpty();
-        await Import(service, target, Session.AddDays(1));
-        await (Task)
-            typeof(YahooPriceImportService)
-                .GetMethod("CaptureSplits", BindingFlags.NonPublic | BindingFlags.Instance)!
-                .Invoke(service, [target, chart.Splits, CancellationToken.None])!;
-        await (Task)
-            typeof(YahooPriceImportService)
-                .GetMethod("CaptureDividends", BindingFlags.NonPublic | BindingFlags.Instance)!
-                .Invoke(service, [target, chart, CancellationToken.None])!;
-        _client.ReceivedCalls().Should().BeEmpty();
-        (await DbContext.Set<EquityDailyStockPrice>().CountAsync()).Should().Be(0);
-        (await DbContext.Set<StockSplit>().CountAsync()).Should().Be(0);
-        (await DbContext.Set<CashDividend>().CountAsync()).Should().Be(0);
-        (await DbContext.Set<EquityDirectorySourceRecord>().CountAsync()).Should().Be(0);
-    }
-
-    [Fact]
-    public async Task Disabled_ReconciliationPreservesPendingAndAppliedActionsAndPrices()
-    {
-        var listing = await SeedLisbon();
-        var split = new StockSplit
-        {
-            Issuer = listing.Security.Issuer,
-            Listing = listing,
-            EffectiveDate = Session,
-            PriceSeriesTicker = listing.Ticker,
-            Numerator = 2,
-            Denominator = 1,
-            PriceAdjustmentAppliedTime = DateTime.UtcNow,
-        };
-        var dividend = new CashDividend
-        {
-            Issuer = listing.Security.Issuer,
-            Listing = listing,
-            ExDate = Session,
-            AmountPerShare = .25m,
-            Currency = "EUR",
-            Source = CashDividendSource.Yahoo,
-        };
-        DbContext.AddRange(
-            split,
-            dividend,
-            Price(listing, Session.AddDays(-1), 20),
-            Price(listing, Session, 10)
-        );
-        await DbContext.SaveChangesAsync();
-        DbContext.ChangeTracker.Clear();
-        var originalMarker = await DbContext
-            .Set<StockSplit>()
-            .Select(row => row.PriceAdjustmentAppliedTime)
-            .SingleAsync();
-        var service = Service(enabled: false);
-        await (Task)
-            typeof(YahooPriceImportService)
-                .GetMethod(
-                    "ReconcilePendingCorporateActions",
-                    BindingFlags.NonPublic | BindingFlags.Instance
-                )!
-                .Invoke(service, [Session.AddDays(1), CancellationToken.None])!;
-
-        _client.ReceivedCalls().Should().BeEmpty();
-        await using var read = Fixture.CreateDbContext();
-        (await read.Set<StockSplit>().SingleAsync())
-            .PriceAdjustmentAppliedTime.Should()
-            .Be(originalMarker);
-        (await read.Set<CashDividend>().SingleAsync()).PriceAdjustmentAppliedTime.Should().BeNull();
-        (
-            await read.Set<EquityDailyStockPrice>()
-                .OrderBy(row => row.Date)
-                .Select(row => row.Close)
-                .ToListAsync()
-        )
-            .Should()
-            .Equal(20m, 10m);
-        (
-            await read.Set<EquityDirectorySourceRecord>()
-                .CountAsync(row => row.Source == YahooListingSource.LisbonEvidenceSource)
-        )
-            .Should()
-            .Be(0);
     }
 
     private static PriceSeriesTarget Target(EquityListing listing) =>
@@ -180,7 +91,9 @@ public class LisbonPriceImportTests(ParadeDbFixture fixture) : ParadeDbMcpTestBa
             false,
             MarketCountryCode: listing.MarketCountryCode,
             MarketIdentifierCode: listing.MarketIdentifierCode,
-            Isin: listing.Security.Isin
+            Isin: listing.Security.Isin,
+            TradingCurrency: listing.TradingCurrency,
+            QuoteUnitMultiplier: listing.QuoteUnitMultiplier
         );
 
     private static Task Import(
@@ -197,7 +110,7 @@ public class LisbonPriceImportTests(ParadeDbFixture fixture) : ParadeDbMcpTestBa
         (Task<List<PriceSeriesTarget>>)
             typeof(YahooPriceImportService)
                 .GetMethod(
-                    "BuildLisbonPriceTargets",
+                    "BuildCatalogPriceTargets",
                     BindingFlags.NonPublic | BindingFlags.Instance
                 )!
                 .Invoke(service, [CancellationToken.None])!;
@@ -331,7 +244,7 @@ public class LisbonPriceImportTests(ParadeDbFixture fixture) : ParadeDbMcpTestBa
         payments.Single(row => row.EquityListingId == lisbon.Id).AmountPerShare.Should().Be(.25m);
         payments.Single(row => row.Id == originalDividend.Id).AmountPerShare.Should().Be(9);
         var evidence = await read.Set<EquityDirectorySourceRecord>()
-            .Where(row => row.Source == YahooListingSource.LisbonEvidenceSource)
+            .Where(row => row.Source == LisbonEvidenceSource)
             .ToListAsync();
         evidence
             .Should()
@@ -583,7 +496,15 @@ public class LisbonPriceImportTests(ParadeDbFixture fixture) : ParadeDbMcpTestBa
 
         await using var read = Fixture.CreateDbContext();
         (await read.Set<EquityIssuerPresentation>().CountAsync()).Should().Be(0);
-        (await read.Set<CommonStock>().CountAsync()).Should().Be(0);
+        (
+            await read
+                .Database.SqlQueryRaw<int>(
+                    "SELECT count(*)::int AS \"Value\" FROM pg_class WHERE oid = to_regclass('\"CommonStock\"')"
+                )
+                .SingleAsync()
+        )
+            .Should()
+            .Be(0);
         (await read.Set<EquityDailyStockPrice>().CountAsync()).Should().Be(2);
         var split = await read.Set<StockSplit>().SingleAsync();
         split.EquityListingId.Should().Be(listing.Id);

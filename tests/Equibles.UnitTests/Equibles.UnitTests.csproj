@@ -73,6 +73,11 @@
     <ProjectReference Include="..\..\src\Equibles.Yahoo.Data\Equibles.Yahoo.Data.csproj" />
     <ProjectReference Include="..\..\src\Equibles.Yahoo.Repositories\Equibles.Yahoo.Repositories.csproj" />
     <ProjectReference Include="..\..\src\Equibles.Yahoo.HostedService\Equibles.Yahoo.HostedService.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.Integrations.DelayedTrades\Equibles.Integrations.DelayedTrades.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.DelayedTrades.Data\Equibles.DelayedTrades.Data.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.DelayedTrades.Repositories\Equibles.DelayedTrades.Repositories.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.DelayedTrades.BusinessLogic\Equibles.DelayedTrades.BusinessLogic.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.DelayedTrades.HostedService\Equibles.DelayedTrades.HostedService.csproj" />
     <ProjectReference Include="..\..\src\Equibles.Finra.Data\Equibles.Finra.Data.csproj" />
     <ProjectReference Include="..\..\src\Equibles.Finra.Repositories\Equibles.Finra.Repositories.csproj" />
     <ProjectReference Include="..\..\src\Equibles.Finra.HostedService\Equibles.Finra.HostedService.csproj" />
@@ -107,6 +112,13 @@
     <ProjectReference Include="..\..\src\Equibles.FdaCatalysts.HostedService\Equibles.FdaCatalysts.HostedService.csproj" />
     <ProjectReference Include="..\..\src\Equibles.Integrations.Euronext\Equibles.Integrations.Euronext.csproj" />
     <ProjectReference Include="..\..\src\Equibles.Integrations.Gleif\Equibles.Integrations.Gleif.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.Integrations.Esma\Equibles.Integrations.Esma.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.Integrations.XbrlFilings\Equibles.Integrations.XbrlFilings.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.Integrations.Xetra\Equibles.Integrations.Xetra.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.EquityMarkets.Data\Equibles.EquityMarkets.Data.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.EquityMarkets.Repositories\Equibles.EquityMarkets.Repositories.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.EquityMarkets.BusinessLogic\Equibles.EquityMarkets.BusinessLogic.csproj" />
+    <ProjectReference Include="..\..\src\Equibles.EquityMarkets.HostedService\Equibles.EquityMarkets.HostedService.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="../Shared/NativeListingSeed.cs" Link="Helpers/NativeListingSeed.cs" />

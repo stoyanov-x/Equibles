@@ -10,6 +10,95 @@ public class EuronextDirectoryTests
             Path.Combine(AppContext.BaseDirectory, "TestAssets", "Euronext", "Lisbon", name)
         );
 
+    private static Task<string> ParisFixture(string name) =>
+        File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "TestAssets", "Euronext", "Paris", name)
+        );
+
+    [Fact]
+    public async Task CrossListedRows_KeepTheMarketsOwnVenueAndStateTheLinkedPrimaryVenue()
+    {
+        var page = EuronextDirectoryParser.ReadPage(
+            await ParisFixture("equities.json"),
+            EuronextMarket.Paris
+        );
+        page.TotalRecords.Should().Be(5);
+        page.Listings.Select(row =>
+                (
+                    row.Symbol,
+                    row.MarketIdentifierCode,
+                    row.PrimaryMarketIdentifierCode,
+                    row.SourceUrl.AbsolutePath
+                )
+            )
+            .Should()
+            .Equal(
+                ("ABO", "XPAR", "XBRU", "/en/product/equities/BE0974278104-XBRU"),
+                ("AC", "XPAR", "XPAR", "/en/product/equities/FR0000120404-XPAR"),
+                ("ACMC", "XPMC", "XPMC", "/en/product/equities/FR0000120404-XPMC"),
+                ("AF", "XPAR", "XPAR", "/en/product/equities/FR001400J770-XPAR"),
+                ("AI", "XPAR", "XPAR", "/en/product/equities/FR0000120073-XPAR")
+            );
+        page.Listings.Select(row => row.ReportedCurrency)
+            .Should()
+            .Equal("EUR", "EUR", "USD", "EUR", "EUR");
+    }
+
+    [Fact]
+    public async Task CrossListedRows_ToleratePaddedVenueSeparators()
+    {
+        var root = JsonNode.Parse(await ParisFixture("equities.json"));
+        root["aaData"][0][3] = "<div class=\"nowrap pointer\">XBRU,&nbsp;XPAR</div>";
+        root["aaData"][3][3] = "<div class=\"nowrap pointer\">XPAR ,\n XAMS</div>";
+        var page = EuronextDirectoryParser.ReadPage(root.ToJsonString(), EuronextMarket.Paris);
+        page.Listings[0].MarketIdentifierCode.Should().Be("XPAR");
+        page.Listings[0].PrimaryMarketIdentifierCode.Should().Be("XBRU");
+        page.Listings[3].MarketIdentifierCode.Should().Be("XPAR");
+        page.Listings[3].PrimaryMarketIdentifierCode.Should().Be("XPAR");
+    }
+
+    [Theory]
+    [InlineData("no-own-venue")]
+    [InlineData("two-own-venues")]
+    [InlineData("repeated-venue")]
+    [InlineData("unknown-venue")]
+    [InlineData("link-outside-cell")]
+    public async Task CrossListedRows_WithoutOneOwnVenueOrALinkedVenue_AreRefused(string scenario)
+    {
+        var root = JsonNode.Parse(await ParisFixture("equities.json"));
+        var abo = root["aaData"][0];
+        if (scenario == "no-own-venue")
+            abo[3] = "XBRU, XAMS";
+        if (scenario == "two-own-venues")
+            abo[3] = "XBRU, XPAR, ALXP";
+        if (scenario == "repeated-venue")
+            abo[3] = "XBRU, XPAR, XPAR";
+        if (scenario == "unknown-venue")
+            abo[3] = "XBRU, XPAR, XLON";
+        if (scenario == "link-outside-cell")
+            abo[0] = "<a href='/en/product/equities/BE0974278104-XAMS'>ABO GROUP</a>";
+        var parse = () =>
+            EuronextDirectoryParser.ReadPage(root.ToJsonString(), EuronextMarket.Paris);
+        parse.Should().Throw<InvalidDataException>();
+    }
+
+    [Theory]
+    [InlineData(2467, true)]
+    [InlineData(5000, true)]
+    [InlineData(5001, false)]
+    public async Task ReportedTotal_IsBoundedAboveMilansDirectorySize(int total, bool accepted)
+    {
+        var root = JsonNode.Parse(await ParisFixture("equities.json"));
+        root["iTotalRecords"] = total;
+        root["iTotalDisplayRecords"] = total;
+        var parse = () =>
+            EuronextDirectoryParser.ReadPage(root.ToJsonString(), EuronextMarket.Paris);
+        if (accepted)
+            parse().TotalRecords.Should().Be(total);
+        else
+            parse.Should().Throw<InvalidDataException>();
+    }
+
     [Fact]
     public async Task CapturedDirectory_ContainsEveryReportedListingAndItsExactSourceIdentity()
     {
@@ -17,7 +106,7 @@ public class EuronextDirectoryTests
         var body = await Fixture("equities.json");
         var handler = new EuronextDirectoryTestHandler([html, body]);
         using var http = new HttpClient(handler);
-        var snapshot = await new EuronextDirectoryClient(http).GetLisbonEquities();
+        var snapshot = await new EuronextDirectoryClient(http).GetEquities(EuronextMarket.Lisbon);
         snapshot.Listings.Should().HaveCount(49);
         snapshot
             .Listings.GroupBy(row => row.MarketIdentifierCode)
@@ -67,7 +156,7 @@ public class EuronextDirectoryTests
         }
         var handler = new EuronextDirectoryTestHandler(new[] { html }.Concat(bodies));
         using var http = new HttpClient(handler);
-        var snapshot = await new EuronextDirectoryClient(http).GetLisbonEquities();
+        var snapshot = await new EuronextDirectoryClient(http).GetEquities(EuronextMarket.Lisbon);
         snapshot.Listings.Should().HaveCount(49);
         snapshot.ResponseBodies.Should().Equal(bodies);
         handler
@@ -108,7 +197,8 @@ public class EuronextDirectoryTests
         using var http = new HttpClient(
             new EuronextDirectoryTestHandler([html, first.ToJsonString(), next.ToJsonString()])
         );
-        Func<Task> fetch = () => new EuronextDirectoryClient(http).GetLisbonEquities();
+        Func<Task> fetch = () =>
+            new EuronextDirectoryClient(http).GetEquities(EuronextMarket.Lisbon);
         await fetch.Should().ThrowAsync<InvalidDataException>();
     }
 
@@ -146,7 +236,8 @@ public class EuronextDirectoryTests
             rows[0][1] = "PTALT0AE0003";
         if (scenario == "missing-column")
             rows[0].AsArray().RemoveAt(6);
-        var parse = () => EuronextDirectoryParser.ReadLisbonPage(root.ToJsonString());
+        var parse = () =>
+            EuronextDirectoryParser.ReadPage(root.ToJsonString(), EuronextMarket.Lisbon);
         parse.Should().Throw<InvalidDataException>();
     }
 
@@ -177,7 +268,7 @@ public class EuronextDirectoryTests
             "<script data-drupal-selector='drupal-settings-json'>"
             + System.Text.Json.JsonSerializer.Serialize(settings)
             + "</script>";
-        var parse = () => EuronextDirectoryParser.ReadLisbonGateway(html);
+        var parse = () => EuronextDirectoryParser.ReadGateway(html, EuronextMarket.Lisbon);
         parse.Should().Throw<InvalidDataException>();
     }
 }

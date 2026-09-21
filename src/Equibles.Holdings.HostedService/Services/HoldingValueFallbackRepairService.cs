@@ -1,6 +1,7 @@
 using Equibles.CommonStocks.Data.Models;
 using Equibles.Core.AutoWiring;
 using Equibles.Core.Contracts;
+using Equibles.CorporateActions.Data;
 using Equibles.CorporateActions.Data.Models;
 using Equibles.Data;
 using Equibles.Holdings.Data.Models;
@@ -90,9 +91,11 @@ namespace Equibles.Holdings.HostedService.Services;
 /// Filed population) or re-exhausts into a retry stamp this phase excludes. Phase 3 terminates
 /// because the recalculator guards the same number this phase tests — the effective per-share
 /// price (factor × close) — so a reset row can never re-derive back above the cap and be reset
-/// again. The stuck-zero phase is served by a partial Id worklist index whose entries disappear
-/// as rows heal. The other candidate predicates are not index-served. Affected filing rollups and
-/// AUM quarters are re-derived through
+/// again. The stuck-zero and implausible-derivation phases are each served by a partial Id
+/// worklist index whose entries disappear as rows heal; the implausible predicate is spelled in
+/// its index exactly as EF renders the phase query, because Postgres uses a partial index only
+/// when it can prove the query's WHERE implies the index's, node for node. The other candidate
+/// predicates are not index-served. Affected filing rollups and AUM quarters are re-derived through
 /// <see cref="HoldingsRollupRefresher"/> in the same pass — a healed position with a stale rollup
 /// would just move the lie one aggregate up.
 /// </para>
@@ -322,10 +325,7 @@ public class HoldingValueFallbackRepairService
 
         var stockIds = rows.Select(h => h.EquityIssuerId).Distinct().ToList();
         var splitsByStock = (
-            await dbContext
-                .Set<StockSplit>()
-                .Where(s => stockIds.Contains(s.EquityIssuerId))
-                .ToListAsync(cancellationToken)
+            await StockSplitQueries.ForIssuers(dbContext, stockIds).ToListAsync(cancellationToken)
         )
             .GroupBy(s => s.EquityIssuerId)
             .ToDictionary(g => g.Key, g => g.ToList());
@@ -525,21 +525,17 @@ public class HoldingValueFallbackRepairService
         return rows.Count;
     }
 
-    /// <summary>
-    /// Resets rows whose implied per-share price is impossible, so the recalculator re-derives
-    /// them under its sanity guard.
-    /// </summary>
-    private async Task<int> ResetImplausibleDerivations(CancellationToken cancellationToken)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var dbContext = scope.ServiceProvider.GetRequiredService<EquiblesFinancialDbContext>();
-        ExtendCommandTimeout(dbContext);
-
+    // Exposed for the Npgsql translation pin: IX_InstitutionalHolding_ImplausibleDerivationRepair
+    // carries this WHERE verbatim, and a rendering drift would silently hand the phase back to a
+    // full-table scan that times out.
+    internal static IQueryable<InstitutionalHolding> BuildImplausibleDerivationCandidateQuery(
+        EquiblesFinancialDbContext dbContext
+    ) =>
         // Decimal math server-side: 1M × a large share count overflows Int64, and the point of
         // the predicate is exactly the rows where Value is astronomically large. Filed-value rows
         // are excluded — that figure is the filer's own claim, not our derivation error, and
         // resetting one would loop it through the fallback forever.
-        var rows = await dbContext
+        dbContext
             .Set<InstitutionalHolding>()
             .Include(h => h.ManagerEntries)
             .Where(h =>
@@ -550,7 +546,19 @@ public class HoldingValueFallbackRepairService
                 && (decimal)h.Value > HoldingValueSanityGuard.MaxPlausibleSharePrice * h.Shares
             )
             .OrderBy(h => h.Id)
-            .Take(MaxRowsPerCycle)
+            .Take(MaxRowsPerCycle);
+
+    /// <summary>
+    /// Resets rows whose implied per-share price is impossible, so the recalculator re-derives
+    /// them under its sanity guard.
+    /// </summary>
+    private async Task<int> ResetImplausibleDerivations(CancellationToken cancellationToken)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<EquiblesFinancialDbContext>();
+        ExtendCommandTimeout(dbContext);
+
+        var rows = await BuildImplausibleDerivationCandidateQuery(dbContext)
             .ToListAsync(cancellationToken);
 
         if (rows.Count == 0)

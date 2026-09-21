@@ -12,6 +12,10 @@ public class EquityListing : IActivable
     public virtual EquitySecurity Security { get; set; }
     public virtual List<EquityListingTickerAlias> TickerAliases { get; set; } = [];
 
+    // Present only when this listing is its issuer's default listing; readers test
+    // `Presentation != null` instead of walking Security.Issuer.Presentation.
+    public virtual EquityIssuerPresentation Presentation { get; set; }
+
     [MaxLength(4)]
     public string MarketIdentifierCode { get; set; }
 
@@ -39,6 +43,9 @@ public class EquityListing : IActivable
     public bool IsReferenceListed { get; set; }
     public bool PriceHistoryBackfilled { get; set; }
     public DateTime? YahooEnrichmentAttemptedAt { get; set; }
+
+    // Last Yahoo chart request for this listing; bounds the cadence once a venue keeps the series current.
+    public DateTime? YahooPriceSyncAttemptedAt { get; set; }
     public DateTime? HistoricalPriceBackfillAttemptedAt { get; set; }
     public DateTime? HistoricalCusipBackfillRequestedAt { get; set; }
     public List<string> HistoricalCusipBackfillCandidates { get; set; } = [];
