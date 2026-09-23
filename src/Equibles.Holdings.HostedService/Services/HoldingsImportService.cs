@@ -36,6 +36,16 @@ public class HoldingsImportService
     // than the column, and the name is only ever a human-facing hint.
     private const int MaxIssuerNameLength = 256;
 
+    // A 13F data set carries one row per reported position, and every stage of the flush scales
+    // with that count: the observation-key JSON, the rows read back to restore a stored ticker,
+    // and the text of the generated upsert statement. A quarter with millions of positions
+    // exhausted the worker's 1 GiB container while importing 2020q2, and because the failure is
+    // logged as non-transient the data set was never marked processed -- so every cycle re-entered
+    // it from the top of the walk and the backfill never reached the newer quarters. Slicing
+    // bounds each of those allocations by a constant instead of by the size of the filing.
+    private const int ObservationKeyChunkSize = 1000;
+    private const int UpsertChunkSize = 1000;
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<HoldingsImportService> _logger;
     private readonly WorkerOptions _workerOptions;
@@ -2086,52 +2096,63 @@ public class HoldingsImportService
             h.ManagerEntries.Clear();
         }
 
-        await dbContext
-            .Set<InstitutionalHolding>()
-            .UpsertRange(safeHoldings)
-            .On(h => new
-            {
-                h.EquityIssuerId,
-                h.InstitutionalHolderId,
-                h.ReportDate,
-                h.ShareType,
-                h.OptionType,
-                h.FilingType,
-                h.ListedTicker,
-            })
-            .WhenMatched(
-                (existing, incoming) =>
-                    new InstitutionalHolding
-                    {
-                        Value = incoming.Value,
-                        FiledValue = incoming.FiledValue,
-                        Shares = incoming.Shares,
-                        FilingDate = incoming.FilingDate,
-                        // A re-import re-derives the value from scratch, so the previous attempt's
-                        // backoff must not carry over: a row that had been given up on would
-                        // otherwise be abandoned again without ever being retried.
-                        ValueRetryCount = incoming.ValueRetryCount,
-                        ValueLastRetryAt = incoming.ValueLastRetryAt,
-                        AccessionNumber = incoming.AccessionNumber,
-                        InvestmentDiscretion = incoming.InvestmentDiscretion,
-                        VotingAuthSole = incoming.VotingAuthSole,
-                        VotingAuthShared = incoming.VotingAuthShared,
-                        VotingAuthNone = incoming.VotingAuthNone,
-                        PercentOfClass = incoming.PercentOfClass,
-                        TitleOfClass = incoming.TitleOfClass,
-                        Cusip = incoming.Cusip,
-                        IsAmendment = incoming.IsAmendment,
-                        ValuePending = incoming.ValuePending,
-                        ValueUnavailable = incoming.ValueUnavailable,
-                        // The label must travel with the figure it describes: without it a
-                        // re-import that re-derives a previously Filed row keeps the stale Filed
-                        // label (shielding the new derivation from the implausible-derivation
-                        // reset), and one that publishes filed over a previously derived row
-                        // keeps Derived (exposing the filer's own figure to that same reset).
-                        ValueSource = incoming.ValueSource,
-                    }
-            )
-            .RunAsync(cancellationToken);
+        // Sliced: FlexLabs renders the whole range into ONE INSERT ... ON CONFLICT DO UPDATE, so
+        // both the statement text and the StringBuilder that assembles it grow with the batch.
+        // On a data set large enough that this text alone exhausted the worker's container the
+        // import threw OutOfMemoryException, and because that is logged as non-transient the data
+        // set was never marked processed -- so it was retried forever and the walk never advanced.
+        // The post-flush reconciliation below still runs once for the whole batch, so slicing here
+        // cannot split one accession's attribution rewrite across two passes.
+        foreach (var chunk in safeHoldings.Chunk(UpsertChunkSize))
+        {
+            await dbContext
+                .Set<InstitutionalHolding>()
+                .UpsertRange(chunk)
+                .On(h => new
+                {
+                    h.EquityIssuerId,
+                    h.InstitutionalHolderId,
+                    h.ReportDate,
+                    h.ShareType,
+                    h.OptionType,
+                    h.FilingType,
+                    h.ListedTicker,
+                })
+                .WhenMatched(
+                    (existing, incoming) =>
+                        new InstitutionalHolding
+                        {
+                            Value = incoming.Value,
+                            FiledValue = incoming.FiledValue,
+                            Shares = incoming.Shares,
+                            FilingDate = incoming.FilingDate,
+                            // A re-import re-derives the value from scratch, so the previous
+                            // attempt's backoff must not carry over: a row that had been given up
+                            // on would otherwise be abandoned again without ever being retried.
+                            ValueRetryCount = incoming.ValueRetryCount,
+                            ValueLastRetryAt = incoming.ValueLastRetryAt,
+                            AccessionNumber = incoming.AccessionNumber,
+                            InvestmentDiscretion = incoming.InvestmentDiscretion,
+                            VotingAuthSole = incoming.VotingAuthSole,
+                            VotingAuthShared = incoming.VotingAuthShared,
+                            VotingAuthNone = incoming.VotingAuthNone,
+                            PercentOfClass = incoming.PercentOfClass,
+                            TitleOfClass = incoming.TitleOfClass,
+                            Cusip = incoming.Cusip,
+                            IsAmendment = incoming.IsAmendment,
+                            ValuePending = incoming.ValuePending,
+                            ValueUnavailable = incoming.ValueUnavailable,
+                            // The label must travel with the figure it describes: without it a
+                            // re-import that re-derives a previously Filed row keeps the stale
+                            // Filed label (shielding the new derivation from the
+                            // implausible-derivation reset), and one that publishes filed over a
+                            // previously derived row keeps Derived (exposing the filer's own
+                            // figure to that same reset).
+                            ValueSource = incoming.ValueSource,
+                        }
+                )
+                .RunAsync(cancellationToken);
+        }
 
         var accessions = safeHoldings.Select(h => h.AccessionNumber).Distinct().ToList();
         var dbHoldings = await dbContext
@@ -2172,9 +2193,31 @@ public class HoldingsImportService
         CancellationToken cancellationToken
     )
     {
-        // CUSIP is the filing's stated identity. Presentation changes cannot turn a replay of
-        // that observation into a second position. Match the full position grain except for
-        // its previously assigned display ticker, retaining option/principal/form distinctions.
+        // Sliced because the stored side is read back one observation key at a time: on the
+        // largest data sets reading every key at once was itself enough to exhaust the container.
+        // Retention only ever writes ListedTicker, and a key identifies exactly one position, so
+        // a slice boundary cannot change the outcome.
+        foreach (var slice in incoming.Chunk(ObservationKeyChunkSize))
+            await RestoreStoredTickers(dbContext, slice, cancellationToken);
+
+        // Runs over the whole batch, after every slice has had its ticker restored: it exists to
+        // catch two positions that retention has collapsed onto one upsert key, and a slice
+        // boundary could hide exactly that pair.
+        var collision = FindRetainedIdentityCollision(incoming);
+        if (collision != null)
+            throw collision;
+    }
+
+    // Restores the display ticker a stored row already carries onto the replayed positions.
+    // CUSIP is the filing's stated identity, so a presentation change cannot turn a replay of that
+    // observation into a second position. Matches the full position grain except for the previously
+    // assigned display ticker, retaining option/principal/form distinctions.
+    private static async Task RestoreStoredTickers(
+        EquiblesFinancialDbContext dbContext,
+        IReadOnlyList<InstitutionalHolding> incoming,
+        CancellationToken cancellationToken
+    )
+    {
         var keys = JsonSerializer.Serialize(
             incoming
                 .Where(row => row.Cusip != null)
@@ -2206,18 +2249,23 @@ public class HoldingsImportService
                 """
             )
             .AsNoTracking()
-            .ToListAsync(cancellationToken);
-        static object ObservationKey(InstitutionalHolding row) =>
-            new
+            // Projected rather than materialised as entities: this read exists only to copy one
+            // column off each stored row, but returning entities handed every matched row a
+            // lazy-loading proxy and made EF populate the ManagerEntries collection through the
+            // split-query shaper. That is what an OutOfMemoryException in this method was costing.
+            .Select(row => new StoredObservation
             {
-                row.EquityIssuerId,
-                row.InstitutionalHolderId,
-                row.ReportDate,
-                row.Cusip,
-                row.ShareType,
-                row.OptionType,
-                row.FilingType,
-            };
+                EquityIssuerId = row.EquityIssuerId,
+                InstitutionalHolderId = row.InstitutionalHolderId,
+                ReportDate = row.ReportDate,
+                Cusip = row.Cusip,
+                ShareType = row.ShareType,
+                OptionType = row.OptionType,
+                FilingType = row.FilingType,
+                ListedTicker = row.ListedTicker,
+            })
+            .ToListAsync(cancellationToken);
+
         var retained = stored
             .GroupBy(ObservationKey)
             .ToDictionary(group => group.Key, group => group.ToList());
@@ -2229,14 +2277,59 @@ public class HoldingsImportService
                 throw new HoldingObservationConflictException(
                     "The stored filing security has conflicting observation identities; replay was "
                         + $"refused. {DescribeObservation(row)}; stored display tickers: "
-                        + string.Join(", ", matches.Select(DescribeTicker))
+                        + string.Join(", ", matches.Select(match => DescribeTicker(match.ListedTicker)))
                         + "."
                 );
             row.ListedTicker = matches[0].ListedTicker;
         }
-        var collision = FindRetainedIdentityCollision(incoming);
-        if (collision != null)
-            throw collision;
+    }
+
+    // The position grain a replayed observation is matched on: the filing's stated identity,
+    // excluding the display ticker that retention is allowed to change.
+    private static ObservationGrain ObservationKey(InstitutionalHolding row) =>
+        new(
+            row.EquityIssuerId,
+            row.InstitutionalHolderId,
+            row.ReportDate,
+            row.Cusip,
+            row.ShareType,
+            row.OptionType,
+            row.FilingType
+        );
+
+    private static ObservationGrain ObservationKey(StoredObservation row) =>
+        new(
+            row.EquityIssuerId,
+            row.InstitutionalHolderId,
+            row.ReportDate,
+            row.Cusip,
+            row.ShareType,
+            row.OptionType,
+            row.FilingType
+        );
+
+    private readonly record struct ObservationGrain(
+        Guid EquityIssuerId,
+        Guid InstitutionalHolderId,
+        DateOnly ReportDate,
+        string Cusip,
+        ShareType ShareType,
+        OptionType? OptionType,
+        FilingType FilingType
+    );
+
+    // Carries the stored position's observation grain plus the one column retention copies back.
+    // Deliberately not an InstitutionalHolding: see RestoreStoredTickers.
+    private sealed record StoredObservation
+    {
+        public Guid EquityIssuerId { get; init; }
+        public Guid InstitutionalHolderId { get; init; }
+        public DateOnly ReportDate { get; init; }
+        public string Cusip { get; init; }
+        public ShareType ShareType { get; init; }
+        public OptionType? OptionType { get; init; }
+        public FilingType FilingType { get; init; }
+        public string ListedTicker { get; init; }
     }
 
     /// <summary>
@@ -2260,7 +2353,7 @@ public class HoldingsImportService
                 + string.Join(
                     ", ",
                     collision.Select(row =>
-                        $"CUSIP {row.Cusip ?? "(none)"} -> {DescribeTicker(row)}"
+                        $"CUSIP {row.Cusip ?? "(none)"} -> {DescribeTicker(row.ListedTicker)}"
                     )
                 )
                 + ". One of those CUSIPs keeps a stored display ticker another now claims, so "
@@ -2268,8 +2361,7 @@ public class HoldingsImportService
         );
     }
 
-    private static string DescribeTicker(InstitutionalHolding row) =>
-        row.ListedTicker ?? "(primary)";
+    private static string DescribeTicker(string listedTicker) => listedTicker ?? "(primary)";
 
     // Names the position grain the refusal is about. The importer only ever sees the conflict
     // once, at the moment it skips the filing, so every identifier needed to find the stored
