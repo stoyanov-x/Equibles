@@ -1,4 +1,6 @@
+using System.Data;
 using System.Text;
+using System.Xml;
 using Equibles.Core.AutoWiring;
 using Equibles.Holdings.Data.Models;
 using Equibles.Holdings.HostedService.Models;
@@ -53,9 +55,12 @@ public class Realtime13FIngestionService
         DateOnly today,
         int lookbackDays,
         DateOnly minReportDate,
-        CancellationToken cancellationToken
+        CancellationToken cancellationToken,
+        RealtimeSweepState sweepState = null,
+        int maxFilings = int.MaxValue
     )
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxFilings, 1);
         var (entries, earliestFailedDate) = await DiscoverEntries(
             today,
             lookbackDays,
@@ -72,6 +77,17 @@ public class Realtime13FIngestionService
             cancellationToken
         );
 
+        await using var failureScope = _scopeFactory.CreateAsyncScope();
+        var failures =
+            failureScope.ServiceProvider.GetRequiredService<HoldingsImportFailureRepository>();
+        var pendingRows = await failures
+            .GetAll()
+            .Where(row => row.ResolvedAt == null)
+            .AsNoTracking()
+            .ToListAsync(cancellationToken);
+        var recoveringManagers = pendingRows.Select(row => row.Cik.TrimStart('0')).ToHashSet();
+        var retryFrom = new Dictionary<string, DateOnly>();
+
         // Sort chronologically so originals are always imported before their
         // amendments — HandleAmendments in the import pipeline deletes prior
         // holdings for the same holder+period before inserting the amendment.
@@ -85,11 +101,32 @@ public class Realtime13FIngestionService
         var earliestRetryDate = earliestFailedDate;
 
         var totalImported = 0;
+        var attempted = 0;
         foreach (var entry in sorted)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (alreadyProcessed.Contains(entry.AccessionNumber))
+            // Recovery owns the complete ordered tail for these managers. Persist new
+            // discoveries before advancing the sweep, including filings older than its floor.
+            if (recoveringManagers.Contains(entry.Cik.TrimStart('0')))
+            {
+                if (!alreadyProcessed.Contains(entry.AccessionNumber))
+                    await failures.EnqueueRecovery(
+                        entry.AccessionNumber,
+                        entry.Cik.TrimStart('0'),
+                        entry.DateFiled,
+                        cancellationToken
+                    );
+                continue;
+            }
+
+            if (
+                alreadyProcessed.Contains(entry.AccessionNumber)
+                && !(
+                    retryFrom.TryGetValue(entry.Cik.TrimStart('0'), out var retryDate)
+                    && entry.DateFiled >= retryDate
+                )
+            )
             {
                 _logger.LogDebug(
                     "Skipping already-processed filing {Accession}",
@@ -98,7 +135,28 @@ public class Realtime13FIngestionService
                 continue;
             }
 
+            // Persist progress only before the first unattempted date. The accession
+            // ledger resumes a partly processed day without losing its amendments.
+            if (attempted == maxFilings)
+            {
+                var resumeFrom =
+                    earliestRetryDate.HasValue && earliestRetryDate.Value < entry.DateFiled
+                        ? earliestRetryDate.Value
+                        : entry.DateFiled;
+                _logger.LogInformation(
+                    "13F real-time ingestion yielded after {Count} attempts; resuming from {Date:yyyy-MM-dd}",
+                    attempted,
+                    resumeFrom
+                );
+                return new RealtimeIngestionResult(totalImported, resumeFrom, true);
+            }
+
+            attempted++;
             var outcome = await ImportEntry(entry, minReportDate, cancellationToken);
+            if (outcome is EntryImportOutcome.Failed or EntryImportOutcome.Incomplete)
+            {
+                retryFrom[entry.Cik.TrimStart('0')] = entry.DateFiled;
+            }
             if (outcome == EntryImportOutcome.Failed)
             {
                 // Hold the watermark back to this day so the filing is re-swept
@@ -108,12 +166,19 @@ public class Realtime13FIngestionService
                     earliestRetryDate = entry.DateFiled;
                 continue;
             }
-            if (outcome != EntryImportOutcome.Imported)
+            if (outcome is not (EntryImportOutcome.Imported or EntryImportOutcome.Skipped))
                 continue;
 
-            await RecordProcessed([entry.AccessionNumber], cancellationToken);
-            totalImported++;
+            // A source-confirmed out-of-range filing is complete too; otherwise it
+            // consumes every bounded pass without ever moving the daily frontier.
+            if (!await RecordProcessed([entry.AccessionNumber], cancellationToken, sweepState))
+                return new RealtimeIngestionResult(totalImported, entry.DateFiled);
+            if (outcome == EntryImportOutcome.Imported)
+                totalImported++;
         }
+
+        // Daily indexes can be incomplete even when every discovered filing imports.
+        // Only complete company-tail recovery may resolve durable failure records.
 
         _logger.LogInformation(
             "13F real-time ingestion cycle complete: {Count} filings imported",
@@ -133,7 +198,7 @@ public class Realtime13FIngestionService
     /// filing whose rows are already present is a no-op. Returns the number of
     /// filings that imported with holdings.
     /// </summary>
-    public async Task<int> IngestSpecificFilings(
+    public virtual async Task<int> IngestSpecificFilings(
         IReadOnlyCollection<EdgarDailyIndexEntry> entries,
         DateOnly minReportDate,
         CancellationToken cancellationToken
@@ -158,17 +223,18 @@ public class Realtime13FIngestionService
             imported++;
         }
 
+        // A caller may supply only a subset of the manager's filings. Recovery owns
+        // resolution after verifying and importing the complete later filing tail.
         return imported;
     }
 
     private enum EntryImportOutcome
     {
-        // Parse/validation rejected it (wrong period, no parseable holdings) —
-        // nothing to record and nothing to retry.
+        // Source confirms the filing is outside the configured history boundary.
         Skipped,
 
         // Imported but the service flagged it incomplete (retry-later, e.g. CUSIPs
-        // not seeded). Bounded by the trailing re-sweep window; not watermark-held.
+        // not seeded). A durable record keeps it retryable outside the sweep window.
         Incomplete,
 
         // The import threw, or a non-amendment original imported "complete" yet
@@ -192,6 +258,16 @@ public class Realtime13FIngestionService
     {
         var filing = await TryParseAndValidateEntry(entry, minReportDate, cancellationToken);
         if (filing == null)
+        {
+            await RecordFailure(
+                entry,
+                null,
+                HoldingsImportFailureReason.UnreadableSource,
+                cancellationToken
+            );
+            return EntryImportOutcome.Failed;
+        }
+        if (filing.PeriodOfReport < minReportDate)
             return EntryImportOutcome.Skipped;
 
         _logger.LogInformation(
@@ -205,11 +281,13 @@ public class Realtime13FIngestionService
         try
         {
             using var archive = _archiveBuilder.Build([filing]);
-            importResult = await _importService.ImportDataSet(
-                archive,
-                minReportDate,
-                cancellationToken
-            );
+            importResult = Filing13FZeroPositionEvidence.IsRestatement(filing)
+                ? await _importService.ImportZeroRestatement(
+                    filing,
+                    minReportDate,
+                    cancellationToken
+                )
+                : await _importService.ImportDataSet(archive, minReportDate, cancellationToken);
         }
         catch (OperationCanceledException)
         {
@@ -226,17 +304,48 @@ public class Realtime13FIngestionService
                 entry.AccessionNumber,
                 entry.Cik
             );
+            await RecordFailure(
+                entry,
+                filing.PeriodOfReport,
+                HoldingsImportFailureReason.ImportFailed,
+                cancellationToken
+            );
             return EntryImportOutcome.Failed;
         }
 
-        // IsComplete=false is the import service's "retry later" contract (e.g.
-        // NoTrackedStocks until CUSIPs seed) — recording it here would consume
-        // the filing forever (EquiblesCommercial#2850). It deliberately does
-        // NOT hold the watermark back: a filing whose issuers never seed a
-        // CUSIP would wedge the sweep, so its retry is bounded by the trailing
-        // window instead — and the quarterly bulk import reconciles it anyway.
+        if (importResult.ConflictedFilings.Count > 0)
+        {
+            await RecordFailure(
+                entry,
+                filing.PeriodOfReport,
+                HoldingsImportFailureReason.IdentityConflict,
+                cancellationToken
+            );
+            return EntryImportOutcome.Failed;
+        }
         if (!importResult.IsComplete)
+        {
+            if (
+                importResult.NoTrackedStocks
+                && IsSourceConfirmedZeroOriginal(filing)
+                && !await HasRetainedBook(filing, cancellationToken)
+            )
+            {
+                _logger.LogInformation(
+                    "Completed source-confirmed zero-position 13F {Accession} (CIK {Cik})",
+                    entry.AccessionNumber,
+                    entry.Cik
+                );
+                return EntryImportOutcome.Imported;
+            }
+            await RecordFailure(
+                entry,
+                filing.PeriodOfReport,
+                HoldingsImportFailureReason.Incomplete,
+                cancellationToken
+            );
             return EntryImportOutcome.Incomplete;
+        }
 
         // A non-amendment original that imported "complete" yet inserted zero
         // holdings is suspect: recording it would consume the filing forever even
@@ -251,10 +360,57 @@ public class Realtime13FIngestionService
                 entry.AccessionNumber,
                 entry.Cik
             );
+            await RecordFailure(
+                entry,
+                filing.PeriodOfReport,
+                HoldingsImportFailureReason.EmptyImport,
+                cancellationToken
+            );
             return EntryImportOutcome.Failed;
         }
 
         return EntryImportOutcome.Imported;
+    }
+
+    internal static bool IsSourceConfirmedZeroOriginal(Parsed13FFiling filing) =>
+        Filing13FZeroPositionEvidence.IsOriginal(filing);
+
+    private async Task<bool> HasRetainedBook(
+        Parsed13FFiling filing,
+        CancellationToken cancellationToken
+    )
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var holdings = scope.ServiceProvider.GetRequiredService<InstitutionalHoldingRepository>();
+        return await holdings
+            .GetAll()
+            .AnyAsync(
+                h =>
+                    h.InstitutionalHolder.Cik == filing.Cik
+                    && h.ReportDate == filing.PeriodOfReport
+                    && h.FilingType == FilingType.Form13F,
+                cancellationToken
+            );
+    }
+
+    private async Task RecordFailure(
+        EdgarDailyIndexEntry entry,
+        DateOnly? reportDate,
+        HoldingsImportFailureReason reason,
+        CancellationToken cancellationToken
+    )
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        await scope
+            .ServiceProvider.GetRequiredService<HoldingsImportFailureRepository>()
+            .Record(
+                entry.AccessionNumber,
+                entry.Cik.TrimStart('0'),
+                entry.DateFiled,
+                reportDate,
+                reason,
+                cancellationToken
+            );
     }
 
     private async Task<Parsed13FFiling> TryParseAndValidateEntry(
@@ -277,9 +433,6 @@ public class Realtime13FIngestionService
                 );
                 return null;
             }
-
-            if (filing.PeriodOfReport < minReportDate)
-                return null;
 
             return filing;
         }
@@ -366,16 +519,34 @@ public class Realtime13FIngestionService
         return await LoadProcessedSet(repo, accessionNumbers, cancellationToken);
     }
 
-    private async Task RecordProcessed(
+    internal async Task<bool> RecordProcessed(
         IReadOnlyCollection<string> accessionNumbers,
-        CancellationToken cancellationToken
+        CancellationToken cancellationToken,
+        RealtimeSweepState sweepState = null
     )
     {
         if (accessionNumbers.Count == 0)
-            return;
+            return true;
 
         await using var scope = _scopeFactory.CreateAsyncScope();
         var repo = scope.ServiceProvider.GetRequiredService<ProcessedFilingRepository>();
+
+        await using var transaction =
+            sweepState == null
+                ? null
+                : await repo.CreateTransaction(IsolationLevel.ReadCommitted, cancellationToken);
+        if (sweepState != null)
+        {
+            // Serialize only the completion write with identity resets, never the SEC request.
+            var states = scope.ServiceProvider.GetRequiredService<RealtimeSweepStateRepository>();
+            var current = await states.Lock(sweepState.Id, cancellationToken);
+            if (
+                current == null
+                || current.UpdatedAt != sweepState.UpdatedAt
+                || current.SweptThrough != sweepState.SweptThrough
+            )
+                return false;
+        }
 
         // Re-check inside the write scope: a parallel sweep (or the quarterly
         // worker) may have recorded some of these between discovery and now.
@@ -388,6 +559,9 @@ public class Realtime13FIngestionService
         }
 
         await repo.SaveChanges();
+        if (transaction != null)
+            await transaction.CommitAsync(cancellationToken);
+        return true;
     }
 
     private static async Task<HashSet<string>> LoadProcessedSet(
@@ -403,16 +577,22 @@ public class Realtime13FIngestionService
         return new HashSet<string>(processed, StringComparer.OrdinalIgnoreCase);
     }
 
-    private async Task<Parsed13FFiling> ParseFiling(
+    internal async Task<Parsed13FFiling> ParseFiling(
         EdgarDailyIndexEntry entry,
         CancellationToken cancellationToken
     )
     {
-        var artifacts = await _edgarClient.GetFilingArtifactNames(
-            entry.Cik,
-            entry.AccessionNumber,
-            cancellationToken
-        );
+        var submission = await TryReadSubmission(entry, cancellationToken);
+        if (submission?.Filing != null)
+            return submission.Filing;
+
+        var artifacts =
+            submission?.ArtifactNames
+            ?? await _edgarClient.GetFilingArtifactNames(
+                entry.Cik,
+                entry.AccessionNumber,
+                cancellationToken
+            );
 
         var primaryDocName = SelectCoverPage(artifacts);
         if (primaryDocName == null)
@@ -448,6 +628,14 @@ public class Realtime13FIngestionService
         // let the authoritative quarterly bulk import reconcile it later.
         if (filing.Holdings.Count == 0 && !filing.IsAmendment)
         {
+            if (submission?.OriginalFallback != null)
+            {
+                _logger.LogInformation(
+                    "Using complete-submission positions for original 13F {Accession}; standalone table unavailable and cover totals unreconciled",
+                    entry.AccessionNumber
+                );
+                return submission.OriginalFallback;
+            }
             _logger.LogWarning(
                 "Filing {Accession} yielded no holdings and is not an amendment — skipping",
                 entry.AccessionNumber
@@ -456,6 +644,45 @@ public class Realtime13FIngestionService
         }
 
         return filing;
+    }
+
+    // Complete submissions stay available when the artifact directory returns server errors.
+    // Bound this first route so unavailable text never starves the existing XML-artifact route.
+    private async Task<Parsed13FSubmission> TryReadSubmission(
+        EdgarDailyIndexEntry entry,
+        CancellationToken cancellationToken
+    )
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(30));
+        try
+        {
+            var content = await _edgarClient.GetDocumentContent(
+                entry.AccessionNumber,
+                entry.Cik,
+                timeout.Token
+            );
+            cancellationToken.ThrowIfCancellationRequested();
+            return Filing13FSubmissionParser.Parse(content, entry, _parser);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogInformation(
+                "Complete 13F submission timed out for {Accession}; trying artifacts",
+                entry.AccessionNumber
+            );
+            return null;
+        }
+        catch (Exception exception)
+            when (exception is HttpRequestException or XmlException or FormatException)
+        {
+            _logger.LogInformation(
+                exception,
+                "Complete 13F submission unavailable for {Accession}; trying artifacts",
+                entry.AccessionNumber
+            );
+            return null;
+        }
     }
 
     /// <summary>

@@ -6,6 +6,16 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Content
+      Include="../Equibles.UnitTests/TestAssets/Holdings/13f-zero-position-submission.txt"
+      Link="TestAssets/Holdings/13f-zero-position-submission.txt"
+      CopyToOutputDirectory="PreserveNewest"
+    />
+    <Content
+      Include="../Equibles.UnitTests/TestAssets/Holdings/13f-zero-restatement-submission.txt"
+      Link="TestAssets/Holdings/13f-zero-restatement-submission.txt"
+      CopyToOutputDirectory="PreserveNewest"
+    />
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
@@ -13,6 +23,11 @@
     <Content
       Include="../Equibles.UnitTests/TestAssets/Esef/ctt-2022-json-excerpt.json"
       Link="TestAssets/Esef/ctt-2022-json-excerpt.json"
+      CopyToOutputDirectory="PreserveNewest"
+    />
+    <Content
+      Include="../Equibles.UnitTests/TestAssets/Esef/ennogie-2025-annual-excerpt.xhtml"
+      Link="TestAssets/Esef/ennogie-2025-annual-excerpt.xhtml"
       CopyToOutputDirectory="PreserveNewest"
     />
     <Content

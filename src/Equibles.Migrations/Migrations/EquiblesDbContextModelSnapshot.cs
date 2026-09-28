@@ -2322,6 +2322,24 @@ namespace Equibles.Migrations.Migrations
                     b.ToTable("HolderQuarterlySnapshot");
                 });
 
+            modelBuilder.Entity("Equibles.Holdings.Data.Models.HoldingLabelConvergenceState", b =>
+                {
+                    b.Property<Guid>("EquityIssuerId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("ConvergedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Fingerprint")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.HasKey("EquityIssuerId");
+
+                    b.ToTable("HoldingLabelConvergenceState");
+                });
+
             modelBuilder.Entity("Equibles.Holdings.Data.Models.HoldingsCorrectionEvidence", b =>
                 {
                     b.Property<Guid>("Id")
@@ -2358,6 +2376,84 @@ namespace Equibles.Migrations.Migrations
                     b.HasIndex("CorrectionKey", "SourceTable", "SourceRecordId");
 
                     b.ToTable("HoldingsCorrectionEvidence");
+                });
+
+            modelBuilder.Entity("Equibles.Holdings.Data.Models.HoldingsCusipRescan", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime?>("CompletedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Cusip")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<Guid>("EquityIssuerId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("PreviousCusip")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<DateTime>("RequestedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateOnly?>("ScannedThrough")
+                        .HasColumnType("date");
+
+                    b.Property<string>("Ticker")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CompletedAt", "RequestedAt");
+
+                    b.ToTable("HoldingsCusipRescan");
+                });
+
+            modelBuilder.Entity("Equibles.Holdings.Data.Models.HoldingsImportFailure", b =>
+                {
+                    b.Property<string>("AccessionNumber")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<int>("Attempts")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Cik")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
+                    b.Property<DateOnly>("FilingDate")
+                        .HasColumnType("date");
+
+                    b.Property<DateTime>("FirstFailedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime>("LastAttemptAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime>("NextAttemptAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("Reason")
+                        .HasColumnType("integer");
+
+                    b.Property<DateOnly?>("ReportDate")
+                        .HasColumnType("date");
+
+                    b.Property<DateTime?>("ResolvedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("AccessionNumber");
+
+                    b.HasIndex("ResolvedAt", "NextAttemptAt");
+
+                    b.ToTable("HoldingsImportFailure");
                 });
 
             modelBuilder.Entity("Equibles.Holdings.Data.Models.HoldingsReconciliationLog", b =>
@@ -3537,8 +3633,8 @@ namespace Equibles.Migrations.Migrations
                         .HasColumnType("date");
 
                     b.Property<string>("SourceUrl")
-                        .HasMaxLength(500)
-                        .HasColumnType("character varying(500)");
+                        .HasMaxLength(2000)
+                        .HasColumnType("character varying(2000)");
 
                     b.Property<string>("XbrlCalendarEvidenceFingerprint")
                         .HasMaxLength(64)
@@ -4284,7 +4380,18 @@ namespace Equibles.Migrations.Migrations
 
                     NpgsqlIndexBuilderExtensions.IncludeProperties(b.HasIndex("Cusip"), new[] { "NportFilingId" });
 
+                    b.HasIndex("Isin")
+                        .HasDatabaseName("IX_NportHolding_IsinFiling")
+                        .HasAnnotation("Npgsql:CreatedConcurrently", true);
+
+                    NpgsqlIndexBuilderExtensions.IncludeProperties(b.HasIndex("Isin"), new[] { "NportFilingId" });
+
                     b.HasIndex("NportFilingId", "ValueUsd");
+
+                    b.HasIndex("Isin", "Cusip", "Lei", "NportFilingId")
+                        .HasDatabaseName("IX_NportHolding_EquityIdentity")
+                        .HasFilter("\"AssetCategory\" = 'EC' AND \"Isin\" IS NOT NULL")
+                        .HasAnnotation("Npgsql:CreatedConcurrently", true);
 
                     b.ToTable("NportHolding");
                 });
@@ -4561,6 +4668,12 @@ namespace Equibles.Migrations.Migrations
                     b.Property<Guid>("EquityIssuerId")
                         .HasColumnType("uuid");
 
+                    b.Property<Guid?>("ImportAttemptId")
+                        .HasColumnType("uuid");
+
+                    b.Property<int>("ImportAttempts")
+                        .HasColumnType("integer");
+
                     b.Property<int>("ImporterVersion")
                         .HasColumnType("integer");
 
@@ -4569,6 +4682,9 @@ namespace Equibles.Migrations.Migrations
 
                     b.Property<DateOnly?>("LastFiledDateSeen")
                         .HasColumnType("date");
+
+                    b.Property<DateTime?>("NextAttemptAt")
+                        .HasColumnType("timestamp with time zone");
 
                     b.HasKey("Id");
 

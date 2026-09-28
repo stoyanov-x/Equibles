@@ -55,6 +55,7 @@ Each scraper has its own option section. All scraper option binds live in [`src/
 | `FredScraper` | FRED worker cadence + series-list filtering. |
 | `FtdScraper` | SEC Fails-To-Deliver worker cadence. |
 | `FinancialFactsScraper` | XBRL fact ingestion cadence. |
+| `FinancialFactsPersistence` | `InsertBatchSize` (default `1000`): rows per `FinancialFact` upsert for both the Company Facts importer and the dimensional-fact extractor. Peak memory scales with it; lower it (e.g. `FinancialFactsPersistence__InsertBatchSize=250`) on memory-constrained hosts. |
 | `YahooPriceScraper` | Yahoo price worker cadence + per-ticker backoff. |
 | `CftcScraper` | CFTC COT worker cadence + contract subset. |
 | `CboeScraper` | CBOE worker cadence. |
@@ -63,6 +64,13 @@ Each scraper has its own option section. All scraper option binds live in [`src/
 | `Worker` | Cross-cutting: `MinSyncDate`, `TickersToSync`. |
 
 Read the matching `<Module>.HostedService/Configuration/<Module>ScraperOptions.cs` for the exact keys each section supports — they vary by source and don't share a common schema.
+
+## Import recovery
+
+- Company Facts reserves an attempt before parsing and database persistence. Interrupted attempts back off from one hour to one day; only a completed import advances the success checkpoint. Lower `FinancialFactsPersistence__InsertBatchSize` if the host still cannot finish a batch.
+- CUSIP discoveries retain old/new identifiers in `HoldingsCusipRescan`. The worker scans retained SEC archives, checkpoints each completed archive, and queues affected managers through the ordered filing recovery path. Quarterly import markers remain intact; the unpublished filing window uses the existing realtime replay.
+- Pending identity scans: `SELECT count(*) FROM "HoldingsCusipRescan" WHERE "CompletedAt" IS NULL;`. Completed scans can still have pending imports: `SELECT count(*) FROM "HoldingsImportFailure" WHERE "ResolvedAt" IS NULL;`.
+- Legacy `__rescan-pending__` requests have no saved CUSIPs and still require one conservative full replay. Recovery remains recurring reconciliation; an empty queue is not a reason to remove it.
 
 ## Embedding override (opt-in)
 
@@ -186,3 +194,11 @@ A `docker compose down` keeps these volumes. `docker compose down -v` deletes th
 - Watch the Status page for progress; data starts showing up as soon as the first cycle of each scraper writes a row.
 - **`CREATE EXTENSION "pg_search" does not exist`** during migration — you're running against a vanilla Postgres image instead of `paradedb/paradedb`. See [Migrations → Postgres extensions](migrations.md#postgres-extensions).
 - **FINRA / FRED scrapers always error** — their API key is set incorrectly. Unset both vars to let them skip gracefully (the rest of the platform runs without them).
+
+## Plain-text file compression
+
+- `FileStorage:CompressTextFiles=true` compresses new filesystem `text/plain` files with gzip, including database-to-filesystem backfill writes. MIME matching ignores case, surrounding whitespace and parameters. Other formats retain their existing bytes.
+- Deploy reader support to every host before enabling this setting. It defaults to false; turning it off affects future writes only. Older binaries cannot read the new `FileSystemGzip` provider and are not a valid rollback after compressed rows exist.
+- `File.Size`, name, extension and content type describe the original bytes. `ContentHash` and `RelativePath` identify the compressed bytes. Reads verify the physical hash and logical length and return the original bytes through the normal file manager; compressed streams remain seekable.
+- This applies to the media store, not arbitrary files written directly to disk. Existing `FileSystem` rows remain readable and require a separate verified migration to gain compression.
+- A migration must preserve file IDs, verify every compressed copy, make it durable before changing rows, and queue replaced blobs for the ordinary cross-database reference checks and deletion grace period. Never overwrite or directly delete an original blob: other rows can share it.

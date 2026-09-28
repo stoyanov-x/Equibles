@@ -18,16 +18,18 @@ public class ImportContext
     public ZipArchive Archive { get; init; }
     public DateOnly MinReportDate { get; init; }
     public TimeSpan BatchPause { get; init; }
+    internal Parsed13FFiling ConfirmedZeroRestatement { get; init; }
 
     // Populated by phases
     public Dictionary<string, SubmissionRow> Submissions { get; set; }
     public Dictionary<string, CoverPageRow> CoverPages { get; set; }
+    public HashSet<string> InfoTableAccessions { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     // CUSIP → the exact security it identifies: the filer row plus the listed ticker when
     // the CUSIP belongs to one of the filer's SECONDARY listings (null = the primary or a
     // retired alias of it). The listing is part of the position's identity — GOOGL and
     // GOOG lines must never merge — so it rides the mapping from resolution to upsert.
-    public Dictionary<string, CusipTarget> CusipMapping { get; set; }
+    public Dictionary<string, CusipTarget> CusipMapping { get; set; } = [];
     public Dictionary<string, Guid> CikToHolderId { get; set; }
 
     // Summary-page other managers (the positions this filing reports on behalf of):

@@ -107,6 +107,23 @@ public class SecModuleConfiguration : Equibles.Data.IFinancialModule
                 .HasDatabaseName("IX_NportHolding_CusipFiling")
                 .IncludeProperties(h => h.NportFilingId)
                 .IsCreatedConcurrently();
+            // Foreign securities carry no CUSIP, so a fund's position in them is found by ISIN.
+            b.HasIndex(h => h.Isin)
+                .HasDatabaseName("IX_NportHolding_IsinFiling")
+                .IncludeProperties(h => h.NportFilingId)
+                .IsCreatedConcurrently();
+            // Identifier co-statements count distinct filings across history; cover their
+            // grouping and count without fetching every matching holding from the heap.
+            b.HasIndex(h => new
+                {
+                    h.Isin,
+                    h.Cusip,
+                    h.Lei,
+                    h.NportFilingId,
+                })
+                .HasDatabaseName("IX_NportHolding_EquityIdentity")
+                .HasFilter("\"AssetCategory\" = 'EC' AND \"Isin\" IS NOT NULL")
+                .IsCreatedConcurrently();
         });
         builder.Entity<ProcessedNportFiling>();
         builder

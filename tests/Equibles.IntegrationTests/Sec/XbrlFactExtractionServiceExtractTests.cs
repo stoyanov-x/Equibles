@@ -245,11 +245,16 @@ public class XbrlFactExtractionServiceExtractTests : ParadeDbMcpTestBase
         document.Issuer.FiscalYearEndMonth.Should().Be(6);
     }
 
-    private XbrlFactExtractionService BuildSut(bool historicalCalendar = false)
+    private XbrlFactExtractionService BuildSut(
+        bool historicalCalendar = false,
+        IOptions<FinancialFactsPersistenceOptions> persistenceOptions = null,
+        EquiblesFinancialDbContext context = null
+    )
     {
+        context ??= DbContext;
         var scopeFactory = ServiceScopeSubstitute.Create(
-            (typeof(EquiblesFinancialDbContext), DbContext),
-            (typeof(FinancialConceptRepository), new FinancialConceptRepository(DbContext))
+            (typeof(EquiblesFinancialDbContext), context),
+            (typeof(FinancialConceptRepository), new FinancialConceptRepository(context))
         );
         var fileManager = Substitute.For<IFileManager>();
         fileManager.GetContent(Arg.Any<File>()).Returns(ci => ((File)ci[0]).FileContent.Bytes);
@@ -265,8 +270,55 @@ public class XbrlFactExtractionServiceExtractTests : ParadeDbMcpTestBase
                     fileManager,
                     new InlineXbrlParser()
                 )
-                : null
+                : null,
+            persistenceOptions
         );
+    }
+
+    [Theory]
+    [InlineData(null, new[] { 3 })]
+    [InlineData(1, new[] { 1, 1, 1 })]
+    [InlineData(2, new[] { 2, 1 })]
+    [InlineData(0, new[] { 3 })]
+    [InlineData(-5, new[] { 3 })]
+    public async Task Extract_ConfiguredBatchSize_PersistsDimensionalAndConsolidatedFactsAndChildren(
+        int? batchSize,
+        int[] expectedBatches
+    )
+    {
+        const string tag = "RevenueFromContractWithCustomerExcludingAssessedTax";
+        var envelope = InlineEnvelope()
+            .Replace("scheme=\"cik\"", "scheme=\"http://www.sec.gov/CIK\"");
+        var bodyStart = envelope.IndexOf("<ix:nonFraction", StringComparison.Ordinal);
+        var facts = envelope[bodyStart..envelope.IndexOf("</body>", StringComparison.Ordinal)];
+        envelope = envelope.Replace(
+            "</body>",
+            facts.Replace(tag, "Revenues") + facts.Replace(tag, "NetIncomeLoss") + "</body>"
+        );
+        var document = await SeedDocument(envelope);
+        document.DocumentType = DocumentType.SixK;
+        await DbContext.SaveChangesAsync();
+        var batches = new FinancialFactBatchInterceptor();
+        await using var context = Fixture.CreateDbContext(options =>
+            options.AddInterceptors(batches)
+        );
+        var sut = BuildSut(
+            persistenceOptions: batchSize.HasValue
+                ? Options.Create(
+                    new FinancialFactsPersistenceOptions { InsertBatchSize = batchSize.Value }
+                )
+                : null,
+            context: context
+        );
+
+        (await sut.Extract(document, CancellationToken.None)).Should().Be(6);
+
+        batches.FactBatchSizes.Should().Equal(expectedBatches.Concat(expectedBatches));
+        batches.DimensionBatchSizes.Should().Equal(expectedBatches);
+        (await DbContext.Set<FinancialFact>().CountAsync(f => f.DocumentId == document.Id))
+            .Should()
+            .Be(6);
+        (await DbContext.Set<FinancialFactDimension>().CountAsync()).Should().Be(3);
     }
 
     [Fact]
@@ -350,9 +402,12 @@ public class XbrlFactExtractionServiceExtractTests : ParadeDbMcpTestBase
     }
 
     [Theory]
-    [InlineData("529900G4A1IKOKC22K56", 2)]
-    [InlineData("529900S21EQ1BO4ESM68", 0)]
+    [InlineData("EsefAnnualReport", "529900G4A1IKOKC22K56", 2)]
+    [InlineData("EsefAnnualReport", "529900S21EQ1BO4ESM68", 0)]
+    [InlineData("EsefReport", "529900G4A1IKOKC22K56", 2)]
+    [InlineData("EsefReport", "529900S21EQ1BO4ESM68", 0)]
     public async Task Extract_CapturedJson_PersistsOnlyExactIssuerFacts(
+        string form,
         string issuerLei,
         int expected
     )
@@ -366,7 +421,7 @@ public class XbrlFactExtractionServiceExtractTests : ParadeDbMcpTestBase
             )
         );
         var document = await SeedDocument(json);
-        document.DocumentType = DocumentType.EsefAnnualReport;
+        document.DocumentType = DocumentType.FromValue(form);
         document.XbrlType = XbrlType.JsonXbrl;
         document.ReportingForDate = new DateOnly(2022, 12, 31);
         document.ReportingDate = new DateOnly(2023, 9, 5);
@@ -393,11 +448,99 @@ public class XbrlFactExtractionServiceExtractTests : ParadeDbMcpTestBase
             .Should()
             .OnlyContain(fact =>
                 fact.Unit == "EUR"
-                && fact.Form == DocumentType.EsefAnnualReport
+                && fact.Form == document.DocumentType
                 && fact.DocumentId == document.Id
                 && fact.DimensionsKey == ""
                 && fact.AccessionNumber == Accession
             );
+    }
+
+    [Theory]
+    [InlineData("EsefAnnualReport", "valid")]
+    [InlineData("EsefReport", "valid")]
+    [InlineData("EsefAnnualReport", "utf8-bom")]
+    [InlineData("EsefReport", "utf8-bom")]
+    [InlineData("EsefAnnualReport", "unbound-unit")]
+    [InlineData("EsefReport", "unbound-unit")]
+    [InlineData("EsefAnnualReport", "spoofed-unit")]
+    [InlineData("EsefReport", "spoofed-unit")]
+    [InlineData("EsefAnnualReport", "spoofed-instance")]
+    [InlineData("EsefReport", "spoofed-instance")]
+    [InlineData("EsefAnnualReport", "aliased-scenario")]
+    [InlineData("EsefReport", "aliased-scenario")]
+    [InlineData("EsefAnnualReport", "rebound-taxonomy")]
+    [InlineData("EsefReport", "rebound-taxonomy")]
+    public async Task Extract_EsefInline_RequiresFaithfulNamespaceEvidenceBeforePersisting(
+        string form,
+        string shape
+    )
+    {
+        var envelope = await System.IO.File.ReadAllTextAsync(
+            Path.Combine(
+                AppContext.BaseDirectory,
+                "TestAssets",
+                "Esef",
+                "ennogie-2025-annual-excerpt.xhtml"
+            )
+        );
+        envelope = shape switch
+        {
+            "utf8-bom" => "\uFEFF" + envelope,
+            "unbound-unit" => envelope.Replace("iso4217:DKK", "undeclared:DKK"),
+            "spoofed-unit" => envelope.Replace("iso4217:DKK", "ifrs-full:DKK"),
+            "spoofed-instance" => envelope.Replace(
+                "http://www.xbrl.org/2003/instance",
+                "https://example.org/instance"
+            ),
+            "aliased-scenario" => envelope.Replace(
+                "</xbrli:context>",
+                "<q:scenario xmlns:q=\"http://www.xbrl.org/2003/instance\"><qualifier xmlns=\"https://example.org/qualifier\">segment</qualifier></q:scenario></xbrli:context>"
+            ),
+            "rebound-taxonomy" => envelope.Replace(
+                "<body>",
+                "<body xmlns:ifrs-full=\"https://example.org/ifrs-full\">"
+            ),
+            _ => envelope,
+        };
+        var document = await SeedDocument(envelope);
+        document.DocumentType = DocumentType.FromValue(form);
+        document.ReportingForDate = new DateOnly(2025, 12, 31);
+        document.ReportingDate = new DateOnly(2026, 4, 7);
+        document.Issuer.Cik = null;
+        document.Issuer.LegalEntityIdentifier = "549300JUGBT2EH17X827";
+        await DbContext.SaveChangesAsync();
+
+        if (shape is "valid" or "utf8-bom")
+        {
+            (await BuildSut().Extract(document, CancellationToken.None)).Should().Be(2);
+            (await BuildSut().Extract(document, CancellationToken.None)).Should().Be(2);
+            var facts = await DbContext
+                .Set<FinancialFact>()
+                .Where(fact => fact.DocumentId == document.Id)
+                .ToListAsync();
+            facts
+                .Should()
+                .HaveCount(2)
+                .And.OnlyContain(fact =>
+                    fact.Unit == "DKK"
+                    && fact.DimensionsKey == ""
+                    && fact.Form == document.DocumentType
+                );
+            facts.Select(fact => fact.Value).Should().BeEquivalentTo([52_789_000m, 18_296_000m]);
+        }
+        else
+        {
+            await Assert.ThrowsAsync<InvalidDataException>(() =>
+                BuildSut().Extract(document, CancellationToken.None)
+            );
+            (
+                await DbContext
+                    .Set<FinancialFact>()
+                    .CountAsync(fact => fact.DocumentId == document.Id)
+            )
+                .Should()
+                .Be(0);
+        }
     }
 
     private async Task<Document> SeedDocument(string envelope)

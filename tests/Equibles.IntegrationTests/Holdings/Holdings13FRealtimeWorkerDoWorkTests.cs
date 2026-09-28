@@ -2,12 +2,14 @@ using Equibles.Core.Configuration;
 using Equibles.Core.Contracts;
 using Equibles.Data;
 using Equibles.Errors.BusinessLogic;
+using Equibles.Holdings.Data.Models;
 using Equibles.Holdings.HostedService;
 using Equibles.Holdings.HostedService.Services;
 using Equibles.Holdings.Repositories;
 using Equibles.Integrations.Sec.Contracts;
 using Equibles.Integrations.Sec.Models;
 using Equibles.IntegrationTests.Helpers;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -79,15 +81,69 @@ public class Holdings13FRealtimeWorkerDoWorkTests : IAsyncLifetime
             : base(logger, scopeFactory, errorReporter, workerOptions, configuration) { }
 
         public Task InvokeDoWork(CancellationToken ct) => DoWork(ct);
+
+        public Task InvokeWait(CancellationToken ct) => WaitForNextCycle(SleepInterval, ct);
     }
 
-    [Fact]
-    public async Task DoWork_EmptyDailyIndexAcrossLookbackWindow_CompletesWithZeroFilings()
+    [Theory]
+    [InlineData(false, 0)]
+    [InlineData(true, 0)]
+    [InlineData(false, 11)]
+    public async Task DoWork_EmptyDailyIndex_PreservesConcurrentReset(
+        bool concurrentReset,
+        int pendingFailures
+    )
     {
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        await using (var seed = _fixture.CreateDbContext())
+        {
+            if (concurrentReset || pendingFailures > 0)
+            {
+                seed.Set<RealtimeSweepState>()
+                    .Add(
+                        new RealtimeSweepState
+                        {
+                            WorkerName = Holdings13FRealtimeWorker.WorkerStateName,
+                            SweptThrough = pendingFailures > 0 ? new DateOnly(2020, 1, 1) : today,
+                        }
+                    );
+                await seed.SaveChangesAsync();
+            }
+        }
+        await using (var seed = _fixture.CreateDbContext())
+        {
+            var failures = new HoldingsImportFailureRepository(seed);
+            for (var i = 0; i < pendingFailures; i++)
+                await failures.Record(
+                    $"pending-{i}",
+                    $"{1000 + i}",
+                    today,
+                    today,
+                    HoldingsImportFailureReason.MissingSourcePosition,
+                    CancellationToken.None
+                );
+        }
+        var resetApplied = false;
         var edgarClient = Substitute.For<ISecEdgarClient>();
         edgarClient
+            .GetCompanyFilings(Arg.Any<string>(), null, Arg.Any<DateOnly?>(), Arg.Any<DateOnly?>())
+            .Returns([]);
+        edgarClient
             .GetDailyIndex(Arg.Any<DateOnly>(), Arg.Any<CancellationToken>())
-            .Returns(new List<EdgarDailyIndexEntry>());
+            .Returns(async _ =>
+            {
+                if (concurrentReset && !resetApplied)
+                {
+                    resetApplied = true;
+                    await using var reset = _fixture.CreateDbContext();
+                    await new RealtimeSweepStateRepository(reset).Rewind(
+                        Holdings13FRealtimeWorker.WorkerStateName,
+                        today.AddDays(-90),
+                        CancellationToken.None
+                    );
+                }
+                return new List<EdgarDailyIndexEntry>();
+            });
 
         IServiceScopeFactory scopeFactory = null!;
         scopeFactory = Substitute.For<IServiceScopeFactory>();
@@ -101,8 +157,14 @@ public class Holdings13FRealtimeWorkerDoWorkTests : IAsyncLifetime
                 sp.GetService(typeof(EquiblesFinancialDbContext)).Returns(ctx);
                 sp.GetService(typeof(ProcessedDataSetRepository))
                     .Returns(new ProcessedDataSetRepository(ctx));
+                sp.GetService(typeof(ProcessedFilingRepository))
+                    .Returns(new ProcessedFilingRepository(ctx));
+                sp.GetService(typeof(HoldingsImportFailureRepository))
+                    .Returns(new HoldingsImportFailureRepository(ctx));
                 sp.GetService(typeof(RealtimeSweepStateRepository))
                     .Returns(new RealtimeSweepStateRepository(ctx));
+                sp.GetService(typeof(HoldingsRealtimeReplaySignal))
+                    .Returns(new HoldingsRealtimeReplaySignal());
                 var importService = new HoldingsImportService(
                     scopeFactory,
                     Substitute.For<ILogger<HoldingsImportService>>(),
@@ -119,6 +181,16 @@ public class Holdings13FRealtimeWorkerDoWorkTests : IAsyncLifetime
                     Substitute.For<ILogger<Realtime13FIngestionService>>()
                 );
                 sp.GetService(typeof(Realtime13FIngestionService)).Returns(ingestion);
+                sp.GetService(typeof(HoldingsImportRecoveryService))
+                    .Returns(
+                        new HoldingsImportRecoveryService(
+                            new HoldingsImportFailureRepository(ctx),
+                            new InstitutionalHoldingRepository(ctx),
+                            edgarClient,
+                            ingestion,
+                            Substitute.For<ILogger<HoldingsImportRecoveryService>>()
+                        )
+                    );
                 var scope = Substitute.For<IServiceScope>();
                 scope.ServiceProvider.Returns(sp);
                 return scope;
@@ -140,6 +212,56 @@ public class Holdings13FRealtimeWorkerDoWorkTests : IAsyncLifetime
 
         await worker.InvokeDoWork(CancellationToken.None);
 
-        logger.Messages.Should().Contain(m => m.Contains("13F real-time ingestion cycle complete"));
+        if (pendingFailures > 0)
+        {
+            await edgarClient
+                .DidNotReceive()
+                .GetDailyIndex(Arg.Any<DateOnly>(), Arg.Any<CancellationToken>());
+            await using var first = _fixture.CreateDbContext();
+            (
+                await first
+                    .Set<HoldingsImportFailure>()
+                    .CountAsync(r => r.NextAttemptAt > DateTime.UtcNow)
+            )
+                .Should()
+                .Be(10);
+            (await first.Set<RealtimeSweepState>().SingleAsync())
+                .SweptThrough.Should()
+                .Be(new DateOnly(2020, 1, 1));
+            await worker.InvokeWait(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(20));
+            await worker.InvokeDoWork(CancellationToken.None);
+            await worker.InvokeWait(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(20));
+        }
+
+        await using var verify = _fixture.CreateDbContext();
+        var state = await verify.Set<RealtimeSweepState>().SingleAsync();
+        if (concurrentReset)
+        {
+            state.SweptThrough.Should().Be(today.AddDays(-90));
+            (await verify.Set<ProcessedFiling>().CountAsync()).Should().Be(0);
+            logger.Messages.Should().Contain(m => m.Contains("replay remains pending"));
+        }
+        else
+        {
+            var start =
+                pendingFailures > 0
+                    ? new DateOnly(2020, 1, 1)
+                    : today.AddDays(
+                        -(Holdings13FRealtimeWorker.EffectiveMinLookback(today, 7) - 1)
+                    );
+            state
+                .SweptThrough.Should()
+                .Be(Holdings13FRealtimeWorker.ComputeWindowEnd(today, start));
+            var fetchedDates = edgarClient
+                .ReceivedCalls()
+                .Where(c => c.GetMethodInfo().Name == nameof(ISecEdgarClient.GetDailyIndex))
+                .Select(c => (DateOnly)c.GetArguments()[0])
+                .ToList();
+            fetchedDates.Count.Should().BeLessThanOrEqualTo(15);
+            fetchedDates.Min().Should().Be(start);
+            logger
+                .Messages.Should()
+                .Contain(m => m.Contains("13F real-time ingestion cycle complete"));
+        }
     }
 }

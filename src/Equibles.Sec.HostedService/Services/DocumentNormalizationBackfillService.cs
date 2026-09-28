@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Text;
 using System.Text.RegularExpressions;
 using Equibles.Integrations.Sec.Contracts;
@@ -11,8 +12,7 @@ using Microsoft.EntityFrameworkCore;
 namespace Equibles.Sec.HostedService.Services;
 
 /// <summary>
-/// Re-fetches and re-normalizes EDGAR documents whose stored Markdown predates the current
-/// normalization pipeline. Each successful replacement keeps the document id, removes stale
+/// Re-normalizes stale retrieval text from EDGAR sources or retained inline ESEF envelopes. Each successful replacement keeps the document id, removes stale
 /// chunks, and returns it to the indexed pending queue for locked reprocessing.
 /// </summary>
 public class DocumentNormalizationBackfillService
@@ -117,12 +117,15 @@ public class DocumentNormalizationBackfillService
             result.Processed++;
             document.NormalizedContentAttempts++;
             var currentAttempt = document.NormalizedContentAttempts;
-            if (string.IsNullOrEmpty(document.AccessionNumber))
+            if (
+                document.DocumentType?.IsEsef() != true
+                && string.IsNullOrEmpty(document.AccessionNumber)
+            )
             {
                 document.AccessionNumber = DeriveAccessionNumber(document.SourceUrl);
             }
 
-            if (document.AccessionNumber == null)
+            if (document.DocumentType?.IsEsef() != true && document.AccessionNumber == null)
             {
                 result.Failed++;
                 _logger.LogWarning(
@@ -136,21 +139,27 @@ public class DocumentNormalizationBackfillService
 
             try
             {
-                var source = await _secEdgarClient.GetDocumentContent(
-                    document.AccessionNumber,
-                    document.Issuer.Cik,
+                var (normalizedContent, emptyByDesign) = await BuildContent(
+                    document,
                     cancellationToken
                 );
-                var normalizedHtml = _normalizer.Normalize(source);
-                var markdown = _converter.Convert(normalizedHtml);
-                if (string.IsNullOrWhiteSpace(markdown))
-                {
+                if (
+                    !emptyByDesign
+                    && (
+                        normalizedContent.Length == 0
+                        || string.IsNullOrWhiteSpace(Encoding.UTF8.GetString(normalizedContent))
+                    )
+                )
                     throw new InvalidOperationException(
                         $"Normalization produced no content for document {document.Id}."
                     );
-                }
+                if (emptyByDesign)
+                    _logger.LogInformation(
+                        "ESEF report {DocumentId} is past the retrieval ceiling ({EnvelopeBytes} bytes); storing an empty body as the importer does.",
+                        document.Id,
+                        document.XbrlUncompressedSize
+                    );
 
-                var normalizedContent = Encoding.UTF8.GetBytes(markdown);
                 document.NormalizedContentVersion = Document.NormalizedContentBuilderVersion;
                 document.NormalizedContentAttempts = 0;
 
@@ -190,6 +199,57 @@ public class DocumentNormalizationBackfillService
         }
 
         return result;
+    }
+
+    // EmptyByDesign marks an ESEF report too large to retrieve, which the importer also stores without text.
+    private async Task<(byte[] Content, bool EmptyByDesign)> BuildContent(
+        Document document,
+        CancellationToken cancellationToken
+    )
+    {
+        if (document.DocumentType?.IsEsef() != true)
+        {
+            var source = await _secEdgarClient.GetDocumentContent(
+                document.AccessionNumber,
+                document.Issuer.Cik,
+                cancellationToken
+            );
+            return (
+                Encoding.UTF8.GetBytes(
+                    _converter.Convert(_normalizer.Normalize(source)) ?? string.Empty
+                ),
+                false
+            );
+        }
+
+        const int maxEnvelopeBytes = 50 * 1024 * 1024;
+        if (document.XbrlUncompressedSize > maxEnvelopeBytes)
+            throw new InvalidOperationException(
+                "ESEF envelope exceeds the normalization size limit."
+            );
+        var captured = await _documentRepository
+            .GetAll()
+            .Include(d => d.XbrlContent)
+                .ThenInclude(f => f.FileContent)
+            .SingleAsync(d => d.Id == document.Id, cancellationToken);
+        await using var stream = await _fileManager.OpenRead(captured.XbrlContent);
+        await using var gzip = new GZipStream(stream, CompressionMode.Decompress);
+        using var output = new MemoryStream();
+        var buffer = new byte[81920];
+        int read;
+        while ((read = await gzip.ReadAsync(buffer, cancellationToken)) != 0)
+        {
+            if (output.Length + read > maxEnvelopeBytes)
+                throw new InvalidOperationException(
+                    "ESEF envelope exceeds the normalization size limit."
+                );
+            output.Write(buffer, 0, read);
+        }
+        if (output.Length == 0)
+            throw new InvalidOperationException("Captured ESEF envelope is empty.");
+        var html = Encoding.UTF8.GetString(output.ToArray());
+        var content = EsefReportContent.Build(html, _normalizer, _converter);
+        return (content, content.Length == 0 && EsefReportContent.ExceedsRetrievalLimit(html));
     }
 
     private async Task<bool> ContentMatches(Document document, byte[] normalizedContent)

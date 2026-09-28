@@ -1,0 +1,568 @@
+using Equibles.Holdings.HostedService.Models;
+using Equibles.Holdings.HostedService.Services;
+using static Equibles.Holdings.HostedService.Services.HoldingLabelConvergenceService;
+
+namespace Equibles.UnitTests.Holdings;
+
+// Pins which stored labels the convergence pass may move, and that the importer's CUSIP
+// resolution never labels a position with its issuer's own presentation ticker.
+public class HoldingLabelConvergencePlanTests
+{
+    private static readonly Guid Issuer = Guid.NewGuid();
+    private static readonly Guid OtherIssuer = Guid.NewGuid();
+    private static readonly Dictionary<Guid, CandidateIssuer> Presentation = new()
+    {
+        [Issuer] = new CandidateIssuer
+        {
+            Id = Issuer,
+            PresentationTicker = "BF-B",
+            PresentationIdentified = true,
+            LiveTickers = ["BF-B", "BF-A"],
+        },
+    };
+
+    [Fact]
+    public void Plan_PresentationLabelWithAPrimaryCusip_MovesToPrimary()
+    {
+        var moves = Plan(
+            [Label("115637209", "BF-B")],
+            Presentation,
+            Mapping(("115637209", Issuer, null))
+        );
+
+        moves
+            .Should()
+            .ContainSingle()
+            .Which.Should()
+            .Be(new Relabel(Issuer, "115637209", "BF-B", null, 1));
+    }
+
+    [Fact]
+    public void Plan_PresentationLabelWithAnUnresolvedCusip_MovesToPrimary()
+    {
+        var moves = Plan(
+            [Label(null, "BF-B"), Label("000000000", "BF-B")],
+            Presentation,
+            Mapping()
+        );
+
+        moves.Should().HaveCount(2).And.OnlyContain(move => move.ToTicker == null);
+    }
+
+    [Fact]
+    public void Plan_PresentationLabelWhoseCusipNamesASibling_StaysPut()
+    {
+        var moves = Plan(
+            [Label("115637100", "BF-B")],
+            Presentation,
+            Mapping(("115637100", Issuer, "BF-A"))
+        );
+
+        moves.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Plan_PrimaryRowOfASiblingCusip_MovesToTheSiblingBeforeAnyPrimaryMove()
+    {
+        var moves = Plan(
+            [Label("115637209", "BF-B"), Label("115637100", null)],
+            Presentation,
+            Mapping(("115637209", Issuer, null), ("115637100", Issuer, "BF-A"))
+        );
+
+        moves.Select(move => move.ToTicker).Should().Equal("BF-A", null);
+    }
+
+    [Fact]
+    public void Plan_PrimaryRowOfASiblingCusipBesideAnUnidentifiedPresentation_StaysPut()
+    {
+        // HOST replaced HCWC as a new listing with no CUSIP: the old CUSIP's rows are the same
+        // security renamed, so they must not move onto the retired symbol.
+        var moves = Plan(
+            [Label("42227T105", null)],
+            new Dictionary<Guid, CandidateIssuer>
+            {
+                [Issuer] = new CandidateIssuer
+                {
+                    Id = Issuer,
+                    PresentationTicker = "HOST",
+                    LiveTickers = ["HOST", "HCWC"],
+                },
+            },
+            Mapping(("42227T105", Issuer, "HCWC"))
+        );
+
+        moves.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Plan_PrimaryRowOfARetiredSiblingCusip_StaysPut()
+    {
+        // IDXG's pre-split CUSIP sits on its delisted listing; IDXGD is the same share class.
+        var moves = Plan(
+            [Label("46062X303", null)],
+            new Dictionary<Guid, CandidateIssuer>
+            {
+                [Issuer] = new CandidateIssuer
+                {
+                    Id = Issuer,
+                    PresentationTicker = "IDXGD",
+                    PresentationIdentified = true,
+                    LiveTickers = ["IDXGD"],
+                },
+            },
+            Mapping(("46062X303", Issuer, "IDXG"))
+        );
+
+        moves.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Plan_PrimaryRowWhoseCusipBelongsToAnotherIssuer_StaysPut()
+    {
+        var moves = Plan(
+            [Label("115637100", null)],
+            Presentation,
+            Mapping(("115637100", OtherIssuer, "XYZ"))
+        );
+
+        moves.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Plan_SiblingLabelAndPrimaryRowOfPrimaryCusip_StayPut()
+    {
+        var moves = Plan(
+            [Label("115637100", "BF-A"), Label("115637209", null)],
+            Presentation,
+            Mapping(("115637100", Issuer, "BF-A"), ("115637209", Issuer, null))
+        );
+
+        moves.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Resolve_ListingClaimNamingThePresentationTicker_ResolvesToPrimary()
+    {
+        var mapping = HoldingCusipResolution.Resolve(
+            new HoldingCusipResolution.Claims
+            {
+                Listed =
+                [
+                    new HoldingCusipResolution.ListedClaim
+                    {
+                        EquityIssuerId = Issuer,
+                        ListedTicker = "BEAT",
+                        Cusip = "42238H108",
+                        PresentationTicker = "BEAT",
+                    },
+                    new HoldingCusipResolution.ListedClaim
+                    {
+                        EquityIssuerId = Issuer,
+                        ListedTicker = "BEATW",
+                        Cusip = "42238H116",
+                        PresentationTicker = "BEAT",
+                    },
+                ],
+            },
+            []
+        );
+
+        mapping["42238H108"].Should().Be(new CusipTarget(Issuer, null));
+        mapping["42238H116"].Should().Be(new CusipTarget(Issuer, "BEATW"));
+    }
+
+    [Fact]
+    public void Resolve_CusipClaimedAsAliasAndListing_IsDroppedAsContested()
+    {
+        var contested = new List<string>();
+        var mapping = HoldingCusipResolution.Resolve(
+            new HoldingCusipResolution.Claims
+            {
+                Listed =
+                [
+                    new HoldingCusipResolution.ListedClaim
+                    {
+                        EquityIssuerId = Issuer,
+                        ListedTicker = "BF-A",
+                        Cusip = "115637100",
+                        PresentationTicker = "BF-B",
+                    },
+                ],
+                Aliases =
+                [
+                    new HoldingCusipResolution.AliasClaim
+                    {
+                        EquityIssuerId = Issuer,
+                        Cusip = "115637100",
+                    },
+                ],
+            },
+            contested
+        );
+
+        mapping.Should().BeEmpty();
+        contested.Should().Equal("115637100");
+    }
+
+    [Fact]
+    public void Plan_PrimaryRowResolvedToThePresentationTicker_StaysPut()
+    {
+        // A retired listing reusing the presentation symbol (IDXGD back to IDXG) is the same line.
+        var issuers = new Dictionary<Guid, CandidateIssuer>
+        {
+            [Issuer] = new CandidateIssuer
+            {
+                Id = Issuer,
+                PresentationTicker = "IDXG",
+                PresentationIdentified = true,
+                LiveTickers = ["IDXG"],
+            },
+        };
+
+        var moves = Plan(
+            [Label("45166V304", null)],
+            issuers,
+            Mapping(("45166V304", Issuer, "IDXG"))
+        );
+
+        moves.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Resolve_RetiredSecurityTradingUnderThePresentationTicker_ResolvesToPrimary()
+    {
+        var primarySecurity = Guid.NewGuid();
+        var mapping = HoldingCusipResolution.Resolve(
+            new HoldingCusipResolution.Claims
+            {
+                Securities =
+                [
+                    new HoldingCusipResolution.SecurityClaim
+                    {
+                        Id = Guid.NewGuid(),
+                        EquityIssuerId = Issuer,
+                        Cusip = "45166V304",
+                        PrimarySecurityId = primarySecurity,
+                        PresentationTicker = "IDXG",
+                        UsTickers = ["IDXG"],
+                    },
+                    new HoldingCusipResolution.SecurityClaim
+                    {
+                        Id = Guid.NewGuid(),
+                        EquityIssuerId = Issuer,
+                        Cusip = "45166V114",
+                        PrimarySecurityId = primarySecurity,
+                        PresentationTicker = "IDXG",
+                        UsTickers = ["IDXGW"],
+                    },
+                ],
+            },
+            []
+        );
+
+        mapping["45166V304"].Should().Be(new CusipTarget(Issuer, null));
+        mapping["45166V114"].Should().Be(new CusipTarget(Issuer, "IDXGW"));
+    }
+
+    private static CandidateIssuer LibertyBroadband(params string[] statedCandidates) =>
+        new()
+        {
+            Id = Issuer,
+            PresentationTicker = "LBRDK",
+            PresentationIdentified = true,
+            RetiredSiblingTickers = ["LBRDA"],
+            RetiredCusipStatements =
+            [
+                new RetiredCusipStatement
+                {
+                    Ticker = "LBRDA",
+                    Candidates =
+                        statedCandidates.Length > 0 ? [.. statedCandidates] : ["530307107"],
+                },
+            ],
+        };
+
+    [Fact]
+    public void Plan_PrimaryRowOfACoRegisteredRetiredClass_MovesOntoIt()
+    {
+        var issuer = LibertyBroadband();
+        AdmitRetiredSiblings(issuer, [("LBRDK", "a-1"), ("LBRDA", "a-1")]);
+
+        var moves = Plan(
+            [Label("530307107", null)],
+            new Dictionary<Guid, CandidateIssuer> { [Issuer] = issuer },
+            Mapping(("530307107", Issuer, "LBRDA"))
+        );
+
+        moves.Should().ContainSingle().Which.ToTicker.Should().Be("LBRDA");
+    }
+
+    // A retired ticker never registered beside the presentation may be the same security renamed.
+    [Fact]
+    public void Plan_PrimaryRowOfARetiredTickerNotCoRegistered_StaysPut()
+    {
+        var issuer = LibertyBroadband();
+        AdmitRetiredSiblings(issuer, [("LBRDK", "a-2"), ("LBRDA", "a-1")]);
+
+        Plan(
+                [Label("530307107", null)],
+                new Dictionary<Guid, CandidateIssuer> { [Issuer] = issuer },
+                Mapping(("530307107", Issuer, "LBRDA"))
+            )
+            .Should()
+            .BeEmpty();
+    }
+
+    // While the presentation holds no CUSIP the sibling's claim may itself be the wrong class, and a
+    // row moved onto a sibling label is never read again.
+    [Fact]
+    public void Plan_RetiredSiblingWhileThePresentationHasNoCusip_StaysPut()
+    {
+        var issuer = new CandidateIssuer
+        {
+            Id = Issuer,
+            PresentationTicker = "LBRDK",
+            PresentationIdentified = false,
+            RetiredSiblingTickers = ["LBRDA"],
+            RetiredCusipStatements =
+            [
+                new RetiredCusipStatement { Ticker = "LBRDA", Candidates = ["530307107"] },
+            ],
+        };
+        AdmitRetiredSiblings(issuer, [("LBRDK", "a-1"), ("LBRDA", "a-1")]);
+
+        Plan(
+                [Label("530307107", null)],
+                new Dictionary<Guid, CandidateIssuer> { [Issuer] = issuer },
+                Mapping(("530307107", Issuer, "LBRDA"))
+            )
+            .Should()
+            .BeEmpty();
+    }
+
+    // Co-registration proves a distinct class, not that the CUSIP it holds is its own.
+    [Fact]
+    public void Plan_RetiredSiblingHoldingACusipTheArchiveNeverStatedForIt_StaysPut()
+    {
+        var issuer = LibertyBroadband("530307999");
+        AdmitRetiredSiblings(issuer, [("LBRDK", "a-1"), ("LBRDA", "a-1")]);
+
+        Plan(
+                [Label("530307107", null)],
+                new Dictionary<Guid, CandidateIssuer> { [Issuer] = issuer },
+                Mapping(("530307107", Issuer, "LBRDA"))
+            )
+            .Should()
+            .BeEmpty();
+    }
+
+    // Two staged candidates mean the archive stated no single CUSIP for the symbol.
+    [Fact]
+    public void Plan_RetiredSiblingWithSeveralStagedCandidates_StaysPut()
+    {
+        var issuer = LibertyBroadband("530307107", "530307999");
+        AdmitRetiredSiblings(issuer, [("LBRDK", "a-1"), ("LBRDA", "a-1")]);
+
+        Plan(
+                [Label("530307107", null)],
+                new Dictionary<Guid, CandidateIssuer> { [Issuer] = issuer },
+                Mapping(("530307107", Issuer, "LBRDA"))
+            )
+            .Should()
+            .BeEmpty();
+    }
+
+    [Fact]
+    public void Fingerprint_AdmittingARetiredSibling_ChangesIt()
+    {
+        var before = LibertyBroadband();
+        var after = LibertyBroadband();
+        AdmitRetiredSiblings(after, [("LBRDK", "a-1"), ("LBRDA", "a-1")]);
+
+        Fingerprint(after, [], Mapping()).Should().NotBe(Fingerprint(before, [], Mapping()));
+    }
+
+    private static CandidateIssuer Seritage(bool identified = true)
+    {
+        var issuer = new CandidateIssuer
+        {
+            Id = Issuer,
+            PresentationTicker = "SRG",
+            PresentationIdentified = identified,
+            LiveTickers = ["SRG", "SRG-PA"],
+            UsTickers = ["SRG", "SRG-PA"],
+        };
+        MarkVacatedTickers(issuer, []);
+        return issuer;
+    }
+
+    // The preferred once held the common's CUSIP, so its label on common positions is stale.
+    [Fact]
+    public void Plan_VacatedSiblingRowUnderThePresentationsCusip_MovesToPrimary()
+    {
+        Plan(
+                [Label("81752R100", "SRG-PA")],
+                new Dictionary<Guid, CandidateIssuer> { [Issuer] = Seritage() },
+                Mapping(("81752R100", Issuer, null))
+            )
+            .Should()
+            .ContainSingle()
+            .Which.Should()
+            .Be(new Relabel(Issuer, "81752R100", "SRG-PA", null, 1));
+    }
+
+    [Fact]
+    public void Plan_VacatedSiblingRowWhileThePresentationHasNoCusip_StaysPut()
+    {
+        Plan(
+                [Label("81752R100", "SRG-PA")],
+                new Dictionary<Guid, CandidateIssuer> { [Issuer] = Seritage(identified: false) },
+                Mapping(("81752R100", Issuer, null))
+            )
+            .Should()
+            .BeEmpty();
+    }
+
+    [Fact]
+    public void Plan_VacatedSiblingRowUnderAnUnresolvedCusip_StaysPut()
+    {
+        Plan(
+                [Label("81752R100", "SRG-PA")],
+                new Dictionary<Guid, CandidateIssuer> { [Issuer] = Seritage() },
+                Mapping()
+            )
+            .Should()
+            .BeEmpty();
+    }
+
+    // A class that still holds a CUSIP is never re-read, so its labels are never moved.
+    [Fact]
+    public void Plan_SiblingLabelOfAClassThatStillHoldsACusip_StaysPut()
+    {
+        var issuer = Seritage();
+        MarkVacatedTickers(issuer, ["SRG-PA"]);
+
+        Plan(
+                [Label("81752R100", "SRG-PA")],
+                new Dictionary<Guid, CandidateIssuer> { [Issuer] = issuer },
+                Mapping(("81752R100", Issuer, null))
+            )
+            .Should()
+            .BeEmpty();
+    }
+
+    private static CandidateIssuer ThreeClasses(params string[] admittedRetiredCusips)
+    {
+        var issuer = new CandidateIssuer
+        {
+            Id = Issuer,
+            PresentationTicker = "SRG",
+            PresentationIdentified = true,
+            LiveTickers = ["SRG", "SRG-PA", "SRG-PB"],
+            UsTickers = ["SRG", "SRG-PA", "SRG-PB", "SRGR"],
+            AdmittedRetiredCusips = [.. admittedRetiredCusips],
+        };
+        MarkVacatedTickers(issuer, ["SRG-PB", "SRGR"]);
+        return issuer;
+    }
+
+    [Fact]
+    public void Plan_VacatedSiblingRowUnderALiveSiblingsCusip_MovesOntoIt()
+    {
+        Plan(
+                [Label("81752R308", "SRG-PA")],
+                new Dictionary<Guid, CandidateIssuer> { [Issuer] = ThreeClasses() },
+                Mapping(("81752R308", Issuer, "SRG-PB"))
+            )
+            .Should()
+            .ContainSingle()
+            .Which.Should()
+            .Be(new Relabel(Issuer, "81752R308", "SRG-PA", "SRG-PB", 1));
+    }
+
+    // A retired ticker may be the same security renamed, so it needs the archive and cover-page proof.
+    [Fact]
+    public void Plan_VacatedSiblingRowUnderAnUnprovenRetiredTicker_StaysPut()
+    {
+        Plan(
+                [Label("81752R407", "SRG-PA")],
+                new Dictionary<Guid, CandidateIssuer> { [Issuer] = ThreeClasses() },
+                Mapping(("81752R407", Issuer, "SRGR"))
+            )
+            .Should()
+            .BeEmpty();
+    }
+
+    [Fact]
+    public void Plan_VacatedSiblingRowUnderAnAdmittedRetiredPair_MovesOntoIt()
+    {
+        Plan(
+                [Label("81752R407", "SRG-PA")],
+                new Dictionary<Guid, CandidateIssuer> { [Issuer] = ThreeClasses("SRGR|81752R407") },
+                Mapping(("81752R407", Issuer, "SRGR"))
+            )
+            .Should()
+            .ContainSingle()
+            .Which.ToTicker.Should()
+            .Be("SRGR");
+    }
+
+    // A primary row moving onto a sibling must vacate its key before a vacated row claims it.
+    [Fact]
+    public void Plan_PrimaryToSiblingMovesComeBeforeVacatedMoves()
+    {
+        var moves = Plan(
+            [Label("81752R100", "SRG-PA"), Label("81752R308", null)],
+            new Dictionary<Guid, CandidateIssuer> { [Issuer] = ThreeClasses() },
+            Mapping(("81752R100", Issuer, null), ("81752R308", Issuer, "SRG-PB"))
+        );
+
+        moves
+            .Select(move => (move.FromTicker, move.ToTicker))
+            .Should()
+            .Equal((null, "SRG-PB"), ("SRG-PA", null));
+    }
+
+    [Fact]
+    public void MarkVacatedTickers_SkipsThePresentationAndEveryClaimedTicker()
+    {
+        var issuer = new CandidateIssuer
+        {
+            Id = Issuer,
+            PresentationTicker = "SRG",
+            UsTickers = ["SRG", "SRG-PA", "SRG-PB", "SRG-PB"],
+        };
+
+        MarkVacatedTickers(issuer, ["SRG-PB"]);
+
+        issuer.VacatedTickers.Should().Equal("SRG-PA");
+    }
+
+    [Fact]
+    public void Fingerprint_ATickerBecomingVacated_ChangesIt()
+    {
+        var claimed = Seritage();
+        MarkVacatedTickers(claimed, ["SRG-PA"]);
+
+        Fingerprint(Seritage(), [], Mapping()).Should().NotBe(Fingerprint(claimed, [], Mapping()));
+    }
+
+    private static StoredLabel Label(string cusip, string ticker) =>
+        new()
+        {
+            EquityIssuerId = Issuer,
+            Cusip = cusip,
+            ListedTicker = ticker,
+            Count = 1,
+        };
+
+    private static Dictionary<string, CusipTarget> Mapping(
+        params (string Cusip, Guid Issuer, string Ticker)[] targets
+    ) =>
+        targets.ToDictionary(
+            target => target.Cusip,
+            target => new CusipTarget(target.Issuer, target.Ticker),
+            StringComparer.OrdinalIgnoreCase
+        );
+}

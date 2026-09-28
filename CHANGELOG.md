@@ -21,6 +21,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `CommonStockRepository.Search` accepts an `includeInactive` flag so operator surfaces can audit retained delisted identities; reader-facing surfaces keep the active-only default.
 - `ListFilings` provides company-scoped or market-wide filing discovery with date, document-type, exact 8-K item-number, and paging filters.
 - `GetDividendHistory` returns stored cash-dividend history newest first with date and paging controls.
+- `FinancialFactsPersistence:InsertBatchSize` (default `1000`) sets the rows per `FinancialFact` upsert for both `FinancialFactsImportService` and `XbrlFactExtractionService`, so memory-constrained hosts can bound peak memory (`FinancialFactsPersistence__InsertBatchSize=250`); a non-positive value falls back to the default (#4580).
 
 ### Changed
 
@@ -37,6 +38,29 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `ListFilings` replaces the retired `ListCompanyDocuments` public MCP tool; clients with cached tool catalogs must refresh their MCP connection.
 
 ### Fixed
+
+- Company Facts retries retain a durable cooldown after interrupted persistence and avoid rewriting unchanged facts; successful checkpoints remain all-or-nothing (#4579).
+- CUSIP changes scan source archives and recover affected managers without clearing the quarterly import ledger; archive progress survives restarts (#4602).
+
+- Read a balance-sheet instant from its latest canonical periodic filing, including quarterly recasts of a prior year end, while preserving annual-report priority for full-year flows.
+
+- Keep bounded index ranking for filing searches with issuer or filing-date filters, refill candidates until the requested scope is complete, and preserve the search deadline across scope checks.
+- Recover House disclosure transactions whose asset type and amount continue after a multi-line page header, preserving source row identities during replay.
+
+- Fund profiles read the directory-selected report with database paging, consistent filing facts and stored counts, and count-based full, partial or unknown portfolio coverage.
+- Discover 13F report dates through indexed date seeks so snapshot startup and recent-quarter rebuilds avoid scanning every historical position.
+- Cover N-PORT equity identifier aggregation with an index on ISIN, CUSIP, LEI and filing identity.
+- 13F positions stored under a share class that later lost its CUSIP to another class now move to the class that holds it.
+- Move a CUSIP to the co-registered sibling class the SEC's fails file shows it trading under. `FtdImportService.ReconcileSiblingCusipsFromArchive` reads the newest twelve fortnightly files at most once a week and calls `EquityIdentityManager.ReassignSiblingCusip` (Arcadia's share class held its units' CUSIP, Stran's warrant held the common's). The stored-label convergence also moves primary rows onto a retired sibling registered on one 12(b) cover page with the presentation, while the presentation holds a CUSIP of its own (Liberty Broadband's Series A history). `CoverPageRegistration` in `Equibles.Sec.FinancialFacts.Data` is the shared co-registration proof.
+- Return a CUSIP held by the wrong class of one issuer to the class the SEC states it for. The live FTD reconcile releases a sibling security's CUSIP when the presentation ticker trades under it and the sibling's own ticker already has a different listed CUSIP (Launch One's unit held its Class A CUSIP), and `FtdImportService.ReconcileRetiredSiblingCusips` swaps a presentation CUSIP back to a retired sibling class from stored SEC evidence (Liberty Broadband's Series C held the Series A CUSIP). Both require the two tickers on one 12(b) cover page, which a renamed predecessor never shares, and neither aliases the sibling's CUSIP into the primary.
+- Wikidata website lookups now retry a throttled (429) or overloaded (5xx) query service a bounded number of times, honouring its `Retry-After`; a persistent outage raises `WikidataUnavailableException`, which website discovery treats as `WebsiteSourceUnavailableException`, a warning that retries the batch next cycle instead of an Errors row.
+- Present an issuer by its filed common stock when SEC's ticker file lists a warrant, unit, right, preferred series or note first (HeartBeam lists BEATW before BEAT). The override needs the issuer's own 12(b) titles to classify both symbols; an unclassified symbol never displaces SEC's order.
+- Converge stored 13F position listing labels after an issuer's presentation listing or CUSIP claims change. `HoldingLabelConvergenceService` moves a label equal to the presentation ticker to primary and a primary row whose CUSIP now resolves to a still-trading sibling (beside a CUSIP-identified presentation) to that sibling's ticker, never onto an occupied key, and marks the moved quarters for rebuild. Each issuer's identity fingerprint is stored in the new `HoldingLabelConvergenceState` table so positions are reread only after that identity changes. The importer and the pass share one CUSIP precedence (`HoldingCusipResolution`), which now resolves a listing claim naming the presentation ticker to primary.
+- Replay newer realtime filings after each bulk holdings pass so historical archives cannot leave later amendments replaced by older captures. Persist replay intent before import and recover it after restarts.
+
+- Resolve moved 13F archives from the SEC published catalog after a legacy download returns 404, instead of treating a directory move as an unpublished quarter.
+
+- Identity-triggered 13F replays now rewind the realtime scan along with its processed-filings ledger, including unpublished bulk-archive gaps; concurrent scans cannot acknowledge the newly requested replay.
 
 - A European annual report past the capture ceiling is remembered instead of being fetched again every cycle. The filing index's host serves reports chunked and states no content length, so the ceiling can only be reached by reading that many bytes and the refusal costs that transfer rather than a response-headers exchange, as four comments and a test claimed; nothing recorded the refusal, so the first production cycle refused 47 reports beside its 100 captures and would have refused the same ones every night against a nonprofit host. `EsefOversizedReport` records the refusal against the ceiling it was made under, so the filing is skipped with no request at all while that ceiling stands, re-opens if the ceiling rises, and has its row cleared if it is then stored. A refusal is now charged against the per-cycle budget, which is safe only because it happens once. Migration `AddEsefOversizedReport` is additive.
 - BME directory capture keeps a share line the venue marks on the line itself. The adapter read a non-empty top-level `active` field as a cancelled line, which is what that field means on an issuer's OTHER lines, where the marker is `C` and always arrives with an exclusion date. On the line itself the marker is `S` and means something else: six of the venue's 123 listed companies carried it and every one of them closed in the last settled session, so five live Madrid companies were being dropped and the sixth only escaped notice because the share gate leaves it out on its instrument classification anyway. The venue's own list and the FIRDS live-share gate decide whether a line is current; the marker is kept as evidence.

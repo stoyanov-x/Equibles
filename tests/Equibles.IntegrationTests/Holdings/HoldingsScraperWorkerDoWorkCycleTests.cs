@@ -60,12 +60,18 @@ public class HoldingsScraperWorkerDoWorkCycleTests : ParadeDbMcpTestBase
         protected override TimeSpan FailedDataSetCooldown => TimeSpan.FromMilliseconds(1);
     }
 
-    private HoldingsDataSetClient ThrowingDataSetClient()
+    private HoldingsDataSetClient ThrowingDataSetClient(bool cancelled = false)
     {
         var secEdgar = Substitute.For<ISecEdgarClient>();
         secEdgar
             .DownloadStream(Arg.Any<string>())
-            .Returns<Task<Stream>>(_ => throw new HttpRequestException("SEC unavailable"));
+            .Returns(
+                Task.FromException<Stream>(
+                    cancelled
+                        ? new OperationCanceledException()
+                        : new HttpRequestException("SEC unavailable")
+                )
+            );
         return new HoldingsDataSetClient(
             secEdgar,
             Substitute.For<ILogger<HoldingsDataSetClient>>()
@@ -81,14 +87,29 @@ public class HoldingsScraperWorkerDoWorkCycleTests : ParadeDbMcpTestBase
             Substitute.For<MassTransit.IBus>()
         );
 
-    [Fact]
-    public async Task DoWork_LatestDataSetFailsTransiently_BackfillsSkipsRetriesAndEscalates()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DoWork_AuditsBeforeMaintenance_PreservesFailureAndCancellation(bool cancelled)
     {
         var scopeFactory = ServiceScopeSubstitute.Create(
             (typeof(ProcessedDataSetRepository), new ProcessedDataSetRepository(DbContext)),
             (typeof(HoldingsDataSetClient), ThrowingDataSetClient()),
             (typeof(HoldingsImportService), BuildImporter()),
-            (typeof(InstitutionalHolderRepository), new InstitutionalHolderRepository(DbContext))
+            (typeof(InstitutionalHolderRepository), new InstitutionalHolderRepository(DbContext)),
+            (
+                typeof(HoldingsArchiveCoverageService),
+                new HoldingsArchiveCoverageService(
+                    BuildImporter(),
+                    ThrowingDataSetClient(cancelled),
+                    new ProcessedDataSetRepository(DbContext),
+                    new InstitutionalHolderRepository(DbContext),
+                    new InstitutionalHoldingRepository(DbContext),
+                    new HoldingsImportFailureRepository(DbContext),
+                    new HoldingsRealtimeReplaySignal(),
+                    Substitute.For<ILogger<HoldingsArchiveCoverageService>>()
+                )
+            )
         );
 
         var config = Substitute.For<IConfiguration>();
@@ -112,7 +133,30 @@ public class HoldingsScraperWorkerDoWorkCycleTests : ParadeDbMcpTestBase
             BindingFlags.NonPublic | BindingFlags.Instance
         );
 
-        await (Task)doWork.Invoke(worker, [CancellationToken.None]);
+        var provider = scopeFactory.CreateScope().ServiceProvider;
+        if (cancelled)
+        {
+            await Assert.ThrowsAsync<OperationCanceledException>(() =>
+                (Task)doWork.Invoke(worker, [CancellationToken.None])
+            );
+            provider.DidNotReceive().GetService(typeof(HoldingsValueRecalculator));
+        }
+        else
+        {
+            await (Task)doWork.Invoke(worker, [CancellationToken.None]);
+            Received.InOrder(() =>
+            {
+                provider.GetService(typeof(HoldingsArchiveCoverageService));
+                provider.GetService(typeof(HoldingsValueRecalculator));
+            });
+        }
+        (
+            await DbContext
+                .Set<ProcessedDataSet>()
+                .AnyAsync(row => row.FileName == ProcessedDataSet.CoverageAuditPendingFileName)
+        )
+            .Should()
+            .BeTrue("an unreadable source audit must retain its incomplete-coverage warning");
 
         // Backfill seeded every file except the latest as already-processed.
         var processedCount = await DbContext

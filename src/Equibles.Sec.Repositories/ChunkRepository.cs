@@ -109,23 +109,6 @@ public class ChunkRepository : BaseRepository<Chunk>
             .ToJson();
 
         var query = DbContext.Set<Chunk>().Where(c => EF.Functions.JsonSearch(c.Id, searchQuery));
-        if (ticker != null)
-        {
-            var documents = DbContext
-                .Set<Document>()
-                .ForUsTicker(ticker)
-                .Select(document => document.Id);
-            query = query.Where(chunk => documents.Contains(chunk.DocumentId));
-        }
-
-        // Document.ReportingDate is the filing/source date surfaced everywhere else. The chunk's
-        // denormalized copy is only an indexed cache and legacy transcript chunks can trail a
-        // corrected document date, so it must never decide date-window membership (#7049).
-        if (startDate is { } windowStart)
-            query = query.Where(c => c.Document.ReportingDate >= windowStart);
-
-        if (endDate is { } windowEnd)
-            query = query.Where(c => c.Document.ReportingDate <= windowEnd);
 
         // Set a hard CommandTimeout for this call so Postgres aborts the
         // statement independently of pdb.parse / pdb.score honouring the
@@ -135,15 +118,32 @@ public class ChunkRepository : BaseRepository<Chunk>
         var originalTimeout = DbContext.Database.GetCommandTimeout();
         DbContext.Database.SetCommandTimeout(timeoutSeconds);
         var stopwatch = Stopwatch.StartNew();
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
         try
         {
             return await LeaderOnlyScan(
                 scan =>
-                    query
-                        .OrderByDescending(c => EF.Functions.Score(c.Id))
-                        .Take(maxResults)
-                        .ToListAsync(scan),
-                cancellationToken
+                    ChunkRankedScope.Read(
+                        DbContext,
+                        query,
+                        maxResults,
+                        ticker,
+                        startDate,
+                        endDate,
+                        stopwatch,
+                        timeoutSeconds,
+                        scan
+                    ),
+                deadline.Token
+            );
+        }
+        catch (OperationCanceledException exception)
+            when (!cancellationToken.IsCancellationRequested && deadline.IsCancellationRequested)
+        {
+            throw new ChunkSearchTimeoutException(
+                $"BM25 chunk search exceeded its {timeoutSeconds}s statement budget.",
+                exception
             );
         }
         catch (Exception exception)
@@ -317,11 +317,10 @@ public class ChunkRepository : BaseRepository<Chunk>
     // Npgsql surfaces its CommandTimeout-triggered cancellation either as the raw backend
     // error (PostgresException 57014 "canceling statement due to user request") or wrapped
     // in an NpgsqlException with a TimeoutException inside, depending on where in the read
-    // loop the cancel lands — walk the chain and match both shapes. The bare-TimeoutException
-    // shape is only trusted when the run actually lasted about the statement budget: a pool
-    // exhaustion or connect timeout carries the same TimeoutException but elapses on the
-    // connection-string timeout (15s default), and relabelling THAT as the statement budget
-    // would send the caller into a doomed degrade pass against a database it cannot reach.
+    // loop the cancel lands — walk the chain and match both shapes. EF's retry strategy can
+    // wrap a read timeout after more than one statement budget has elapsed, so a provider read
+    // timeout is still classified then. Other TimeoutException shapes are trusted only near the
+    // statement budget: pool exhaustion and connect timeouts use the connection-string timeout.
     // A caller-requested cancellation surfaces as OperationCanceledException (or trips the
     // token) and is excluded at the catch site.
     // internal: the classification rules are pinned by unit tests.
@@ -336,6 +335,15 @@ public class ChunkRepository : BaseRepository<Chunk>
         for (var current = exception; current != null; current = current.InnerException)
         {
             if (current is PostgresException { SqlState: PostgresErrorCodes.QueryCanceled })
+                return true;
+            if (
+                current is NpgsqlException { InnerException: TimeoutException } readTimeout
+                && readTimeout.Message.StartsWith(
+                    "Exception while reading from stream",
+                    StringComparison.Ordinal
+                )
+                && elapsed >= TimeSpan.FromSeconds(budgetSeconds)
+            )
                 return true;
             if (current is TimeoutException && withinBudgetWindow)
                 return true;

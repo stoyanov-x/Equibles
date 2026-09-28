@@ -199,6 +199,159 @@ public class DocumentNormalizationBackfillServiceTests : IDisposable
         document.NormalizedContentVersion.Should().Be(0);
     }
 
+    [Theory]
+    [InlineData("EsefAnnualReport")]
+    [InlineData("EsefReport")]
+    public async Task Backfill_EsefWithoutCik_ReplaysCapturedEnvelopeAndPreservesOriginal(
+        string form
+    )
+    {
+        var document = SeedEsef();
+        document.DocumentType = DocumentType.FromValue(form);
+        _dbContext.SaveChanges();
+        var originalId = document.XbrlContentId;
+        var originalBytes = document.XbrlContent.FileContent.Bytes.ToArray();
+        _fileManager
+            .OpenRead(document.XbrlContent)
+            .Returns(_ => new MemoryStream(originalBytes, writable: false));
+
+        var result = await BuildSut().Backfill(batchSize: 10);
+
+        result.Replaced.Should().Be(1);
+        result.Failed.Should().Be(0);
+        await _persistenceService
+            .Received(1)
+            .ReplaceContent(
+                Arg.Is<Document>(d =>
+                    d.Id == document.Id
+                    && d.NormalizedContentVersion == Document.NormalizedContentBuilderVersion
+                ),
+                Arg.Is<byte[]>(b => Encoding.UTF8.GetString(b).Contains("Retained annual report")),
+                Arg.Any<CancellationToken>()
+            );
+        await _secEdgarClient
+            .DidNotReceiveWithAnyArgs()
+            .GetDocumentContent(default, default, default);
+        document.XbrlContentId.Should().Be(originalId);
+        document.XbrlContent.FileContent.Bytes.Should().Equal(originalBytes);
+        _fileManager.DidNotReceive().DeleteFile(document.XbrlContent);
+    }
+
+    [Fact]
+    public async Task Backfill_EsefPastTheRetrievalCeiling_ReplacesStaleContentWithAnEmptyBody()
+    {
+        var document = SeedEsef();
+        var filler = new string('a', EsefReportContent.MaxRetrievalHtmlChars + 1);
+        var oversized = GzipCompressor.Compress(
+            Encoding.UTF8.GetBytes($"<html><body><p>{filler}</p></body></html>")
+        );
+        _fileManager
+            .OpenRead(document.XbrlContent)
+            .Returns(_ => new MemoryStream(oversized, writable: false));
+        _fileManager.GetContent(document.Content).Returns("Source: Register.\n\n"u8.ToArray());
+
+        var result = await BuildSut().Backfill(batchSize: 10);
+
+        result.Replaced.Should().Be(1);
+        result.Failed.Should().Be(0);
+        await _persistenceService
+            .Received(1)
+            .ReplaceContent(
+                Arg.Is<Document>(d =>
+                    d.Id == document.Id
+                    && d.NormalizedContentVersion == Document.NormalizedContentBuilderVersion
+                    && d.NormalizedContentAttempts == 0
+                ),
+                Arg.Is<byte[]>(b => b.Length == 0),
+                Arg.Any<CancellationToken>()
+            );
+    }
+
+    [Fact]
+    public async Task Backfill_EsefWithAnEmptyCapturedEnvelope_FailsAndKeepsItsText()
+    {
+        var document = SeedEsef();
+        var empty = GzipCompressor.Compress([]);
+        _fileManager
+            .OpenRead(document.XbrlContent)
+            .Returns(_ => new MemoryStream(empty, writable: false));
+
+        var result = await BuildSut().Backfill(batchSize: 10);
+
+        result.Failed.Should().Be(1);
+        document.NormalizedContentAttempts.Should().Be(1);
+        document.NormalizedContentVersion.Should().Be(0);
+        await _persistenceService
+            .DidNotReceiveWithAnyArgs()
+            .ReplaceContent(default, default, default);
+    }
+
+    [Fact]
+    public async Task Backfill_EdgarFilingWithNoText_FailsAndKeepsItsText()
+    {
+        var document = SeedDocument(normalizedContentVersion: 0);
+        _secEdgarClient
+            .GetDocumentContent(
+                document.AccessionNumber,
+                _company.Cik,
+                Arg.Any<CancellationToken>()
+            )
+            .Returns("   ");
+
+        var result = await BuildSut().Backfill(batchSize: 10);
+
+        result.Failed.Should().Be(1);
+        document.NormalizedContentAttempts.Should().Be(1);
+        document.NormalizedContentVersion.Should().Be(0);
+        await _persistenceService
+            .DidNotReceiveWithAnyArgs()
+            .ReplaceContent(default, default, default);
+    }
+
+    [Theory]
+    [InlineData(XbrlType.JsonXbrl, XbrlCaptureStatus.Captured)]
+    [InlineData(XbrlType.InlineIxbrl, XbrlCaptureStatus.NotChecked)]
+    public async Task Backfill_EsefWithoutCapturedInlineHtml_IsNotEligible(
+        XbrlType type,
+        XbrlCaptureStatus status
+    )
+    {
+        var document = SeedEsef();
+        document.XbrlType = type;
+        document.XbrlStatus = status;
+        await _dbContext.SaveChangesAsync();
+        var result = await BuildSut().Backfill(10, includeAllDocumentTypes: true);
+        result.Processed.Should().Be(0);
+    }
+
+    private Document SeedEsef()
+    {
+        var document = SeedDocument(0);
+        _company.Cik = null;
+        document.AccessionNumber = null;
+        document.DocumentType = DocumentType.EsefAnnualReport;
+        document.SourceUrl = "https://authority.example/report.xhtml";
+        document.XbrlType = XbrlType.InlineIxbrl;
+        document.XbrlStatus = XbrlCaptureStatus.Captured;
+        document.XbrlContent = new Equibles.Media.Data.Models.File
+        {
+            Name = "retained-report",
+            Extension = "gz",
+            ContentType = "application/gzip",
+            FileContent = new Equibles.Media.Data.Models.FileContent
+            {
+                Bytes = GzipCompressor.Compress(
+                    Encoding.UTF8.GetBytes(
+                        "<html xmlns='http://www.w3.org/1999/xhtml'><head><title/></head><body><p>Retained annual report</p></body></html>"
+                    )
+                ),
+            },
+        };
+        _dbContext.Add(document.XbrlContent);
+        _dbContext.SaveChanges();
+        return document;
+    }
+
     private DocumentNormalizationBackfillService BuildSut() =>
         new(
             new DocumentRepository(_dbContext),

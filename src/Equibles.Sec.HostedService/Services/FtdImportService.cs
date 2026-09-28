@@ -11,6 +11,8 @@ using Equibles.Errors.BusinessLogic;
 using Equibles.Errors.Data.Models;
 using Equibles.Integrations.Sec.Contracts;
 using Equibles.Sec.Data.Models;
+using Equibles.Sec.FinancialFacts.Data.Models;
+using Equibles.Sec.FinancialFacts.Data.Registrations;
 using Equibles.Sec.HostedService.Models;
 using Equibles.Sec.Repositories;
 using Equibles.Worker;
@@ -1569,6 +1571,12 @@ public class FtdImportService
             })
             .ToListAsync(cancellationToken);
 
+        var registrations = await CoverPageRegistration.Load(
+            scope.ServiceProvider.GetRequiredService<EquiblesFinancialDbContext>(),
+            stocks.Select(stock => stock.Id).ToList(),
+            cancellationToken
+        );
+
         var seeded = 0;
         foreach (EquityIssuer stock in stocks)
         {
@@ -1616,7 +1624,19 @@ public class FtdImportService
             // published (outbox) — lets Holdings backfill any 13F data
             // sets processed before this stock had a CUSIP (or while it
             // still carried the retired one, kept as an alias).
-            if (await stockManager.SetCusip(stock, resolved.Cusip, displacedTicker))
+            var releasedSiblingTicker = ResolveReleasedSiblingTicker(
+                stock,
+                resolved.Cusip,
+                registrations.GetValueOrDefault(stock.Id, [])
+            );
+            if (
+                await stockManager.SetCusip(
+                    stock,
+                    resolved.Cusip,
+                    displacedTicker,
+                    releasedSiblingTicker
+                )
+            )
             {
                 AddOwner(resolved.Cusip, stock.Id);
                 seeded++;
@@ -1718,6 +1738,518 @@ public class FtdImportService
             })
             .GroupBy(observation => observation.StockId)
             .ToDictionary(group => group.Key, group => group.ToList());
+    }
+
+    // A sibling security holding the presentation's CUSIP is released only when the SEC registered
+    // both tickers on one 12(b) cover page, which a renamed predecessor never shares.
+    internal static string ResolveReleasedSiblingTicker(
+        EquityIssuer stock,
+        string cusip,
+        IReadOnlyCollection<(string Symbol, string Accession)> registrations
+    )
+    {
+        var holders = stock
+            .Securities.Where(security =>
+                security.Id != stock.Presentation.Listing.EquitySecurityId
+                && string.Equals(security.Cusip, cusip, StringComparison.OrdinalIgnoreCase)
+            )
+            .ToList();
+        if (holders.Count != 1)
+            return null;
+        var tickers = holders[0]
+            .Listings.Where(listing => listing.MarketCountryCode == "US")
+            .Select(listing => listing.Ticker.ToUpperInvariant())
+            .Distinct()
+            .ToList();
+        return
+            tickers.Count == 1
+            && CoverPageRegistration.RegisteredTogether(
+                registrations,
+                stock.Presentation.Listing.Ticker,
+                tickers[0]
+            )
+            ? tickers[0]
+            : null;
+    }
+
+    /// <summary>
+    /// Returns a presentation CUSIP to the retired sibling class the SEC states it for, swapping in
+    /// the presentation ticker's own listed CUSIP. Reads stored evidence only, because a fully
+    /// delisted issuer never reappears in a live replay month.
+    /// </summary>
+    public async Task<int> ReconcileRetiredSiblingCusips(CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            EquityIssuerRepository stockRepo =
+                scope.ServiceProvider.GetRequiredService<EquityIssuerRepository>();
+            var candidates = await LoadRetiredSiblingCandidates(stockRepo, cancellationToken);
+            if (candidates.Count == 0)
+                return 0;
+
+            var cusips = candidates.Select(candidate => candidate.Cusip).Distinct().ToList();
+            var retiredClaims = await stockRepo
+                .GetDelistedListings()
+                .Where(listing =>
+                    (listing.Cusip != null && cusips.Contains(listing.Cusip))
+                    || listing.HistoricalCusipBackfillCandidates.Any(staged =>
+                        cusips.Contains(staged)
+                    )
+                )
+                .Select(listing => new RetiredCusipClaim(
+                    listing.EquityIssuerId,
+                    listing.ListedTicker,
+                    listing.Cusip,
+                    listing.HistoricalCusipBackfillCandidates
+                ))
+                .ToListAsync(cancellationToken);
+            var registrations = await CoverPageRegistration.Load(
+                scope.ServiceProvider.GetRequiredService<EquiblesFinancialDbContext>(),
+                candidates.Select(candidate => candidate.EquityIssuerId).ToList(),
+                cancellationToken
+            );
+
+            var reconciled = 0;
+            foreach (var candidate in candidates)
+            {
+                var retiredTicker = ResolveRetiredSiblingTicker(
+                    candidate.EquityIssuerId,
+                    candidate.Ticker,
+                    candidate.Cusip,
+                    retiredClaims,
+                    registrations.GetValueOrDefault(candidate.EquityIssuerId, [])
+                );
+                if (
+                    retiredTicker != null
+                    && await ReturnCusipToRetiredSibling(
+                        scope.ServiceProvider,
+                        candidate,
+                        retiredTicker,
+                        cancellationToken
+                    )
+                )
+                    reconciled++;
+            }
+            return reconciled;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error returning CUSIPs to retired sibling listings");
+            await _errorReporter.Report(
+                ErrorSource.FtdScraper,
+                "FtdImport.ReconcileRetiredSiblingCusips",
+                ex,
+                null
+            );
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Moves a CUSIP to the co-registered sibling class the SEC's fails file states it for, reading
+    /// the newest sixteen half-month files at most once a week.
+    /// </summary>
+    public async Task<int> ReconcileSiblingCusipsFromArchive(CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (!await SiblingReconcileDue(cancellationToken))
+                return 0;
+
+            using var scope = _scopeFactory.CreateScope();
+            EquityIssuerRepository stockRepo =
+                scope.ServiceProvider.GetRequiredService<EquityIssuerRepository>();
+            EquityIdentityManager stockManager =
+                scope.ServiceProvider.GetRequiredService<EquityIdentityManager>();
+            var securities = await stockRepo
+                .GetSecurities()
+                .Where(security =>
+                    security.Issuer.Securities.Any(other => other.Cusip != null)
+                    && security.Listings.Any(listing => listing.MarketCountryCode == "US")
+                )
+                .Select(security => new SiblingSecurity(
+                    security.Id,
+                    security.EquityIssuerId,
+                    security.Cusip,
+                    security
+                        .Listings.Where(listing => listing.MarketCountryCode == "US")
+                        .Select(listing => new SiblingListing(listing.Ticker, listing.DelistedOn))
+                        .ToList()
+                ))
+                .ToListAsync(cancellationToken);
+            // Only a held CUSIP can move, so every other row is dropped as each file is read.
+            var heldCusips = securities
+                .Where(security => security.Cusip != null)
+                .Select(security => security.Cusip.ToUpperInvariant())
+                .ToHashSet(StringComparer.Ordinal);
+
+            var records = new List<FtdRecord>();
+            foreach (
+                var fileName in GetFileNames(OldestAvailableDate).TakeLast(SiblingReconcileFiles)
+            )
+            {
+                try
+                {
+                    records.AddRange(
+                        (await DownloadAndParse(fileName, cancellationToken)).Where(record =>
+                            record.Cusip != null
+                            && heldCusips.Contains(record.Cusip.Trim().ToUpperInvariant())
+                        )
+                    );
+                }
+                catch (HttpRequestException ex)
+                    when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+                {
+                    // An unpublished or permanently missing file carries no observation.
+                }
+                catch (Exception ex) when (ex is HttpRequestException or InvalidDataException)
+                {
+                    // A partial window could make an older symbol look current, so skip this week.
+                    _logger.LogWarning(
+                        ex,
+                        "Sibling-CUSIP reconcile: failed to read {File}; retrying next cycle",
+                        fileName
+                    );
+                    return 0;
+                }
+            }
+
+            var candidateIssuers = securities
+                .GroupBy(security => security.EquityIssuerId)
+                .Where(group => group.Count() > 1)
+                .Select(group => group.Key)
+                .ToList();
+            var registrations = await CoverPageRegistration.Load(
+                scope.ServiceProvider.GetRequiredService<EquiblesFinancialDbContext>(),
+                candidateIssuers,
+                cancellationToken
+            );
+
+            var moved = 0;
+            foreach (var move in PlanSiblingCusipMoves(records, securities, registrations))
+            {
+                if (
+                    await stockManager.ReassignSiblingCusip(
+                        move.EquityIssuerId,
+                        move.Cusip,
+                        move.HolderTicker,
+                        move.SiblingTicker,
+                        cancellationToken
+                    )
+                )
+                {
+                    _logger.LogInformation(
+                        "Moved CUSIP {Cusip} from {Holder} to its sibling class {Sibling}",
+                        move.Cusip,
+                        move.HolderTicker,
+                        move.SiblingTicker
+                    );
+                    moved++;
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "CUSIP {Cusip} on {Holder} trades as sibling {Sibling}, but the identity write refused the move",
+                        move.Cusip,
+                        move.HolderTicker,
+                        move.SiblingTicker
+                    );
+                }
+            }
+            await StampSiblingReconcile(cancellationToken);
+            return moved;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error moving CUSIPs to their sibling classes");
+            await _errorReporter.Report(
+                ErrorSource.FtdScraper,
+                "FtdImport.ReconcileSiblingCusipsFromArchive",
+                ex,
+                null
+            );
+            return 0;
+        }
+    }
+
+    private const string SiblingReconcileStateName = "Ftd.SiblingCusipReconcileV1";
+
+    // The newest two or three half-month files are not yet published, so sixteen reach back about
+    // six months, long enough for a thinly failed class to appear.
+    private const int SiblingReconcileFiles = 16;
+
+    private static readonly TimeSpan SiblingReconcileInterval = TimeSpan.FromDays(7);
+
+    private async Task<bool> SiblingReconcileDue(CancellationToken cancellationToken)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var stateRepo = scope.ServiceProvider.GetRequiredService<BackfillStateRepository>();
+        var state = await stateRepo.GetByName(SiblingReconcileStateName);
+        return state?.LastFullRescanAt == null
+            || state.LastFullRescanAt < DateTime.UtcNow - SiblingReconcileInterval;
+    }
+
+    private async Task StampSiblingReconcile(CancellationToken cancellationToken)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var stateRepo = scope.ServiceProvider.GetRequiredService<BackfillStateRepository>();
+        var state = await stateRepo.GetByName(SiblingReconcileStateName);
+        if (state == null)
+        {
+            state = new BackfillState { Name = SiblingReconcileStateName };
+            stateRepo.Add(state);
+        }
+        state.LastFullRescanAt = DateTime.UtcNow;
+        await stateRepo.SaveChanges();
+    }
+
+    internal sealed record SiblingListing(string Ticker, DateOnly? DelistedOn);
+
+    internal sealed record SiblingSecurity(
+        Guid Id,
+        Guid EquityIssuerId,
+        string Cusip,
+        List<SiblingListing> Listings
+    );
+
+    internal sealed record SiblingCusipMove(
+        Guid EquityIssuerId,
+        string Cusip,
+        string HolderTicker,
+        string SiblingTicker
+    );
+
+    /// <summary>
+    /// Plans each move the fails file proves: the held CUSIP's latest symbol is the sole ticker of
+    /// another security of the same issuer, co-registered with the holder's, and never the holder's.
+    /// </summary>
+    internal static List<SiblingCusipMove> PlanSiblingCusipMoves(
+        IEnumerable<FtdRecord> records,
+        IReadOnlyCollection<SiblingSecurity> securities,
+        IReadOnlyDictionary<Guid, List<(string Symbol, string Accession)>> registrations
+    )
+    {
+        static string Identity(string symbol) => TickerNormalizer.NormalizeIdentity(symbol);
+
+        var latestByCusip = new Dictionary<string, (DateOnly Date, HashSet<string> Symbols)>(
+            StringComparer.OrdinalIgnoreCase
+        );
+        var cusipsBySymbol = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        foreach (var record in records)
+        {
+            var symbol = Identity(record.Symbol);
+            var cusip = record.Cusip?.Trim().ToUpperInvariant();
+            if (symbol == null || string.IsNullOrEmpty(cusip))
+                continue;
+            if (!cusipsBySymbol.TryGetValue(symbol, out var seen))
+                cusipsBySymbol[symbol] = seen = new HashSet<string>(StringComparer.Ordinal);
+            seen.Add(cusip);
+            if (
+                !latestByCusip.TryGetValue(cusip, out var latest)
+                || record.SettlementDate > latest.Date
+            )
+                latestByCusip[cusip] = (record.SettlementDate, [symbol]);
+            else if (record.SettlementDate == latest.Date)
+                latest.Symbols.Add(symbol);
+        }
+
+        var moves = new List<SiblingCusipMove>();
+        foreach (var issuer in securities.GroupBy(security => security.EquityIssuerId))
+        {
+            var issuerSecurities = issuer.ToList();
+            foreach (var holder in issuerSecurities.Where(security => security.Cusip != null))
+            {
+                var holderTickers = holder
+                    .Listings.Select(listing => listing.Ticker)
+                    .Distinct()
+                    .ToList();
+                if (
+                    holderTickers.Count != 1
+                    || !latestByCusip.TryGetValue(holder.Cusip, out var latest)
+                    || latest.Symbols.Count != 1
+                )
+                    continue;
+                var siblingSymbol = latest.Symbols.Single();
+                var holderSymbol = Identity(holderTickers[0]);
+                if (
+                    holderSymbol == null
+                    || holderSymbol == siblingSymbol
+                    || (
+                        cusipsBySymbol.TryGetValue(holderSymbol, out var holderCusips)
+                        && holderCusips.Contains(holder.Cusip.ToUpperInvariant())
+                    )
+                )
+                    continue;
+
+                var siblings = issuerSecurities
+                    .Where(security =>
+                        security.Id != holder.Id
+                        && security.Listings.Any(listing =>
+                            Identity(listing.Ticker) == siblingSymbol
+                        )
+                    )
+                    .ToList();
+                if (siblings.Count != 1 || siblings[0].Cusip != null)
+                    continue;
+                var siblingListings = siblings[0].Listings;
+                if (
+                    siblingListings.Select(listing => listing.Ticker).Distinct().Count() != 1
+                    || siblingListings.Any(listing =>
+                        listing.DelistedOn != null && latest.Date > listing.DelistedOn
+                    )
+                    || !CoverPageRegistration.RegisteredTogether(
+                        registrations.GetValueOrDefault(issuer.Key, []),
+                        holderTickers[0],
+                        siblingListings[0].Ticker
+                    )
+                )
+                    continue;
+                moves.Add(
+                    new SiblingCusipMove(
+                        issuer.Key,
+                        holder.Cusip.ToUpperInvariant(),
+                        holderTickers[0],
+                        siblingListings[0].Ticker
+                    )
+                );
+            }
+        }
+        return moves;
+    }
+
+    internal sealed record RetiredSiblingCandidate(
+        Guid EquityIssuerId,
+        string Ticker,
+        string Cusip,
+        string OwnCusip
+    );
+
+    // A presentation ticker with several listed CUSIPs states no single own CUSIP, so it abstains.
+    private static async Task<List<RetiredSiblingCandidate>> LoadRetiredSiblingCandidates(
+        EquityIssuerRepository stockRepo,
+        CancellationToken cancellationToken
+    )
+    {
+        var rows = await stockRepo
+            .GetListedCusips()
+            .Where(evidence =>
+                evidence.Issuer.Presentation != null
+                && evidence.Issuer.Presentation.Listing.MarketCountryCode == "US"
+                && evidence.ListedTicker == evidence.Issuer.Presentation.Listing.Ticker
+                && evidence.Issuer.Presentation.Listing.Security.Cusip != null
+                && evidence.Cusip != evidence.Issuer.Presentation.Listing.Security.Cusip
+            )
+            .Select(evidence => new RetiredSiblingCandidate(
+                evidence.EquityIssuerId,
+                evidence.ListedTicker,
+                evidence.Issuer.Presentation.Listing.Security.Cusip,
+                evidence.Cusip
+            ))
+            .ToListAsync(cancellationToken);
+        return rows.GroupBy(row => row.EquityIssuerId)
+            .Where(group => group.Count() == 1)
+            .Select(group => group.Single())
+            .ToList();
+    }
+
+    private async Task<bool> ReturnCusipToRetiredSibling(
+        IServiceProvider services,
+        RetiredSiblingCandidate candidate,
+        string retiredTicker,
+        CancellationToken cancellationToken
+    )
+    {
+        EquityIssuerRepository stockRepo = services.GetRequiredService<EquityIssuerRepository>();
+        EquityIdentityManager stockManager = services.GetRequiredService<EquityIdentityManager>();
+        var stock = await stockRepo
+            .GetAll()
+            .SingleAsync(issuer => issuer.Id == candidate.EquityIssuerId, cancellationToken);
+        // The decision was made on the candidate snapshot; a presentation that moved since abstains.
+        var presentation = stock.Presentation?.Listing;
+        if (
+            presentation?.Ticker != candidate.Ticker
+            || !string.Equals(
+                presentation.Security.Cusip,
+                candidate.Cusip,
+                StringComparison.OrdinalIgnoreCase
+            )
+        )
+            return false;
+
+        if (await stockManager.SetCusip(stock, candidate.OwnCusip, retiredTicker))
+        {
+            _logger.LogInformation(
+                "Returned CUSIP {Cusip} from {Ticker} to its retired sibling {Sibling}",
+                candidate.Cusip,
+                candidate.Ticker,
+                retiredTicker
+            );
+            return true;
+        }
+        _logger.LogWarning(
+            "CUSIP {Cusip} on {Ticker} belongs to retired sibling {Sibling}, but the identity write refused the swap",
+            candidate.Cusip,
+            candidate.Ticker,
+            retiredTicker
+        );
+        return false;
+    }
+
+    internal sealed record RetiredCusipClaim(
+        Guid EquityIssuerId,
+        string ListedTicker,
+        string Cusip,
+        List<string> Candidates
+    );
+
+    // Exactly one retired listing may state the CUSIP, as its seeded value or its sole staged
+    // candidate, sharing a 12(b) cover page with the presentation ticker. The ambiguity flag is not
+    // read: the inactive seeder also sets it for exactly this held-by-a-sibling conflict.
+    internal static string ResolveRetiredSiblingTicker(
+        Guid issuerId,
+        string presentationTicker,
+        string displacedCusip,
+        IEnumerable<RetiredCusipClaim> claims,
+        IReadOnlyCollection<(string Symbol, string Accession)> registrations
+    )
+    {
+        var stating = claims
+            .Where(claim =>
+                string.Equals(claim.Cusip, displacedCusip, StringComparison.OrdinalIgnoreCase)
+                || claim.Candidates.Contains(displacedCusip, StringComparer.OrdinalIgnoreCase)
+            )
+            .ToList();
+        if (stating.Count != 1)
+            return null;
+        var claim = stating[0];
+        var attested =
+            claim.Cusip != null
+                ? string.Equals(claim.Cusip, displacedCusip, StringComparison.OrdinalIgnoreCase)
+                : claim.Candidates.Count == 1;
+        return
+            attested
+            && claim.EquityIssuerId == issuerId
+            && !string.Equals(
+                claim.ListedTicker,
+                presentationTicker,
+                StringComparison.OrdinalIgnoreCase
+            )
+            && CoverPageRegistration.RegisteredTogether(
+                registrations,
+                presentationTicker,
+                claim.ListedTicker
+            )
+            ? claim.ListedTicker.ToUpperInvariant()
+            : null;
     }
 
     private static string ResolveDisplacedListedTicker(

@@ -11,12 +11,14 @@ using Equibles.Sec.FinancialFacts.BusinessLogic.Models;
 using Equibles.Sec.FinancialFacts.BusinessLogic.Parsers;
 using Equibles.Sec.FinancialFacts.Data.Enums;
 using Equibles.Sec.FinancialFacts.Data.Models;
+using Equibles.Sec.FinancialFacts.HostedService.Configuration;
 using Equibles.Sec.FinancialFacts.Repositories;
 using Equibles.Worker;
 using FlexLabs.EntityFrameworkCore.Upsert;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Equibles.Sec.FinancialFacts.HostedService.Services;
 
@@ -67,8 +69,6 @@ public class XbrlFactExtractionService
     // Version 7 replays derived fiscal identities for interim instants and existing rows.
     public const int CurrentVersion = 8;
 
-    private const int InsertBatchSize = 1000;
-
     /// <summary>
     /// Envelopes above this uncompressed size are skipped instead of parsed.
     /// The parsers materialise the whole document in memory (the DOM costs a
@@ -101,6 +101,7 @@ public class XbrlFactExtractionService
     private readonly StandaloneXbrlParser _standaloneParser;
     private readonly IFileManager _fileManager;
     private readonly FiscalCalendarEvidenceReader _calendarReader;
+    private readonly int _insertBatchSize;
     private readonly ILogger<XbrlFactExtractionService> _logger;
 
     public XbrlFactExtractionService(
@@ -109,7 +110,8 @@ public class XbrlFactExtractionService
         StandaloneXbrlParser standaloneParser,
         IFileManager fileManager,
         ILogger<XbrlFactExtractionService> logger,
-        FiscalCalendarEvidenceReader calendarReader = null
+        FiscalCalendarEvidenceReader calendarReader = null,
+        IOptions<FinancialFactsPersistenceOptions> persistenceOptions = null
     )
     {
         _scopeFactory = scopeFactory;
@@ -117,6 +119,9 @@ public class XbrlFactExtractionService
         _standaloneParser = standaloneParser;
         _fileManager = fileManager;
         _calendarReader = calendarReader;
+        _insertBatchSize = (
+            persistenceOptions?.Value ?? new FinancialFactsPersistenceOptions()
+        ).EffectiveInsertBatchSize;
         _logger = logger;
     }
 
@@ -181,19 +186,24 @@ public class XbrlFactExtractionService
         }
         else if (document.XbrlType == XbrlType.JsonXbrl)
         {
-            if (document.DocumentType != DocumentType.EsefAnnualReport)
-                throw new InvalidOperationException(
-                    "xBRL-JSON recovery requires an ESEF annual report."
-                );
+            if (document.DocumentType?.IsEsef() != true)
+                throw new InvalidOperationException("xBRL-JSON recovery requires an ESEF report.");
             parsed = new JsonXbrlParser().Parse(envelope);
         }
         else if (document.XbrlType is null or XbrlType.InlineIxbrl)
         {
-            var result = _inlineParser.ParseEnvelope(envelope);
-            parsed = result.Facts;
-            // Before the numeric early-return: a filing whose numeric facts
-            // are all API-covered still states the 12(b) table.
-            await PersistCoverListings(document, result.CoverListings, cancellationToken);
+            if (document.DocumentType?.IsEsef() == true)
+            {
+                parsed = EsefInlineXbrlParser.Parse(envelope);
+            }
+            else
+            {
+                var result = _inlineParser.ParseEnvelope(envelope);
+                parsed = result.Facts;
+                // Before the numeric early-return: a filing whose numeric facts
+                // are all API-covered still states the 12(b) table.
+                await PersistCoverListings(document, result.CoverListings, cancellationToken);
+            }
         }
         else
         {
@@ -248,7 +258,7 @@ public class XbrlFactExtractionService
             dimensionsByKey.TryAdd(candidate.DimensionsKey, candidate.Fact.Dimensions);
         }
 
-        await BatchPersister.Persist(facts, InsertBatchSize, items => FlushFacts(items, false));
+        await BatchPersister.Persist(facts, _insertBatchSize, items => FlushFacts(items, false));
         foreach (
             var group in consolidatedFills.GroupBy(fact =>
                 calendar.Resolve(fact.PeriodStart, fact.PeriodEnd) != null
@@ -257,7 +267,7 @@ public class XbrlFactExtractionService
         {
             await BatchPersister.Persist(
                 group.ToList(),
-                InsertBatchSize,
+                _insertBatchSize,
                 items => FlushFacts(items, true, refreshFiscalIdentity: group.Key)
             );
         }
@@ -323,7 +333,7 @@ public class XbrlFactExtractionService
         if (document == null)
             return false;
         var form = document.DocumentType;
-        var esef = form == DocumentType.EsefAnnualReport;
+        var esef = form?.IsEsef() == true;
         if (
             !esef
             && form != DocumentType.SixK
@@ -342,7 +352,7 @@ public class XbrlFactExtractionService
         )
             return false;
 
-        // A European annual report states its filer under ISO 17442 rather than as a CIK, so the same
+        // A European ESEF report states its filer under ISO 17442 rather than as a CIK, so the same
         // unqualified-context test is made against the issuer's LEI. The comparison is exact: an LEI is one
         // fixed-width identifier with no leading-zero convention to trim.
         if (esef)
@@ -845,7 +855,7 @@ public class XbrlFactExtractionService
         if (rows.Count == 0)
             return;
 
-        foreach (var batch in rows.Chunk(InsertBatchSize))
+        foreach (var batch in rows.Chunk(_insertBatchSize))
         {
             await dbContext
                 .Set<FinancialFactDimension>()

@@ -1,6 +1,7 @@
 using Equibles.CommonStocks.Data.Models;
 using Equibles.Data;
 using Equibles.Sec.Data.Models;
+using Equibles.Sec.Repositories.Models;
 using Microsoft.EntityFrameworkCore;
 
 namespace Equibles.Sec.Repositories;
@@ -41,10 +42,58 @@ public class NportFilingRepository : BaseRepository<NportFiling>
         return DbContext.Set<NportHolding>().Where(h => h.NportFilingId == filing.Id);
     }
 
+    /// <summary>
+    /// Reads one selected filing's facts, complete stored count and bounded portfolio page in
+    /// one statement, so a concurrent parser replay cannot mix the header and schedule revisions.
+    /// Directory callers pass FundSeries.LatestNportFilingId; this read never selects a report.
+    /// </summary>
+    public Task<NportPortfolioSnapshot> GetPortfolioSnapshot(
+        Guid filingId,
+        int offset,
+        int limit,
+        CancellationToken cancellationToken = default
+    )
+    {
+        offset = Math.Max(0, offset);
+        limit = Math.Max(1, limit);
+        return GetAll()
+            .AsNoTracking()
+            .AsSingleQuery()
+            .Where(f => f.Id == filingId)
+            .Select(f => new NportPortfolioSnapshot
+            {
+                FilingId = f.Id,
+                ReportPeriodDate = f.ReportPeriodDate,
+                FilingDate = f.FilingDate,
+                NetAssets = f.NetAssets,
+                TotalAssets = f.TotalAssets,
+                TotalHoldings = f.Holdings.Count,
+                ReportedHoldingCount = f.ReportedHoldingCount,
+                Holdings = f
+                    .Holdings.Where(h => h.NportFilingId == filingId)
+                    .OrderByDescending(h => h.ValueUsd)
+                    .ThenBy(h => h.Id)
+                    .Skip(offset)
+                    .Take(limit)
+                    .ToList(),
+            })
+            .FirstOrDefaultAsync(cancellationToken);
+    }
+
     /// <summary>The reported holding rows carrying the given CUSIP, across all NPORT filings.</summary>
     public IQueryable<NportHolding> GetHoldingsByCusip(string cusip)
     {
         return DbContext.Set<NportHolding>().Where(h => h.Cusip == cusip);
+    }
+
+    /// <summary>
+    /// The reported holding rows carrying one exact security ISIN, across all NPORT filings. A
+    /// foreign listing has no CUSIP, so its fund positions are identified by the ISIN the filer
+    /// stated; a null ISIN matches nothing.
+    /// </summary>
+    public IQueryable<NportHolding> GetHoldingsByIsin(string isin)
+    {
+        return DbContext.Set<NportHolding>().Where(h => isin != null && h.Isin == isin);
     }
 
     /// <summary>

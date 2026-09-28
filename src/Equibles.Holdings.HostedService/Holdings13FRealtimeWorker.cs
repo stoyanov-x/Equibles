@@ -28,12 +28,17 @@ public class Holdings13FRealtimeWorker : BaseScraperWorker
     // so late/amended filings (which carry a fresh accession) are picked up even
     // after the watermark has advanced past their report period.
     private const int TrailingReSweepDays = 14;
+    internal const int CatchUpWindowDays = 7;
+    private const int FilingsPerCycle = 100;
+    internal static readonly TimeSpan BacklogRetryInterval = TimeSpan.FromSeconds(5);
 
     // Identifies this worker's row in RealtimeSweepState.
-    private const string WorkerStateName = "Holdings13FRealtime";
+    internal const string WorkerStateName = "Holdings13FRealtime";
 
     private readonly WorkerOptions _workerOptions;
     private readonly IConfiguration _configuration;
+    private DateTime? _nextRecoveryAt;
+    private bool _hasMoreFilings;
 
     protected override string WorkerName => "13F real-time ingestion";
     protected override TimeSpan SleepInterval => TimeSpan.FromHours(6);
@@ -52,6 +57,30 @@ public class Holdings13FRealtimeWorker : BaseScraperWorker
         _configuration = configuration;
     }
 
+    protected override async Task WaitForNextCycle(
+        TimeSpan interval,
+        CancellationToken stoppingToken
+    )
+    {
+        await using var scope = ScopeFactory.CreateAsyncScope();
+        var signal = scope.ServiceProvider.GetRequiredService<HoldingsRealtimeReplaySignal>();
+        if (_hasMoreFilings && BacklogRetryInterval < interval)
+            interval = BacklogRetryInterval;
+        if (_nextRecoveryAt.HasValue)
+        {
+            var untilRecovery = _nextRecoveryAt.Value - DateTime.UtcNow;
+            if (untilRecovery < BacklogRetryInterval)
+                untilRecovery = BacklogRetryInterval;
+            if (untilRecovery < interval)
+                interval = untilRecovery;
+        }
+        using var wait = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var requested = signal.WaitAsync(wait.Token);
+        var elapsed = Task.Delay(interval, wait.Token);
+        await Task.WhenAny(requested, elapsed);
+        await wait.CancelAsync();
+    }
+
     protected override bool ValidateConfiguration() =>
         ValidateSecContactEmail(
             _configuration,
@@ -61,11 +90,25 @@ public class Holdings13FRealtimeWorker : BaseScraperWorker
 
     protected override async Task DoWork(CancellationToken stoppingToken)
     {
+        _hasMoreFilings = false;
         var startDate = _workerOptions.MinSyncDate ?? new DateTime(2020, 1, 1);
         var minReportDate = DateOnly.FromDateTime(startDate);
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
 
         await using var scope = ScopeFactory.CreateAsyncScope();
+        await scope
+            .ServiceProvider.GetRequiredService<HoldingsImportRecoveryService>()
+            .Recover(minReportDate, stoppingToken);
+        _nextRecoveryAt = await scope
+            .ServiceProvider.GetRequiredService<HoldingsImportFailureRepository>()
+            .GetAll()
+            .Where(row => row.ResolvedAt == null)
+            .MinAsync(row => (DateTime?)row.NextAttemptAt, stoppingToken);
+        if (_nextRecoveryAt <= DateTime.UtcNow)
+        {
+            Logger.LogInformation("13F due recovery remains; deferring daily-index catch-up");
+            return;
+        }
         var stateRepo = scope.ServiceProvider.GetRequiredService<RealtimeSweepStateRepository>();
         var ingestionService =
             scope.ServiceProvider.GetRequiredService<Realtime13FIngestionService>();
@@ -82,7 +125,19 @@ public class Holdings13FRealtimeWorker : BaseScraperWorker
             TrailingReSweepDays,
             firstRunLookbackDays
         );
-        var lookbackDays = today.DayNumber - windowStart.DayNumber + 1;
+        // Every accession completion needs a durable version, including the first sweep.
+        if (state == null)
+        {
+            await stateRepo.SaveProgress(WorkerStateName, null, windowStart, stoppingToken);
+            state = await stateRepo
+                .GetByWorker(WorkerStateName)
+                .AsNoTracking()
+                .SingleAsync(stoppingToken);
+            if (state.SweptThrough < windowStart)
+                windowStart = state.SweptThrough;
+        }
+        var windowEnd = ComputeWindowEnd(today, windowStart);
+        var lookbackDays = windowEnd.DayNumber - windowStart.DayNumber + 1;
 
         Logger.LogInformation(
             "13F real-time ingestion sweeping {LookbackDays} days of EDGAR daily index (from {Start:yyyy-MM-dd})",
@@ -91,16 +146,36 @@ public class Holdings13FRealtimeWorker : BaseScraperWorker
         );
 
         var result = await ingestionService.IngestRecentFilings(
-            today,
+            windowEnd,
             lookbackDays,
             minReportDate,
-            stoppingToken
+            stoppingToken,
+            state,
+            FilingsPerCycle
         );
 
         // Advance the watermark only past days that swept cleanly: a throttled or
         // failed day holds it back so the gap is re-swept next cycle.
-        var newWatermark = ComputeNextWatermark(today, result.EarliestFailedDate);
-        await SaveWatermark(stateRepo, state, newWatermark);
+        var newWatermark = ComputeNextWatermark(windowEnd, result.EarliestFailedDate);
+        _hasMoreFilings = result.HasMoreFilings || windowEnd < today;
+        _nextRecoveryAt = await scope
+            .ServiceProvider.GetRequiredService<HoldingsImportFailureRepository>()
+            .GetAll()
+            .Where(row => row.ResolvedAt == null)
+            .MinAsync(row => (DateTime?)row.NextAttemptAt, stoppingToken);
+        var saved = await stateRepo.SaveProgress(
+            WorkerStateName,
+            state,
+            newWatermark,
+            stoppingToken
+        );
+        if (saved == 0)
+        {
+            Logger.LogInformation(
+                "13F sweep progress superseded by a concurrent identity rescan; replay remains pending"
+            );
+            return;
+        }
 
         Logger.LogInformation(
             "13F real-time ingestion cycle complete: {Count} filings processed, swept through {Watermark:yyyy-MM-dd}",
@@ -139,6 +214,11 @@ public class Holdings13FRealtimeWorker : BaseScraperWorker
         return watermark.Value < trailingStart ? watermark.Value : trailingStart;
     }
 
+    internal static DateOnly ComputeWindowEnd(DateOnly today, DateOnly windowStart) =>
+        today.DayNumber - windowStart.DayNumber + 1 > TrailingReSweepDays + 1
+            ? windowStart.AddDays(CatchUpWindowDays - 1)
+            : today;
+
     /// <summary>
     /// The watermark to persist after a cycle: today when every day swept
     /// cleanly, otherwise the day before the earliest failed day so it (and
@@ -146,32 +226,6 @@ public class Holdings13FRealtimeWorker : BaseScraperWorker
     /// </summary>
     internal static DateOnly ComputeNextWatermark(DateOnly today, DateOnly? earliestFailedDate) =>
         earliestFailedDate.HasValue ? earliestFailedDate.Value.AddDays(-1) : today;
-
-    private static async Task SaveWatermark(
-        RealtimeSweepStateRepository repo,
-        RealtimeSweepState existing,
-        DateOnly sweptThrough
-    )
-    {
-        if (existing == null)
-        {
-            repo.Add(
-                new RealtimeSweepState
-                {
-                    WorkerName = WorkerStateName,
-                    SweptThrough = sweptThrough,
-                    UpdatedAt = DateTime.UtcNow,
-                }
-            );
-        }
-        else
-        {
-            existing.SweptThrough = sweptThrough;
-            existing.UpdatedAt = DateTime.UtcNow;
-        }
-
-        await repo.SaveChanges();
-    }
 
     /// <summary>
     /// Computes how many days of EDGAR daily index to sweep by finding the

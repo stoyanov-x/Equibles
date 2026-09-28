@@ -1,3 +1,4 @@
+using System.Data;
 using System.Net;
 using Equibles.Core.Configuration;
 using Equibles.Errors.BusinessLogic;
@@ -101,6 +102,9 @@ public class HoldingsScraperWorker : BaseScraperWorker
     {
         await ApplyPendingCusipRescan(stoppingToken);
 
+        // Before the walk, so a replay finds each stored position under its current label.
+        await ConvergeHoldingLabels(stoppingToken);
+
         await BackfillHolderClassifications(stoppingToken);
 
         var startDate = _workerOptions.MinSyncDate ?? new DateTime(2020, 1, 1);
@@ -136,6 +140,48 @@ public class HoldingsScraperWorker : BaseScraperWorker
 
         if (failedDataSets.Count > 0)
             await RetryFailedDataSets(failedDataSets, minReportDate, stoppingToken);
+
+        // Scan retained source archives only after the bulk walk; recovery replays each
+        // affected manager's full later filing tail so amendments keep their ordering.
+        try
+        {
+            await using var rescanScope = ScopeFactory.CreateAsyncScope();
+            await rescanScope
+                .ServiceProvider.GetRequiredService<HoldingsCusipRescanService>()
+                .Scan(minReportDate, stoppingToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            Logger.LogError(
+                exception,
+                "CUSIP source rescan failed; archive progress remains queued"
+            );
+        }
+
+        // Bulk files contain older captures than the live filings already in the store.
+        // Reapply their later tail only after the entire oldest-first bulk pass has finished.
+        await ApplyPendingRealtimeReplay(stoppingToken);
+
+        // Position coverage does not depend on valuation. Check it before maintenance can
+        // spend the cycle repricing a large backlog, but let maintenance survive SEC outages.
+        try
+        {
+            await using var auditScope = ScopeFactory.CreateAsyncScope();
+            await auditScope
+                .ServiceProvider.GetRequiredService<HoldingsArchiveCoverageService>()
+                .AuditLatest(minReportDate, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            Logger.LogError(
+                exception,
+                "Holdings source coverage audit failed; reconciliation remains pending"
+            );
+        }
 
         // Revise mis-published filed values, heal abandoned zero-value rows (publish the filed
         // figure) and reset implausible derivations for honest repricing. Bounded per cycle;
@@ -181,6 +227,10 @@ public class HoldingsScraperWorker : BaseScraperWorker
         await using var scope = ScopeFactory.CreateAsyncScope();
         var dataSets = scope.ServiceProvider.GetRequiredService<ProcessedDataSetRepository>();
 
+        await using var transaction = await dataSets.CreateTransaction(
+            IsolationLevel.ReadCommitted,
+            cancellationToken
+        );
         var rows = await dataSets.GetAll().ToListAsync(cancellationToken);
         var pending = rows.FirstOrDefault(r =>
             r.FileName == Holdings.Data.Models.ProcessedDataSet.RescanPendingFileName
@@ -191,8 +241,28 @@ public class HoldingsScraperWorker : BaseScraperWorker
         var realRows = rows.Where(r =>
                 r.FileName != Holdings.Data.Models.ProcessedDataSet.BackfillGuardFileName
                 && r.FileName != Holdings.Data.Models.ProcessedDataSet.RescanPendingFileName
+                && r.FileName != Holdings.Data.Models.ProcessedDataSet.RealtimeReplayPendingFileName
             )
             .ToList();
+
+        var seasonStartDate = Holdings13FRealtimeWorker.LatestQuarterEnd(
+            DateOnly.FromDateTime(DateTime.UtcNow)
+        );
+        var latestBulkEnd = realRows
+            .Select(r => Holdings13FRealtimeWorker.ParseDataSetEndDate(r.FileName))
+            .Where(d => d.HasValue)
+            .Max();
+        // A still-unpublished archive can straddle a calendar-quarter rollover.
+        var replayFrom =
+            latestBulkEnd.HasValue && latestBulkEnd.Value < seasonStartDate
+                ? latestBulkEnd.Value.AddDays(1)
+                : seasonStartDate;
+        var states = scope.ServiceProvider.GetRequiredService<RealtimeSweepStateRepository>();
+        await states.Rewind(
+            Holdings13FRealtimeWorker.WorkerStateName,
+            replayFrom,
+            cancellationToken
+        );
 
         dataSets.Delete(pending);
         foreach (var row in realRows)
@@ -213,19 +283,82 @@ public class HoldingsScraperWorker : BaseScraperWorker
 
         var processedFilings =
             scope.ServiceProvider.GetRequiredService<ProcessedFilingRepository>();
-        var seasonStart = Holdings13FRealtimeWorker
-            .LatestQuarterEnd(DateOnly.FromDateTime(DateTime.UtcNow))
-            .ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        var seasonStart = replayFrom.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
         var clearedFilings = await processedFilings
             .GetAll()
             .Where(f => f.CreationTime >= seasonStart)
             .ExecuteDeleteAsync(cancellationToken);
+
+        await transaction.CommitAsync(cancellationToken);
 
         Logger.LogInformation(
             "Applied queued CUSIP-identity rescan: cleared {DataSets} quarterly data set marker(s) and {Filings} open-season realtime accession(s)",
             realRows.Count,
             clearedFilings
         );
+    }
+
+    internal async Task ApplyPendingRealtimeReplay(CancellationToken cancellationToken)
+    {
+        await using var scope = ScopeFactory.CreateAsyncScope();
+        var dataSets = scope.ServiceProvider.GetRequiredService<ProcessedDataSetRepository>();
+        await using var transaction = await dataSets.CreateTransaction(
+            IsolationLevel.ReadCommitted,
+            cancellationToken
+        );
+        var rows = await dataSets.GetAll().ToListAsync(cancellationToken);
+        var pending = rows.FirstOrDefault(r =>
+            r.FileName == Holdings.Data.Models.ProcessedDataSet.RealtimeReplayPendingFileName
+        );
+        if (pending == null)
+            return;
+
+        var latestBulkEnd = rows.Where(r =>
+                r.ParserVersion >= Holdings.Data.Models.ProcessedDataSet.CurrentParserVersion
+            )
+            .Select(r => Holdings13FRealtimeWorker.ParseDataSetEndDate(r.FileName))
+            .Where(d => d.HasValue)
+            .Max();
+        var replayFrom =
+            latestBulkEnd?.AddDays(1)
+            ?? DateOnly.FromDateTime(_workerOptions.MinSyncDate ?? new DateTime(2020, 1, 1));
+        var states = scope.ServiceProvider.GetRequiredService<RealtimeSweepStateRepository>();
+        await states.Rewind(
+            Holdings13FRealtimeWorker.WorkerStateName,
+            replayFrom,
+            cancellationToken
+        );
+        var filings = scope.ServiceProvider.GetRequiredService<ProcessedFilingRepository>();
+        var since = replayFrom.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        await filings
+            .GetAll()
+            .Where(f => f.CreationTime >= since)
+            .ExecuteDeleteAsync(cancellationToken);
+        dataSets.Delete(pending);
+        await dataSets.SaveChanges();
+        await transaction.CommitAsync(cancellationToken);
+
+        scope.ServiceProvider.GetRequiredService<HoldingsRealtimeReplaySignal>().RequestReplay();
+        Logger.LogInformation(
+            "Bulk replay finished; reopened realtime filings from {From:yyyy-MM-dd}",
+            replayFrom
+        );
+    }
+
+    private async Task ConvergeHoldingLabels(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var scope = ScopeFactory.CreateAsyncScope();
+            var convergence =
+                scope.ServiceProvider.GetRequiredService<HoldingLabelConvergenceService>();
+            await convergence.Converge(cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            // Maintenance, not ingestion: the import still runs under the retained labels.
+            Logger.LogWarning(exception, "Holding label convergence pass failed");
+        }
     }
 
     private async Task BackfillFilingRollupTypes(CancellationToken cancellationToken)
@@ -459,6 +592,11 @@ public class HoldingsScraperWorker : BaseScraperWorker
                     fileName,
                     cancellationToken
                 );
+                // Persist intent before any amendment delete/upsert, even if the import fails
+                // or the process stops before a completion marker can be written.
+                await scope
+                    .ServiceProvider.GetRequiredService<ProcessedDataSetRepository>()
+                    .QueueRealtimeReplay(cancellationToken);
                 var result = await importService.ImportDataSet(
                     archive,
                     minReportDate,

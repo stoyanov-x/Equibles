@@ -71,6 +71,14 @@ public class FtdScraperWorker : BaseScraperWorker
         // authoritative SEC symbol+CUSIP archive before Holdings retries historical filings.
         await ftdService.BackfillInactiveCusips(stoppingToken);
 
+        // A presentation holding a retired sibling class's CUSIP heals from stored SEC evidence,
+        // because a fully delisted issuer never reappears in a live replay month.
+        await ftdService.ReconcileRetiredSiblingCusips(stoppingToken);
+
+        // A CUSIP held by one class while the fails file shows it trading as a co-registered
+        // sibling moves to that sibling; bounded to one six-month read a week.
+        await ftdService.ReconcileSiblingCusipsFromArchive(stoppingToken);
+
         // And the sibling-listing sweep: secondary tickers' CUSIPs (share classes, units)
         // recorded against the exact listed symbol so 13F lines filed under them resolve.
         var listedCusipBacklog = await ftdService.BackfillListedTickerCusips(stoppingToken);

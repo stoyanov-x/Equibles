@@ -6,6 +6,7 @@
 
   <ItemGroup>
     <PackageReference Include="Equibles.Core.AutoWiring" />
+    <PackageReference Include="HtmlAgilityPack" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
     <PackageReference Include="Microsoft.Extensions.Http" />
     <PackageReference Include="FlexLabs.EntityFrameworkCore.Upsert" />
@@ -14,9 +15,11 @@
   <ItemGroup>
     <ProjectReference Include="..\Equibles.Core\Equibles.Core.csproj" />
     <ProjectReference Include="..\Equibles.Integrations.Sec\Equibles.Integrations.Sec.csproj" />
+    <ProjectReference Include="..\Equibles.Sec.BusinessLogic\Equibles.Sec.BusinessLogic.csproj" />
     <ProjectReference Include="..\Equibles.Holdings.Repositories\Equibles.Holdings.Repositories.csproj" />
     <ProjectReference Include="..\Equibles.Holdings.BusinessLogic\Equibles.Holdings.BusinessLogic.csproj" />
     <ProjectReference Include="..\Equibles.CommonStocks.BusinessLogic\Equibles.CommonStocks.BusinessLogic.csproj" />
+    <ProjectReference Include="..\Equibles.Sec.FinancialFacts.Data\Equibles.Sec.FinancialFacts.Data.csproj" />
     <ProjectReference Include="..\Equibles.CorporateActions.Data\Equibles.CorporateActions.Data.csproj" />
     <ProjectReference Include="..\Equibles.Errors.BusinessLogic\Equibles.Errors.BusinessLogic.csproj" />
     <ProjectReference Include="..\Equibles.Worker\Equibles.Worker.csproj" />

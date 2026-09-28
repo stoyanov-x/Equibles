@@ -6,6 +6,7 @@ using Equibles.Core.Configuration;
 using Equibles.Core.Contracts;
 using Equibles.Data;
 using Equibles.Holdings.Data.Models;
+using Equibles.Holdings.HostedService;
 using Equibles.Holdings.HostedService.Services;
 using Equibles.Holdings.Repositories;
 using Equibles.Integrations.Sec.Contracts;
@@ -82,6 +83,10 @@ public class Realtime13FIngestionCrashSafetyTests : IAsyncLifetime
                     .Returns(new InstitutionalHoldingRepository(ctx));
                 sp.GetService(typeof(ProcessedFilingRepository))
                     .Returns(new ProcessedFilingRepository(ctx));
+                sp.GetService(typeof(HoldingsImportFailureRepository))
+                    .Returns(new HoldingsImportFailureRepository(ctx));
+                sp.GetService(typeof(RealtimeSweepStateRepository))
+                    .Returns(new RealtimeSweepStateRepository(ctx));
                 var scope = Substitute.For<IServiceScope>();
                 scope.ServiceProvider.Returns(sp);
                 return scope;
@@ -126,7 +131,150 @@ public class Realtime13FIngestionCrashSafetyTests : IAsyncLifetime
         };
 
     [Fact]
-    public async Task IngestRecentFilings_ImportFailsMidSweep_DoesNotRecordLedgerSoNextSweepRetries()
+    public async Task PartialIndexSweep_PreservesRecoveryUntilProcessedAmendmentReplays()
+    {
+        var original = Entry();
+        var amendment = new EdgarDailyIndexEntry
+        {
+            FormType = "13F-HR/A",
+            CompanyName = "BIG FUND",
+            Cik = Cik,
+            DateFiled = original.DateFiled.AddDays(1),
+            AccessionNumber = "ACC-AMEND",
+        };
+        using (var seed = FreshContext())
+        {
+            seed.Add(
+                Equibles.TestSupport.EquityIssuerSeed.Create(
+                    Id: Guid.NewGuid(),
+                    Ticker: "AAPL",
+                    Name: "Apple Inc",
+                    Cik: "0000320193",
+                    Cusip: Cusip
+                )
+            );
+            seed.Add(new ProcessedFiling { AccessionNumber = amendment.AccessionNumber });
+            await seed.SaveChangesAsync();
+            await new HoldingsImportFailureRepository(seed).Record(
+                original.AccessionNumber,
+                Cik,
+                original.DateFiled,
+                new DateOnly(2024, 9, 30),
+                HoldingsImportFailureReason.Incomplete,
+                CancellationToken.None
+            );
+        }
+        var missingAmendmentDay = true;
+        var edgar = Substitute.For<ISecEdgarClient>();
+        edgar
+            .GetDailyIndex(Arg.Any<DateOnly>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                if (call.ArgAt<DateOnly>(0) == amendment.DateFiled)
+                {
+                    if (missingAmendmentDay)
+                        throw new IOException("Index unavailable");
+                    return new List<EdgarDailyIndexEntry> { amendment };
+                }
+                return new List<EdgarDailyIndexEntry> { original };
+            });
+        edgar
+            .GetFilingArtifactNames(
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<CancellationToken>()
+            )
+            .Returns(["primary_doc.xml", "infotable.xml"]);
+        edgar
+            .GetDocumentFileBytes(
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<CancellationToken>()
+            )
+            .Returns(call =>
+                Encoding.UTF8.GetBytes(
+                    call.ArgAt<string>(2) == "primary_doc.xml"
+                        ? PrimaryDoc()
+                            .Replace(
+                                "<isAmendment>false</isAmendment>",
+                                call.ArgAt<string>(1) == "ACC-AMEND"
+                                    ? "<isAmendment>true</isAmendment><amendmentType>RESTATEMENT</amendmentType>"
+                                    : "<isAmendment>false</isAmendment>"
+                            )
+                        : InfoTable()
+                            .Replace("1000", call.ArgAt<string>(1) == "ACC-AMEND" ? "2000" : "1000")
+                )
+            );
+        var scopes = CreateScopeFactory();
+        var prices = Substitute.For<IStockPriceProvider>();
+        prices
+            .GetClosingPrices(
+                Arg.Any<IEnumerable<(Guid, string, DateOnly)>>(),
+                Arg.Any<CancellationToken>()
+            )
+            .Returns(new Dictionary<(Guid, string, DateOnly), decimal>());
+        var importer = new HoldingsImportService(
+            scopes,
+            Substitute.For<ILogger<HoldingsImportService>>(),
+            Options.Create(new WorkerOptions()),
+            prices,
+            Substitute.For<MassTransit.IBus>()
+        );
+        var ingestion = new Realtime13FIngestionService(
+            edgar,
+            new Filing13FXmlParser(),
+            new Realtime13FArchiveBuilder(),
+            importer,
+            scopes,
+            Substitute.For<ILogger<Realtime13FIngestionService>>()
+        );
+        var first = await ingestion.IngestRecentFilings(
+            amendment.DateFiled,
+            2,
+            new DateOnly(2024, 1, 1),
+            CancellationToken.None
+        );
+        first.EarliestFailedDate.Should().Be(amendment.DateFiled);
+        using (var verify = FreshContext())
+            (await verify.Set<HoldingsImportFailure>().SingleAsync()).ResolvedAt.Should().BeNull();
+        missingAmendmentDay = false;
+        await ingestion.IngestRecentFilings(
+            amendment.DateFiled,
+            2,
+            new DateOnly(2024, 1, 1),
+            CancellationToken.None
+        );
+        using (var verify = FreshContext())
+            (await verify.Set<InstitutionalHolding>().AnyAsync()).Should().BeFalse();
+        await ingestion.IngestSpecificFilings(
+            [original, amendment],
+            new DateOnly(2024, 1, 1),
+            CancellationToken.None
+        );
+        using (var verify = FreshContext())
+        {
+            var position = await verify.Set<InstitutionalHolding>().SingleAsync();
+            position.Shares.Should().Be(2000);
+            position.AccessionNumber.Should().Be(amendment.AccessionNumber);
+            (await verify.Set<HoldingsImportFailure>().SingleAsync()).ResolvedAt.Should().BeNull();
+        }
+        // Importing an explicit subset is not evidence that the whole tail is complete either.
+        await ingestion.IngestSpecificFilings(
+            [original],
+            new DateOnly(2024, 1, 1),
+            CancellationToken.None
+        );
+        using (var verify = FreshContext())
+            (await verify.Set<HoldingsImportFailure>().SingleAsync()).ResolvedAt.Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task IngestRecentFilings_ImportFailsOrResetWins_DoesNotRecordLedgerSoRestartRetries(
+        bool resetDuringImport
+    )
     {
         using (var seed = FreshContext())
         {
@@ -172,6 +320,19 @@ public class Realtime13FIngestionCrashSafetyTests : IAsyncLifetime
 
         var scopeFactory = CreateScopeFactory();
 
+        await using var progressContext = FreshContext();
+        var progress = new RealtimeSweepStateRepository(progressContext);
+        await progress.SaveProgress(
+            Holdings13FRealtimeWorker.WorkerStateName,
+            null,
+            new DateOnly(2024, 11, 25),
+            CancellationToken.None
+        );
+        var originalState = await progress
+            .GetByWorker(Holdings13FRealtimeWorker.WorkerStateName)
+            .AsNoTracking()
+            .SingleAsync();
+
         // The import path resolves closing prices; throw on the FIRST sweep so
         // ImportDataSet fails mid-flight, then succeed on every later call.
         var prices = Substitute.For<IStockPriceProvider>();
@@ -181,17 +342,26 @@ public class Realtime13FIngestionCrashSafetyTests : IAsyncLifetime
                 Arg.Any<IEnumerable<(Guid, string, DateOnly)>>(),
                 Arg.Any<CancellationToken>()
             )
-            .Returns(ci =>
+            .Returns(async ci =>
             {
                 if (Interlocked.Increment(ref priceCalls) == 1)
-                    throw new InvalidOperationException("price service unavailable");
+                {
+                    if (!resetDuringImport)
+                        throw new InvalidOperationException("price service unavailable");
+                    await using var reset = FreshContext();
+                    await new RealtimeSweepStateRepository(reset).Rewind(
+                        Holdings13FRealtimeWorker.WorkerStateName,
+                        new DateOnly(2024, 10, 1),
+                        CancellationToken.None
+                    );
+                }
 
                 var dict = new Dictionary<(Guid, string, DateOnly), decimal>();
                 foreach (
                     var (id, ticker, date) in ci.ArgAt<IEnumerable<(Guid, string, DateOnly)>>(0)
                 )
                     dict[(id, ticker, date)] = 100m;
-                return Task.FromResult(dict);
+                return dict;
             });
 
         var importService = new HoldingsImportService(
@@ -215,12 +385,16 @@ public class Realtime13FIngestionCrashSafetyTests : IAsyncLifetime
 
         // Sweep 1 — the import blows up. The sweep survives, the ledger MUST stay
         // empty, and the failed filing's date must hold the watermark back.
+        using var stoppedSweep = new CancellationTokenSource();
         var firstSweep = await ingestion.IngestRecentFilings(
             today,
             1,
             minReportDate,
-            CancellationToken.None
+            stoppedSweep.Token,
+            originalState
         );
+        // Stop before any worker-level progress save or cleanup can run.
+        stoppedSweep.Cancel();
         firstSweep.FilingsImported.Should().Be(0, "the only filing in the window failed to import");
         firstSweep
             .EarliestFailedDate.Should()
@@ -237,15 +411,29 @@ public class Realtime13FIngestionCrashSafetyTests : IAsyncLifetime
             recorded.Should().BeFalse("a crash before import completes must not record the ledger");
         }
 
-        // Sweep 2 — prices now resolve; the filing must be re-ingested, not skipped.
+        // A failed import belongs to ordered recovery; a reset alone remains a sweep retry.
         var imported = await ingestion.IngestRecentFilings(
             today,
             1,
             minReportDate,
-            CancellationToken.None
+            CancellationToken.None,
+            await progress
+                .GetByWorker(Holdings13FRealtimeWorker.WorkerStateName)
+                .AsNoTracking()
+                .SingleAsync()
         );
 
-        imported.FilingsImported.Should().Be(1);
+        imported.FilingsImported.Should().Be(resetDuringImport ? 1 : 0);
+        if (!resetDuringImport)
+            (
+                await ingestion.IngestSpecificFilings(
+                    [Entry()],
+                    minReportDate,
+                    CancellationToken.None
+                )
+            )
+                .Should()
+                .Be(1);
 
         using var verify = FreshContext();
         var holdings = await verify
@@ -258,5 +446,202 @@ public class Realtime13FIngestionCrashSafetyTests : IAsyncLifetime
             .ContainSingle("the retried sweep must land the holdings the failed sweep dropped");
         holdings[0].Shares.Should().Be(1000);
         holdings[0].AccessionNumber.Should().Be("ACC-ORIG");
+    }
+
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(1, false)]
+    [InlineData(0, true)]
+    [InlineData(1, true)]
+    public async Task BoundedSweep_ResumesOriginalAndAmendmentWithoutSkippingSourceDays(
+        int amendmentDayOffset,
+        bool earlierIndexFails
+    )
+    {
+        var original = Entry();
+        original.AccessionNumber = "001-original";
+        var amendment = new EdgarDailyIndexEntry
+        {
+            AccessionNumber = "002-amendment",
+            Cik = Cik,
+            FormType = "13F-HR/A",
+            DateFiled = original.DateFiled.AddDays(amendmentDayOffset),
+        };
+        using (var seed = FreshContext())
+        {
+            seed.Add(
+                Equibles.TestSupport.EquityIssuerSeed.Create(
+                    Id: Guid.NewGuid(),
+                    Ticker: "AAPL",
+                    Name: "Apple Inc",
+                    Cik: "0000320193",
+                    Cusip: Cusip
+                )
+            );
+            await seed.SaveChangesAsync();
+        }
+        var edgar = Substitute.For<ISecEdgarClient>();
+        edgar
+            .GetDailyIndex(Arg.Any<DateOnly>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var day = call.ArgAt<DateOnly>(0);
+                if (earlierIndexFails && day == original.DateFiled.AddDays(-1))
+                    throw new IOException("Earlier index unavailable");
+                return new[] { amendment, original }.Where(e => e.DateFiled == day).ToList();
+            });
+        edgar
+            .GetFilingArtifactNames(
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<CancellationToken>()
+            )
+            .Returns(["primary_doc.xml", "infotable.xml"]);
+        edgar
+            .GetDocumentFileBytes(
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<CancellationToken>()
+            )
+            .Returns(call =>
+                Encoding.UTF8.GetBytes(
+                    call.ArgAt<string>(2) == "primary_doc.xml"
+                        ? PrimaryDoc()
+                            .Replace(
+                                "<isAmendment>false</isAmendment>",
+                                call.ArgAt<string>(1) == amendment.AccessionNumber
+                                    ? "<isAmendment>true</isAmendment><amendmentType>RESTATEMENT</amendmentType>"
+                                    : "<isAmendment>false</isAmendment>"
+                            )
+                        : InfoTable()
+                            .Replace(
+                                "1000",
+                                call.ArgAt<string>(1) == amendment.AccessionNumber ? "2000" : "1000"
+                            )
+                )
+            );
+        var scopes = CreateScopeFactory();
+        var prices = Substitute.For<IStockPriceProvider>();
+        prices
+            .GetClosingPrices(
+                Arg.Any<IEnumerable<(Guid, string, DateOnly)>>(),
+                Arg.Any<CancellationToken>()
+            )
+            .Returns(new Dictionary<(Guid, string, DateOnly), decimal>());
+        var importer = new HoldingsImportService(
+            scopes,
+            Substitute.For<ILogger<HoldingsImportService>>(),
+            Options.Create(new WorkerOptions()),
+            prices,
+            Substitute.For<MassTransit.IBus>()
+        );
+        var ingestion = new Realtime13FIngestionService(
+            edgar,
+            new Filing13FXmlParser(),
+            new Realtime13FArchiveBuilder(),
+            importer,
+            scopes,
+            Substitute.For<ILogger<Realtime13FIngestionService>>()
+        );
+        var first = await ingestion.IngestRecentFilings(
+            amendment.DateFiled,
+            amendmentDayOffset + 2,
+            new(2024, 1, 1),
+            CancellationToken.None,
+            maxFilings: 1
+        );
+        first.FilingsImported.Should().Be(1);
+        first.HasMoreFilings.Should().BeTrue();
+        first
+            .EarliestFailedDate.Should()
+            .Be(earlierIndexFails ? original.DateFiled.AddDays(-1) : amendment.DateFiled);
+        using (var verify = FreshContext())
+        {
+            (await verify.Set<ProcessedFiling>().SingleAsync())
+                .AccessionNumber.Should()
+                .Be(original.AccessionNumber);
+            (await verify.Set<InstitutionalHolding>().SingleAsync()).Shares.Should().Be(1000);
+        }
+        var second = await ingestion.IngestRecentFilings(
+            amendment.DateFiled,
+            amendmentDayOffset + 2,
+            new(2024, 1, 1),
+            CancellationToken.None,
+            maxFilings: 1
+        );
+        second.FilingsImported.Should().Be(1);
+        second.HasMoreFilings.Should().BeFalse();
+        using (var verify = FreshContext())
+        {
+            (await verify.Set<ProcessedFiling>().CountAsync()).Should().Be(2);
+            var position = await verify.Set<InstitutionalHolding>().SingleAsync();
+            position.Shares.Should().Be(2000);
+            position.AccessionNumber.Should().Be(amendment.AccessionNumber);
+        }
+    }
+
+    [Fact]
+    public async Task BoundedSweep_OutOfRangeFilingsDoNotConsumeEveryPassForever()
+    {
+        var first = Entry();
+        first.AccessionNumber = "001-old";
+        var second = Entry();
+        second.AccessionNumber = "002-old";
+        var edgar = Substitute.For<ISecEdgarClient>();
+        edgar
+            .GetDailyIndex(Arg.Any<DateOnly>(), Arg.Any<CancellationToken>())
+            .Returns([second, first]);
+        edgar
+            .GetFilingArtifactNames(
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<CancellationToken>()
+            )
+            .Returns(["primary_doc.xml", "infotable.xml"]);
+        edgar
+            .GetDocumentFileBytes(
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<CancellationToken>()
+            )
+            .Returns(call =>
+                Encoding.UTF8.GetBytes(
+                    call.ArgAt<string>(2) == "primary_doc.xml" ? PrimaryDoc() : InfoTable()
+                )
+            );
+        var ingestion = new Realtime13FIngestionService(
+            edgar,
+            new Filing13FXmlParser(),
+            new Realtime13FArchiveBuilder(),
+            null,
+            CreateScopeFactory(),
+            Substitute.For<ILogger<Realtime13FIngestionService>>()
+        );
+        var firstPass = await ingestion.IngestRecentFilings(
+            first.DateFiled,
+            1,
+            new(2025, 1, 1),
+            CancellationToken.None,
+            maxFilings: 1
+        );
+        firstPass.HasMoreFilings.Should().BeTrue();
+        firstPass.FilingsImported.Should().Be(0);
+        firstPass.EarliestFailedDate.Should().Be(first.DateFiled);
+        var secondPass = await ingestion.IngestRecentFilings(
+            first.DateFiled,
+            1,
+            new(2025, 1, 1),
+            CancellationToken.None,
+            maxFilings: 1
+        );
+        secondPass.HasMoreFilings.Should().BeFalse();
+        secondPass.FilingsImported.Should().Be(0);
+        secondPass.EarliestFailedDate.Should().BeNull();
+        using var verify = FreshContext();
+        (await verify.Set<ProcessedFiling>().CountAsync()).Should().Be(2);
+        (await verify.Set<HoldingsImportFailure>().CountAsync()).Should().Be(0);
+        (await verify.Set<InstitutionalHolding>().CountAsync()).Should().Be(0);
     }
 }
