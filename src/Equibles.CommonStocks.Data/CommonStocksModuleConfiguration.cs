@@ -66,7 +66,38 @@ public class CommonStocksModuleConfiguration : Equibles.Data.IFinancialModule
                 .HasForeignKey(row => row.SourceRecordId)
                 .OnDelete(DeleteBehavior.Restrict);
         });
+        builder.Entity<EquitySecuritySourceIdentifier>(identifier =>
+        {
+            identifier
+                .HasOne(row => row.Security)
+                .WithMany(row => row.SourceIdentifiers)
+                .HasForeignKey(row => row.EquitySecurityId)
+                .OnDelete(DeleteBehavior.Restrict);
+            identifier
+                .HasOne(row => row.SourceRecord)
+                .WithMany()
+                .HasForeignKey(row => row.SourceRecordId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+        builder.Entity<EquityListingSourceIdentifier>(identifier =>
+        {
+            identifier
+                .HasOne(row => row.Listing)
+                .WithMany(row => row.SourceIdentifiers)
+                .HasForeignKey(row => row.EquityListingId)
+                .OnDelete(DeleteBehavior.Restrict);
+            identifier
+                .HasOne(row => row.SourceRecord)
+                .WithMany()
+                .HasForeignKey(row => row.SourceRecordId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
         builder.Entity<EquityIssuer>().Property(issuer => issuer.Id).ValueGeneratedNever();
+        // Old hosts omit this column during rolling deployment.
+        builder
+            .Entity<EquityIssuer>()
+            .Property(issuer => issuer.NameAliases)
+            .HasDefaultValueSql("ARRAY[]::text[]");
         builder.Entity<EquitySecurity>().Property(security => security.Id).ValueGeneratedNever();
         builder.Entity<EquityListing>().Property(listing => listing.Id).ValueGeneratedNever();
         builder

@@ -64,6 +64,18 @@ public class EquityIssuerRepository : BaseRepository<EquityIssuer>
     public void AddSourceIdentifier(EquityIssuerSourceIdentifier identifier) =>
         DbContext.Set<EquityIssuerSourceIdentifier>().Add(identifier);
 
+    public IQueryable<EquitySecuritySourceIdentifier> GetSecurityIdentifiers() =>
+        DbContext.Set<EquitySecuritySourceIdentifier>();
+
+    public void AddSecurityIdentifier(EquitySecuritySourceIdentifier identifier) =>
+        DbContext.Set<EquitySecuritySourceIdentifier>().Add(identifier);
+
+    public IQueryable<EquityListingSourceIdentifier> GetListingIdentifiers() =>
+        DbContext.Set<EquityListingSourceIdentifier>();
+
+    public void AddListingIdentifier(EquityListingSourceIdentifier identifier) =>
+        DbContext.Set<EquityListingSourceIdentifier>().Add(identifier);
+
     public IQueryable<EquitySecurity> GetSecurities() =>
         GetAll().SelectMany(issuer => issuer.Securities);
 
@@ -195,6 +207,9 @@ public class EquityIssuerRepository : BaseRepository<EquityIssuer>
             query = query.Where(c =>
                 EF.Functions.ILike(c.Presentation.Listing.Ticker, pattern, LikePattern.EscapeChar)
                 || EF.Functions.ILike(c.Name, pattern, LikePattern.EscapeChar)
+                || c.NameAliases.Any(name =>
+                    EF.Functions.ILike(name, pattern, LikePattern.EscapeChar)
+                )
                 || EF.Functions.ILike(c.Description, pattern, LikePattern.EscapeChar)
                 || EF.Functions.ILike(c.Industry.Name, pattern, LikePattern.EscapeChar)
             );

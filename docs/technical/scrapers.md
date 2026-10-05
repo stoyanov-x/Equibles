@@ -19,6 +19,7 @@
 - Recovery is recurring reconciliation, not a one-time script; no extraction-version bump replays already captured HTML documents.
 - An ESEF index entry does not establish annual reporting: tagged interim reports use the same format.
 - Validate inline XML namespaces in scope before annual classification and fact extraction; ambiguous rebindings, spoofed instance namespaces and aliases unsupported by the shared parser keep the general type and refuse financial-fact publication.
+- Unit measures resolve only from ISO 4217, `xbrli:pure`/`xbrli:shares`, or the XBRL Unit Type Registry (`utr`); a registry name that reads as a currency code, `pure` or `shares` still refuses the report.
 - Retain refused originals for diagnosis; the extraction guard prevents new unsupported facts but does not remove previously stored rows or replay the completed corpus.
 - Classify a captured report as annual only with matching unqualified, conflict-free IFRS annual-duration and instant facts at its indexed end, and no later supported issuer facts.
 - Keep other captured reports as the general `EsefReport` type; preserve their envelope, financial extraction, normalization replay and history deduplication.
@@ -28,6 +29,14 @@
 - Capturing an XBRL envelope queues existing financial-fact extraction; capture counts alone do not prove published financial coverage.
 
 How the `*.HostedService` workers ingest data, how the `Equibles.Integrations.*` HTTP clients talk to upstream APIs, and how the deduplication ledgers keep re-runs idempotent.
+
+## Retained SEC originals
+
+- Live capture and the original-document backfill share `AsFiledHtmlDocumentTypes.Supported`: 8-K, 10-K, 10-Q, 20-F, 40-F, 6-K and their amendments.
+- Periodic reports retain their primary HTML and referenced images even without an HTML exhibit; 8-K stitching still requires a displayable exhibit.
+- The backfill selects supported reports below the current builder version, with a known CIK, a stored or recoverable accession, and fewer than five failed attempts.
+- Reporting dates do not limit the backfill; completed captures stay complete when a new form is added to the supported set.
+- Original capture preserves the separate XBRL envelope and derived financial facts; image requests retain the shared SEC pacing and existing count/byte limits.
 
 ## Two-layer shape
 
@@ -143,6 +152,9 @@ These sources publish a continuous time series rather than discrete filings. Eac
 - Otherwise → `WorkerOptions.MinSyncDate` if set, else `2020-01-01`.
 
 The cursor pattern means re-running is cheap (a single query for `max(date)` per cycle); duplicate ingestion is prevented by the per-source unique index (`[Index(nameof(CommonStockId), nameof(Date), IsUnique = true)]` etc.).
+
+- Catalog prices rotate across venue identities inside both the recent-price and historical queues; a larger market cannot fill each bounded request batch ahead of smaller markets.
+- Each venue retains oldest-attempt ordering across restarts, with four recent-price candidates per historical candidate and unchanged retry intervals.
 
 ### FDA catalysts — watermark-less re-read + upsert
 

@@ -2,6 +2,7 @@ using System.Data;
 using Equibles.CommonStocks.Data.Helpers;
 using Equibles.CommonStocks.Data.Models;
 using Equibles.CommonStocks.Repositories;
+using Equibles.CommonStocks.Repositories.Extensions;
 using Equibles.Core.AutoWiring;
 using Equibles.Core.Calendars;
 using Equibles.Core.Configuration;
@@ -70,6 +71,7 @@ public class YahooPriceImportService
     private readonly YahooPriceScraperOptions _scraperOptions;
 
     public bool HasEnrichmentBacklog { get; private set; }
+    public bool HasCatalogPriceBacklog { get; private set; }
 
     public YahooPriceImportService(
         IServiceScopeFactory scopeFactory,
@@ -101,7 +103,17 @@ public class YahooPriceImportService
     /// persisted attempt time is due receives the key-statistics + company-profile calls (2 extra
     /// Yahoo calls per stock, the bulk of a cycle's traffic).
     /// </summary>
-    public async Task Import(bool includeEnrichment, CancellationToken cancellationToken)
+    public Task Import(bool includeEnrichment, CancellationToken cancellationToken) =>
+        ImportUniverse(includeEnrichment, includeCatalog: true, cancellationToken);
+
+    public Task ImportUsPrices(CancellationToken cancellationToken) =>
+        ImportUniverse(includeEnrichment: true, includeCatalog: false, cancellationToken);
+
+    private async Task ImportUniverse(
+        bool includeEnrichment,
+        bool includeCatalog,
+        CancellationToken cancellationToken
+    )
     {
         HasEnrichmentBacklog = false;
         var tickerMap = await _tickerMapService.Build(
@@ -113,7 +125,8 @@ public class YahooPriceImportService
             cancellationToken
         );
         priceTargets.AddRange(await BuildHistoricalPriceTargets(cancellationToken));
-        priceTargets.AddRange(await BuildCatalogPriceTargets(cancellationToken));
+        if (includeCatalog)
+            priceTargets.AddRange(await BuildCatalogPriceTargets(cancellationToken));
         _logger.LogInformation(
             "Starting Yahoo price sync for {SeriesCount} listed symbols across {StockCount} stocks (enrichment: {Enrichment})",
             priceTargets.Count,
@@ -156,6 +169,49 @@ public class YahooPriceImportService
                 .ToList();
             await ImportEnrichment(primaryOrder, cancellationToken);
         }
+    }
+
+    public async Task ImportCatalogPrices(
+        CancellationToken cancellationToken,
+        bool includeEnrichment = true
+    )
+    {
+        HasCatalogPriceBacklog = false;
+        HasEnrichmentBacklog = false;
+        var targets = await BuildCatalogPriceTargets(cancellationToken);
+        using var scope = _scopeFactory.CreateScope();
+        var listings = scope.ServiceProvider.GetRequiredService<EquityListingRepository>();
+        var prices = scope.ServiceProvider.GetRequiredService<EquityDailyStockPriceRepository>();
+        var ids = targets.Select(target => target.EquityListingId).ToArray();
+        // Each indexed latest-row lookup avoids rescanning the complete price history per batch.
+        var lastDates = await listings
+            .GetAll()
+            .Where(listing => ids.Contains(listing.Id))
+            .Select(listing => new
+            {
+                listing.Id,
+                Date = prices
+                    .GetAllSeries()
+                    .Where(price => price.EquityListingId == listing.Id)
+                    .OrderByDescending(price => price.Date)
+                    .Select(price => (DateOnly?)price.Date)
+                    .FirstOrDefault(),
+            })
+            .ToDictionaryAsync(row => row.Id, row => row.Date, cancellationToken);
+        var order = YahooCatalogPriceQueue.Order(targets, lastDates, DateTime.UtcNow);
+        var result = await ImportPriceBatch(order, cancellationToken, 200);
+        HasCatalogPriceBacklog = result.HasMore;
+        _logger.LogInformation(
+            "Yahoo catalog price batch complete: {Count} inserted; more prices: {HasMore}",
+            result.Inserted,
+            result.HasMore
+        );
+        if (includeEnrichment)
+            await ImportEnrichment(
+                targets.Where(target => target.IsPrimary).ToList(),
+                cancellationToken,
+                maximumBatchSize: 25
+            );
     }
 
     private async Task<List<PriceSeriesTarget>> BuildPriceSeriesTargets(
@@ -255,7 +311,7 @@ public class YahooPriceImportService
     private static bool IsCatalogMarket(PriceSeriesTarget target) =>
         target.IsUs || YahooListingSource.Market(target) != null;
 
-    private async Task<List<PriceSeriesTarget>> BuildCatalogPriceTargets(
+    internal async Task<List<PriceSeriesTarget>> BuildCatalogPriceTargets(
         CancellationToken cancellationToken
     )
     {
@@ -267,11 +323,11 @@ public class YahooPriceImportService
             var claims = MarketClaims(repository, market);
             rows.AddRange(
                 await claims
+                    .WithDirectoryInstrumentIdentity()
                     .Where(listing =>
                         listing.IdentityState == EquityIdentityState.Verified
                         && listing.TradingCurrency != null
                         && listing.QuoteUnitMultiplier != null
-                        && listing.Security.Isin != null
                         && claims.Count(other => other.Ticker == listing.Ticker) == 1
                     )
                     // The presentation listing is the issuer's enrichment target and carries the
@@ -291,11 +347,13 @@ public class YahooPriceImportService
                         listing.Security.Isin,
                         listing.TradingCurrency,
                         listing.QuoteUnitMultiplier,
-                        listing.YahooPriceSyncAttemptedAt
+                        listing.YahooPriceSyncAttemptedAt,
+                        listing.EquitySecurityId
                     ))
                     .ToListAsync(cancellationToken)
             );
         }
+        rows.RemoveAll(target => target.ProviderSymbol == null);
         if (_workerOptions.TickersToSync.Count == 0)
             return rows;
         var requested = _workerOptions.TickersToSync.ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -339,7 +397,13 @@ public class YahooPriceImportService
             .Include(listing => listing.Security)
             .Take(2)
             .ToListAsync(token);
-        return claims.Count == 1 && YahooListingSource.MatchesListing(target, claims[0]);
+        return claims.Count == 1
+            && YahooListingSource.MatchesListing(target, claims[0])
+            && await repository
+                .GetSecurities()
+                .SelectMany(security => security.Listings)
+                .WithDirectoryInstrumentIdentity()
+                .AnyAsync(listing => listing.Id == target.EquityListingId, token);
     }
 
     private async Task<List<PriceSeriesTarget>> BuildHistoricalPriceTargets(
@@ -472,22 +536,29 @@ public class YahooPriceImportService
     private async Task<int> ImportPrices(
         List<PriceSeriesTarget> crawlOrder,
         CancellationToken cancellationToken
+    ) => (await ImportPriceBatch(crawlOrder, cancellationToken, int.MaxValue)).Inserted;
+
+    private async Task<(int Inserted, bool HasMore)> ImportPriceBatch(
+        List<PriceSeriesTarget> crawlOrder,
+        CancellationToken cancellationToken,
+        int attemptLimit
     )
     {
         var totalInserted = 0;
         var fetched = 0;
         var fetchedWithNothingNew = 0;
+        var attempted = 0;
 
         foreach (var target in crawlOrder)
         {
+            if (attempted >= attemptLimit)
+                return (totalInserted, true);
             var ticker = target.Ticker;
             cancellationToken.ThrowIfCancellationRequested();
 
-            // Resolved per ticker, not once per cycle: a multi-hour crawl straddles the UTC
-            // midnight rollover, and a cycle-start snapshot would keep excluding the just-settled
-            // bar for every stock processed after midnight — a cycle starting 23:50 UTC used to
-            // ship a whole day late for the entire universe.
-            var today = DateOnly.FromDateTime(DateTime.UtcNow);
+            // Resolve per ticker: a long crawl can cross either a venue's post-close boundary
+            // or UTC midnight. US and historical series retain their original UTC-date rule.
+            var today = YahooListingSource.SettledBefore(target, DateTime.UtcNow);
 
             try
             {
@@ -495,6 +566,7 @@ public class YahooPriceImportService
                 totalInserted += result.Inserted;
                 if (result.Fetched)
                 {
+                    attempted++;
                     fetched++;
                     if (result.Inserted == 0)
                         fetchedWithNothingNew++;
@@ -502,6 +574,7 @@ public class YahooPriceImportService
             }
             catch (HttpRequestException ex)
             {
+                attempted++;
                 _logger.LogWarning(ex, "Failed to fetch prices for {Ticker}, skipping", ticker);
                 await StampFailedAttempt(target, cancellationToken);
             }
@@ -513,6 +586,7 @@ public class YahooPriceImportService
             }
             catch (Exception ex)
             {
+                attempted++;
                 _logger.LogError(ex, "Error importing prices for {Ticker}", ticker);
                 await StampFailedAttempt(target, cancellationToken);
                 await _errorReporter.Report(
@@ -524,7 +598,7 @@ public class YahooPriceImportService
         }
 
         WarnIfUpstreamServedNothing(crawlOrder.Count, fetched, fetchedWithNothingNew);
-        return totalInserted;
+        return (totalInserted, false);
     }
 
     // A barren fetch — one that called the provider and inserted nothing — is only evidence of an
@@ -585,7 +659,8 @@ public class YahooPriceImportService
     // cycle's traffic, which is why it runs in restart-safe batches AND strictly after prices.
     private async Task ImportEnrichment(
         List<PriceSeriesTarget> crawlOrder,
-        CancellationToken cancellationToken
+        CancellationToken cancellationToken,
+        int maximumBatchSize = int.MaxValue
     )
     {
         var interval = TimeSpan.FromHours(Math.Max(0, _scraperOptions.EnrichmentIntervalHours));
@@ -593,7 +668,7 @@ public class YahooPriceImportService
             crawlOrder,
             DateTime.UtcNow,
             interval,
-            Math.Max(1, _scraperOptions.EnrichmentBatchSize)
+            Math.Min(maximumBatchSize, Math.Max(1, _scraperOptions.EnrichmentBatchSize))
         );
         HasEnrichmentBacklog = selection.Remaining > 0;
         if (selection.Targets.Count == 0)
@@ -891,7 +966,7 @@ public class YahooPriceImportService
 
             try
             {
-                await ReconcileStock(series, floor, today, cancellationToken);
+                await ReconcileStock(series, floor, today, cancellationToken, DateTime.UtcNow);
             }
             catch (HttpRequestException ex)
             {
@@ -923,11 +998,12 @@ public class YahooPriceImportService
         }
     }
 
-    private async Task ReconcileStock(
+    internal async Task ReconcileStock(
         PendingPriceReconciliationSeries selectedSeries,
         DateOnly floor,
         DateOnly today,
-        CancellationToken cancellationToken
+        CancellationToken cancellationToken,
+        DateTime? asOfUtc = null
     )
     {
         PriceSeriesTarget target;
@@ -970,7 +1046,8 @@ public class YahooPriceImportService
                 MarketIdentifierCode: listing.MarketIdentifierCode,
                 Isin: listing.Security.Isin,
                 TradingCurrency: listing.TradingCurrency,
-                QuoteUnitMultiplier: listing.QuoteUnitMultiplier
+                QuoteUnitMultiplier: listing.QuoteUnitMultiplier,
+                EquitySecurityId: listing.EquitySecurityId
             );
             if (
                 !IsCatalogMarket(target)
@@ -980,6 +1057,10 @@ public class YahooPriceImportService
                 return;
         }
 
+        // A replacement must admit the same settled venue session as the forward writer,
+        // or reconciliation after close would erase the newly stored current-day bar.
+        if (asOfUtc is { } now && !target.IsUs && !target.IsHistorical)
+            today = YahooListingSource.SettledBefore(target, now);
         var historyEndDate = target.HistoryEndDate ?? today;
         if (target.IsHistorical)
         {
@@ -1101,9 +1182,15 @@ public class YahooPriceImportService
             scope.ServiceProvider.GetRequiredService<EquityDailyStockPriceRepository>();
         var appliedSince = DateTime.UtcNow.AddDays(-AppliedSplitBasisAuditLookbackDays);
         var catalogMics = EquityMarketCatalog
-            .All.SelectMany(market => market.MarketIdentifierCodes)
+            .All.Where(market => market.YahooSuffix != null && market.YahooExchangeCode != null)
+            .SelectMany(market => market.MarketIdentifierCodes)
             .ToList();
 
+        var identityRepository = scope.ServiceProvider.GetRequiredService<EquityIssuerRepository>();
+        var identifiedListings = identityRepository
+            .GetSecurities()
+            .SelectMany(security => security.Listings)
+            .WithDirectoryInstrumentIdentity();
         var boundaries = await splitRepository
             .GetAll()
             .Where(split =>
@@ -1112,7 +1199,7 @@ public class YahooPriceImportService
                 && (
                     split.Listing.MarketCountryCode == "US"
                     || catalogMics.Contains(split.Listing.MarketIdentifierCode)
-                        && split.Listing.Security.Isin != null
+                        && identifiedListings.Any(listing => listing.Id == split.EquityListingId)
                 )
                 && split.EffectiveDate < today
                 && split.Numerator > 0m
@@ -1430,6 +1517,19 @@ public class YahooPriceImportService
                 : target.EquityListingId;
             var priceListingId = target.EquityListingId;
             if (recordedSymbolListingId != priceListingId)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return false;
+            }
+            // Another price worker can cross the local settlement boundary while this fetch is
+            // in flight. Keep the complete newer series and retry with a current response rather
+            // than mixing its new session with a replacement fetched on the previous basis.
+            if (
+                !target.IsUs
+                && !target.IsHistorical
+                && await repo.GetByListing(priceListingId)
+                    .AnyAsync(row => row.Date >= settledBefore, cancellationToken)
+            )
             {
                 await transaction.RollbackAsync(cancellationToken);
                 return false;
@@ -3242,7 +3342,7 @@ public class YahooPriceImportService
         var covered =
             latestVenueOwned != null
             && (latestYahooOwned == null || latestVenueOwned > latestYahooOwned);
-        if (covered)
+        if (covered && latestVenueOwned >= today.AddDays(-1))
         {
             var interval = TimeSpan.FromHours(
                 Math.Max(1, options.CoveredListingFetchIntervalHours)
@@ -3256,10 +3356,10 @@ public class YahooPriceImportService
             ResettleWindowStart(today, options.VolumeResettleWindowDays),
             today.AddDays(-GapHealWindowDays)
         );
-        // A covered listing's feed rows are only ever the pre-venue tail, so its fetch is the recent
-        // window alone instead of everything since the frozen latest date.
+        // Start from the newer venue observation, but a stale venue cannot suppress a
+        // missing settled session or shorten the uncovered gap to the resettle window.
         if (covered)
-            return bounded;
+            return Min(latestVenueOwned.Value.AddDays(1), bounded);
         var forwardOnly = latestYahooOwned.Value.AddDays(1);
         return forwardOnly < today ? Min(forwardOnly, bounded) : forwardOnly;
     }

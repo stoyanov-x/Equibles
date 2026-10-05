@@ -55,7 +55,10 @@
 - `EquityIssuerSourceIdentifier` binds an exact provider issuer code to a native issuer and immutable capture evidence; it contains no route records.
 - Match existing issuers by exact source identifier, LEI, ISIN, or a current U.S. security CUSIP explicitly connected through GLEIF's complete ISIN-to-LEI relationship set; never match names or old CUSIP aliases.
 - Conflicting owners, legal identifiers, venue symbols, or quotation units reject the identity write atomically; a failed import discards its tracked graph.
-- Securities remain distinct by ISIN; a shared issuer never merges an ADR with its underlying share, and the source's broad `STOCK` type remains unclassified.
+- Securities remain distinct by ISIN or an explicitly supplied source security identifier; a shared issuer never merges an ADR with its underlying share, and the source's broad `STOCK` type remains unclassified.
+- Sources without public ISINs must supply both `SourceSecurityIdentifier` and `SourceListingIdentifier`; missing ISINs never match other missing ISINs, and ticker/name similarity never joins issuers.
+- `EquitySecuritySourceIdentifier` and `EquityListingSourceIdentifier` retain exact source bindings and immutable evidence. A later valid ISIN may enrich the same security, but conflicting bindings fail atomically.
+- Separate source listing identifiers permit multiple currency counters for one security on one venue; replay and explicit source-identity renames preserve each listing independently, while a retired source listing cannot be silently reactivated.
 - Preserve existing issuer profiles and presentation listings; new venues retain their own prices and symbols, and native rename history remains intact.
 - GLEIF capture requires exact issuer identity, complete unique related ISINs, stable publication/total metadata, and source-provided same-origin pagination without added filters; related ISINs are read 200 a page at a shared pace of 60 requests a minute, with throttled and failed requests retried after an exponential backoff.
 - An issuer whose reported ISIN total exceeds 2,000 is not enumerated: the capture records only the requested ISIN, which the lookup itself confirmed, plus the reported total. Such an issuer still joins an existing row by source identifier, LEI or the exact ISIN, but not through a sibling ISIN or a sibling's embedded CUSIP, so a row known only under a sibling identifier (a depositary receipt captured without an LEI) would be created a second time rather than joined or refused.
@@ -93,8 +96,19 @@
 
 ## Market capture
 
+- Beijing uses the ISO [BJSE market identifier](https://www.iso20022.org/sites/default/files/ISO10383_MIC/ISO10383_MIC.csv), CNY quotations and Asia/Shanghai time. Continuous trading ends at 14:57 and the closing auction ends at 15:00 under [BSE trading rules section 2.3.2](https://www.bse.cn/jygl_list/200028217.html).
+- A registered market can lack an available price provider; absent symbol suffix and exchange-code fields must remain null together, and no provider identity may be guessed from the venue name. Split-basis audits must retain applied markers when that provider cannot reconcile the market.
+
+- London directory discovery resumes from the edition in its last committed snapshot, crosses publication gaps, and fails if its search budget ends before the terminal gap; an incomplete search must never reconcile an older workbook as current.
+
 - Every catalog market with a directory adapter is captured; there is no per-market switch. `EquityMarketDirectoryWorker` runs each such market's directory pass within a minute of start-up, once `FirdsUniverseWorker` has stored a full set for the market's authority, and again once a day.
-- Prices, quotation evidence and corporate actions are captured for every verified listing on a catalog market; a verified listing only exists because a directory pass created it.
+- Prices, quotation evidence and corporate actions are captured for every verified listing on a catalog market. An instrument without an ISIN also requires paired security/listing identifiers from the same authoritative directory; price writes bind its immutable security ID.
+- Catalog daily-price imports admit a session thirty minutes after the later of its configured continuous close and closing-auction end, in the venue's timezone. Forward imports and complete history replacements use the same exclusive date cutoff; US and retired-series rules remain unchanged. A returned bar is still required, so weekends and holidays never create observations.
+- Catalog prices run independently from US corporate-action recovery in batches of at most 200 attempted listings. Persisted attempt times rotate unfinished work across restarts; four recently trading listings alternate with one backfill when both groups have work. Recent series retry after five minutes and dormant or unpriced series after one hour. Existing provider pacing and identity/write guards still apply.
+- Catalog enrichment runs after price batches finish; the US worker retains global corporate-action reconciliation and excludes duplicate catalog forward imports.
+- Shanghai, Shenzhen and Hong Kong have quotation metadata in the catalog; their official directories are supplied by the host rather than FIRDS. Catalog registration alone creates no active listings. Hong Kong requires its canonical five-digit numeric exchange code before converting to the provider’s four-digit minimum width; alternate spellings are ineligible, so two source tickers cannot normalize to one price symbol.
+- Complete source-identified snapshots validate every referenced binding, including withdrawn listings, before changing current claims. Each listing identifier records its own directory claim; a shared listing remains active until its last current claim disappears, preserving separate currency counters and other directories’ listings. Withdrawal revokes capture eligibility without inventing a delisting date; reappearance and renaming preserve the original listing identity.
+- Optional authoritative security type and admission date enrich unknown metadata; contradictory values reject the complete row transaction.
 - `EquityMarketRegistration` holds one row per catalog market recording pass state only: the last refresh, the last directory counts, the last error, and a refresh request. Setting `DirectoryRefreshRequestedAt = now()` on an adapter market's row runs its pass on the next control tick.
 - The `Enabled` column is retired and unread; a later migration drops it.
 
@@ -111,3 +125,8 @@
 - Native import preflight retains the stored full-grain/CUSIP observation key before assembling both position and manager writes.
 - A permanent insert guard refuses incompatible keys from unprepared writers before they can alter either positions or another security’s allocations.
 - Both generations serialize on native issuer locks; original position IDs, source facts and attribution IDs remain intact through replay and final storage retirement.
+
+- Each catalog price batch reserves at most 25 due enrichment attempts, even when price retries replenish the queue.
+- Within each market's recent-price queue, listings missing a settled close precede already-current series; oldest-attempt ordering still rotates each group across restarts.
+- A newer venue-owned bar permits the longer fallback interval only while it covers the latest settled date; stale venue coverage resumes from its last observation through the normal resettle window.
+- A non-US history replacement refuses a response whose settlement cutoff predates an already stored session; the next reconciliation fetches a complete current basis.

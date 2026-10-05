@@ -1,7 +1,6 @@
 using Equibles.CommonStocks.Data.Models;
 using Equibles.CommonStocks.Repositories;
 using Equibles.Core.AutoWiring;
-using Equibles.Core.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -15,7 +14,7 @@ public class EquityDirectoryIdentityImporter(IServiceScopeFactory scopeFactory)
         CancellationToken cancellationToken = default
     )
     {
-        Validate(input);
+        EquityDirectoryListingInputValidator.Validate(input);
         // Failed identity writes discard their complete tracked graph; no later save can leak it.
         await using var scope = scopeFactory.CreateAsyncScope();
         var issuers = scope.ServiceProvider.GetRequiredService<EquityIssuerRepository>();
@@ -52,7 +51,18 @@ public class EquityDirectoryIdentityImporter(IServiceScopeFactory scopeFactory)
                 row => row.Source == input.Source && row.Identifier == input.SourceIssuerIdentifier,
                 cancellationToken
             );
-        var issuer = await ResolveIssuer(issuers, input, sourceIdentifier, cancellationToken);
+        var instruments = await EquityDirectoryInstrumentIdentity.Read(
+            issuers,
+            input,
+            cancellationToken
+        );
+        var issuer = await ResolveIssuer(
+            issuers,
+            input,
+            sourceIdentifier,
+            instruments.IssuerIds,
+            cancellationToken
+        );
         if (issuer == null)
         {
             issuer = new EquityIssuer
@@ -78,28 +88,14 @@ public class EquityDirectoryIdentityImporter(IServiceScopeFactory scopeFactory)
             if (string.IsNullOrWhiteSpace(issuer.Name))
                 issuer.Name = input.IssuerName;
         }
-        var security = issuer.Securities.SingleOrDefault(row => row.Isin == input.Isin);
-        if (security == null)
-        {
-            security = new EquitySecurity
-            {
-                Issuer = issuer,
-                Isin = input.Isin,
-                IdentitySourceUrl = input.SourceUrl,
-            };
-            issuer.Securities.Add(security);
-        }
-        var existing = security
-            .Listings.Where(row =>
-                row.MarketIdentifierCode == input.MarketIdentifierCode
-                && (row.Active || input.DirectorySnapshotId.HasValue && row.DelistedOn == null)
-            )
+        issuer.NameAliases = issuer
+            .NameAliases.Concat(input.IssuerNameAliases)
+            .Append(input.IssuerName)
+            .Select(name => name.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
-        if (existing.Count > 1)
-            throw new InvalidDataException(
-                "Directory security has multiple eligible listing identities on this venue."
-            );
-        var listing = existing.SingleOrDefault();
+        var security = instruments.Security(issuer);
+        var listing = instruments.Listing(security);
         var existingListingId = listing?.Id ?? Guid.Empty;
         if (
             await listings
@@ -139,6 +135,15 @@ public class EquityDirectoryIdentityImporter(IServiceScopeFactory scopeFactory)
             throw new InvalidDataException(
                 "Directory quotation units conflict with the existing listing."
             );
+        if (
+            input.ListedOn.HasValue
+            && listing.ListedOn.HasValue
+            && input.ListedOn != listing.ListedOn
+        )
+            throw new InvalidDataException(
+                "Directory admission date conflicts with the recorded listing."
+            );
+        listing.ListedOn ??= input.ListedOn;
         listing.MarketCountryCode ??= input.MarketCountryCode;
         listing.Ticker = input.Ticker;
         listing.TradingCurrency ??= input.TradingCurrency;
@@ -165,6 +170,7 @@ public class EquityDirectoryIdentityImporter(IServiceScopeFactory scopeFactory)
                     SourceRecordId = recordId,
                 }
             );
+        instruments.Bind(issuers, listing, recordId);
         await issuers.SaveChanges();
         await transaction.CommitAsync(cancellationToken);
         return listing.Id;
@@ -174,10 +180,11 @@ public class EquityDirectoryIdentityImporter(IServiceScopeFactory scopeFactory)
         EquityIssuerRepository repository,
         EquityDirectoryListingInput input,
         EquityIssuerSourceIdentifier sourceIdentifier,
+        IEnumerable<Guid> instrumentIssuerIds,
         CancellationToken cancellationToken
     )
     {
-        var candidates = new HashSet<Guid>();
+        var candidates = new HashSet<Guid>(instrumentIssuerIds);
         if (sourceIdentifier != null)
             candidates.Add(sourceIdentifier.EquityIssuerId);
         if (input.LegalEntityIdentifier != null)
@@ -189,7 +196,9 @@ public class EquityDirectoryIdentityImporter(IServiceScopeFactory scopeFactory)
             );
         var related =
             input.LegalEntityIdentifier == null
-                ? new List<string> { input.Isin }
+                ? input.Isin == null
+                    ? new List<string>()
+                    : new List<string> { input.Isin }
                 : input.RelatedIsins;
         // ISO 6166 embeds the national CUSIP only in US/CA ISINs; this never classifies the security.
         var cusips = related
@@ -204,7 +213,7 @@ public class EquityDirectoryIdentityImporter(IServiceScopeFactory scopeFactory)
             await repository
                 .GetSecurities()
                 .Where(row =>
-                    row.Isin == input.Isin
+                    input.Isin != null && row.Isin == input.Isin
                     || input.LegalEntityIdentifier != null
                         && (
                             row.Isin != null && related.Contains(row.Isin)
@@ -225,42 +234,4 @@ public class EquityDirectoryIdentityImporter(IServiceScopeFactory scopeFactory)
             );
         return candidates.Count == 0 ? null : await repository.Get(candidates.Single());
     }
-
-    private static void Validate(EquityDirectoryListingInput input)
-    {
-        if (
-            input == null
-            || string.IsNullOrWhiteSpace(input.Source)
-            || input.Source.Length > 64
-            || string.IsNullOrWhiteSpace(input.SourceIssuerIdentifier)
-            || input.SourceIssuerIdentifier.Length > 128
-            || string.IsNullOrWhiteSpace(input.IssuerName)
-            || input.IssuerName.Length > 500
-            || !InternationalSecurityIdentifiers.IsValidIsin(input.Isin)
-            || input.LegalEntityIdentifier != null
-                && !InternationalSecurityIdentifiers.IsValidLei(input.LegalEntityIdentifier)
-            || input.RelatedIsins == null
-            || input.RelatedIsins.Any(isin => !InternationalSecurityIdentifiers.IsValidIsin(isin))
-            || input.LegalEntityIdentifier != null && !input.RelatedIsins.Contains(input.Isin)
-            || !Identifier(input.MarketIdentifierCode, 4)
-            || !Identifier(input.MarketCountryCode, 2)
-            || string.IsNullOrWhiteSpace(input.Ticker)
-            || input.Ticker.Length > 32
-            || input.Ticker != input.Ticker.Trim()
-            || input.TradingCurrency != null && !Identifier(input.TradingCurrency, 3)
-            || input.QuoteUnitMultiplier is <= 0
-            || (input.TradingCurrency == null) != (input.QuoteUnitMultiplier == null)
-            || !Uri.TryCreate(input.SourceUrl, UriKind.Absolute, out var url)
-            || url.Scheme != "https"
-            || input.SourceUrl.Length > 256
-            || string.IsNullOrWhiteSpace(input.PayloadJson)
-        )
-            throw new InvalidDataException(
-                "Directory listing input lacks complete source identity."
-            );
-    }
-
-    private static bool Identifier(string value, int length) =>
-        value?.Length == length
-        && value.All(character => character is >= 'A' and <= 'Z' or >= '0' and <= '9');
 }

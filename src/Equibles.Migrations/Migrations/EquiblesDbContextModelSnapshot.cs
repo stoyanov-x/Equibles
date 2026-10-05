@@ -330,6 +330,12 @@ namespace Equibles.Migrations.Migrations
                         .HasMaxLength(500)
                         .HasColumnType("character varying(500)");
 
+                    b.PrimitiveCollection<List<string>>("NameAliases")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("text[]")
+                        .HasDefaultValueSql("ARRAY[]::text[]");
+
                     b.PrimitiveCollection<List<string>>("SecondaryCiks")
                         .HasColumnType("text[]");
 
@@ -682,6 +688,43 @@ namespace Equibles.Migrations.Migrations
                     b.ToTable("EquityListingRetirementEvidence");
                 });
 
+            modelBuilder.Entity("Equibles.CommonStocks.Data.Models.EquityListingSourceIdentifier", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("EquityListingId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Identifier")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<bool>("IsDirectoryListed")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("Source")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<Guid>("SourceRecordId")
+                        .HasColumnType("uuid");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("EquityListingId");
+
+                    b.HasIndex("SourceRecordId");
+
+                    b.HasIndex("Source", "Identifier")
+                        .IsUnique();
+
+                    b.ToTable("EquityListingSourceIdentifier");
+                });
+
             modelBuilder.Entity("Equibles.CommonStocks.Data.Models.EquityListingTickerAlias", b =>
                 {
                     b.Property<Guid>("EquityListingId")
@@ -748,6 +791,40 @@ namespace Equibles.Migrations.Migrations
                         .IsUnique();
 
                     b.ToTable("EquitySecurity");
+                });
+
+            modelBuilder.Entity("Equibles.CommonStocks.Data.Models.EquitySecuritySourceIdentifier", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("EquitySecurityId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Identifier")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("Source")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<Guid>("SourceRecordId")
+                        .HasColumnType("uuid");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("EquitySecurityId");
+
+                    b.HasIndex("SourceRecordId");
+
+                    b.HasIndex("Source", "Identifier")
+                        .IsUnique();
+
+                    b.ToTable("EquitySecuritySourceIdentifier");
                 });
 
             modelBuilder.Entity("Equibles.CommonStocks.Data.Models.Taxonomies.Industry", b =>
@@ -5060,6 +5137,25 @@ namespace Equibles.Migrations.Migrations
                     b.Navigation("Issuer");
                 });
 
+            modelBuilder.Entity("Equibles.CommonStocks.Data.Models.EquityListingSourceIdentifier", b =>
+                {
+                    b.HasOne("Equibles.CommonStocks.Data.Models.EquityListing", "Listing")
+                        .WithMany("SourceIdentifiers")
+                        .HasForeignKey("EquityListingId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("Equibles.CommonStocks.Data.Models.EquityDirectorySourceRecord", "SourceRecord")
+                        .WithMany()
+                        .HasForeignKey("SourceRecordId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("Listing");
+
+                    b.Navigation("SourceRecord");
+                });
+
             modelBuilder.Entity("Equibles.CommonStocks.Data.Models.EquityListingTickerAlias", b =>
                 {
                     b.HasOne("Equibles.CommonStocks.Data.Models.EquityListing", "Listing")
@@ -5080,6 +5176,25 @@ namespace Equibles.Migrations.Migrations
                         .IsRequired();
 
                     b.Navigation("Issuer");
+                });
+
+            modelBuilder.Entity("Equibles.CommonStocks.Data.Models.EquitySecuritySourceIdentifier", b =>
+                {
+                    b.HasOne("Equibles.CommonStocks.Data.Models.EquitySecurity", "Security")
+                        .WithMany("SourceIdentifiers")
+                        .HasForeignKey("EquitySecurityId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("Equibles.CommonStocks.Data.Models.EquityDirectorySourceRecord", "SourceRecord")
+                        .WithMany()
+                        .HasForeignKey("SourceRecordId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("Security");
+
+                    b.Navigation("SourceRecord");
                 });
 
             modelBuilder.Entity("Equibles.CommonStocks.Data.Models.Taxonomies.Industry", b =>
@@ -5756,12 +5871,16 @@ namespace Equibles.Migrations.Migrations
                 {
                     b.Navigation("Presentation");
 
+                    b.Navigation("SourceIdentifiers");
+
                     b.Navigation("TickerAliases");
                 });
 
             modelBuilder.Entity("Equibles.CommonStocks.Data.Models.EquitySecurity", b =>
                 {
                     b.Navigation("Listings");
+
+                    b.Navigation("SourceIdentifiers");
                 });
 
             modelBuilder.Entity("Equibles.Congress.Data.Models.CongressMember", b =>

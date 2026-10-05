@@ -28,6 +28,29 @@ public class YahooListingSourceTests
         );
 
     [Fact]
+    public void BeijingDoesNotInventAPriceProviderIdentity()
+    {
+        var target = Target("920000", "CN", "BJSE", "CNE1000048X1", "CNY");
+        YahooListingSource.Market(target).Should().BeNull();
+        YahooListingSource.ProviderSymbol(target).Should().BeNull();
+        YahooListingSource.ProviderSymbol("920000", "CN", "BJSE").Should().BeNull();
+        YahooListingSource
+            .MatchesChart(
+                target,
+                new YahooChartSourceIdentity
+                {
+                    Symbol = "920000.BJ",
+                    Currency = "CNY",
+                    ExchangeCode = "BSE",
+                    InstrumentType = "EQUITY",
+                    ExchangeTimeZone = "Asia/Shanghai",
+                }
+            )
+            .Should()
+            .BeFalse();
+    }
+
+    [Fact]
     public void LondonQuotesInPenceAndAFewOfItsLinesInAnotherCurrency()
     {
         var pence = Target("BT-A", "GB", "XLON", "GB0030913577", "GBP", 0.01m);
@@ -128,6 +151,15 @@ public class YahooListingSourceTests
     [InlineData("11B", "PL", "XWAR", "11B.WA")]
     [InlineData("4BB", "GB", "AIMX", "4BB.L")]
     [InlineData("BT-A", "GB", "XLON", "BT-A.L")]
+    [InlineData("600000", "CN", "XSHG", "600000.SS")]
+    [InlineData("000001", "CN", "XSHE", "000001.SZ")]
+    [InlineData("00001", "HK", "XHKG", "0001.HK")]
+    [InlineData("80700", "HK", "XHKG", "80700.HK")]
+    [InlineData("0001", "HK", "XHKG", null)]
+    [InlineData("1", "HK", "XHKG", null)]
+    [InlineData("ALPHA", "HK", "XHKG", null)]
+    [InlineData("00000", "HK", "XHKG", null)]
+    [InlineData("920000", "CN", "BJSE", null)]
     [InlineData("NESN", "CH", "XSWX", null)]
     [InlineData("AIR", "FR", "XETR", null)]
     [InlineData("AIR", "FR", null, null)]
@@ -239,6 +271,60 @@ public class YahooListingSourceTests
         listing.TradingCurrency = "EUR";
         listing.IdentityState = EquityIdentityState.Legacy;
         YahooListingSource.MatchesListing(target, listing).Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("600000", "CN", "XSHG", "CNY", "600000.SS", "SHH", "Asia/Shanghai")]
+    [InlineData("000001", "CN", "XSHE", "CNY", "000001.SZ", "SHZ", "Asia/Shanghai")]
+    [InlineData("00001", "HK", "XHKG", "HKD", "0001.HK", "HKG", "Asia/Hong_Kong")]
+    public void SourceIdentifiedInstrumentWithoutIsinStillRequiresExactChartAndListingIdentity(
+        string ticker,
+        string country,
+        string mic,
+        string currency,
+        string symbol,
+        string exchange,
+        string zone
+    )
+    {
+        var securityId = Guid.NewGuid();
+        var target = Target(ticker, country, mic, null, currency) with
+        {
+            EquitySecurityId = securityId,
+        };
+        var chart = new YahooChartSourceIdentity
+        {
+            Symbol = symbol,
+            Currency = currency,
+            ExchangeCode = exchange,
+            InstrumentType = "EQUITY",
+            ExchangeTimeZone = zone,
+        };
+        target.ProviderSymbol.Should().Be(symbol);
+        YahooListingSource.MatchesChart(target, chart).Should().BeTrue();
+        YahooListingSource.SourceBinding(target).EquitySecurityId.Should().Be(securityId);
+        var listing = new EquityListing
+        {
+            Id = target.EquityListingId,
+            EquitySecurityId = securityId,
+            Security = new EquitySecurity
+            {
+                Id = securityId,
+                EquityIssuerId = target.EquityIssuerId,
+            },
+            Ticker = ticker,
+            MarketCountryCode = country,
+            MarketIdentifierCode = mic,
+            TradingCurrency = currency,
+            QuoteUnitMultiplier = 1m,
+            IdentityState = EquityIdentityState.Verified,
+        };
+        YahooListingSource.MatchesListing(target, listing).Should().BeTrue();
+        listing.EquitySecurityId = Guid.NewGuid();
+        YahooListingSource.MatchesListing(target, listing).Should().BeFalse();
+        chart.Currency = "USD";
+        YahooListingSource.MatchesChart(target, chart).Should().BeFalse();
+        (target with { EquitySecurityId = null }).ProviderSymbol.Should().BeNull();
     }
 
     [Fact]
