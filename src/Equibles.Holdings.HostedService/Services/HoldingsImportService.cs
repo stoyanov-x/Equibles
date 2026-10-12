@@ -14,6 +14,7 @@ using Equibles.CorporateActions.Data.Models;
 using Equibles.Data;
 using Equibles.Errors.BusinessLogic;
 using Equibles.Errors.Data.Models;
+using Equibles.Holdings.BusinessLogic;
 using Equibles.Holdings.Data.Models;
 using Equibles.Holdings.HostedService.Extensions;
 using Equibles.Holdings.HostedService.Models;
@@ -108,15 +109,21 @@ public class HoldingsImportService
             ConfirmedZeroRestatement = confirmedZeroRestatement,
         };
 
+        // Every return before UpsertInstitutionalHolders precedes all holdings writes, so it
+        // reports HoldingsUntouched.
         var parseResult = await ParseSubmissions(context, cancellationToken);
         if (parseResult == null)
-            return new ImportResult(0, IsComplete: false);
+            return new ImportResult(0, IsComplete: false, HoldingsUntouched: true);
         if (parseResult == false)
-            return new ImportResult(0, IsComplete: true);
+            return new ImportResult(0, IsComplete: true, HoldingsUntouched: true);
         // Cover pages must parse BEFORE the dedup: whether a later filing supersedes
         // its original depends on the amendment type, which lives on the cover page.
         if (!await ParseCoverPages(context, cancellationToken))
-            return new ImportResult(context.Submissions.Count, IsComplete: false);
+            return new ImportResult(
+                context.Submissions.Count,
+                IsComplete: false,
+                HoldingsUntouched: true
+            );
         DeduplicateSubmissions(context);
         var submissionCount = context.Submissions.Count;
         await ParseSummaryPages(context, cancellationToken);
@@ -124,12 +131,23 @@ public class HoldingsImportService
         if (cusipResult == CusipMappingOutcome.NoInfoTable)
             // A malformed publication is not evidence of an empty quarter. Keep it
             // retryable so a corrected archive can recover without clearing a false success.
-            return new ImportResult(submissionCount, IsComplete: false);
-        if (cusipResult == CusipMappingOutcome.NoTrackedStocks && confirmedZeroRestatement == null)
-            // No tracked stock mapped — typically a cold start where the FTD
-            // scraper hasn't seeded CUSIPs yet. NOT terminal: leave the data
-            // set unprocessed so a later cycle backfills it once CUSIPs exist.
-            return new ImportResult(submissionCount, IsComplete: false, NoTrackedStocks: true);
+            return new ImportResult(submissionCount, IsComplete: false, HoldingsUntouched: true);
+        if (
+            cusipResult
+                is CusipMappingOutcome.NoTrackedStocks
+                    or CusipMappingOutcome.UntrackedPositionsOnly
+            && confirmedZeroRestatement == null
+        )
+            // No tracked stock mapped, typically a cold start before CUSIPs seed: leave the data
+            // set unprocessed for a later cycle. UntrackedPositionsOnly tells a single-filing
+            // caller the directory is seeded, so the filing itself has nothing to track.
+            return new ImportResult(
+                submissionCount,
+                IsComplete: false,
+                NoTrackedStocks: true,
+                HoldingsUntouched: true,
+                UntrackedPositionsOnly: cusipResult == CusipMappingOutcome.UntrackedPositionsOnly
+            );
         await BuildPriceMap(context, cancellationToken);
         await BuildSplitMap(context, cancellationToken);
         await ParseOtherManagers(context, cancellationToken);
@@ -289,11 +307,24 @@ public class HoldingsImportService
             return null;
 
         var submissions = new Dictionary<string, SubmissionRow>(StringComparer.OrdinalIgnoreCase);
+        var offQuarter = new List<string>();
         await foreach (var row in context.TsvParser.ParseEntry(submissionEntry))
         {
             if (TryParseSubmissionRow(row, context.MinReportDate, out var submission))
                 submissions[submission.AccessionNumber] = submission;
+            else if (
+                IsForm13FOutsideQuarterEnd(row)
+                && TryParseDateOnly(GetValue(row, "PERIODOFREPORT"), out var period)
+                && period >= context.MinReportDate
+            )
+                offQuarter.Add(GetValue(row, AccessionNumberColumn));
         }
+        if (offQuarter.Count > 0)
+            _logger.LogWarning(
+                "Refused {Count} 13F submission(s) whose period of report is not a calendar quarter end, e.g. {Accession}",
+                offQuarter.Count,
+                offQuarter[0]
+            );
 
         if (submissions.Count == 0)
         {
@@ -330,6 +361,8 @@ public class HoldingsImportService
             && reportDateCheck < minReportDate
         )
             return false;
+        if (IsForm13FOutsideQuarterEnd(row))
+            return false;
 
         submission = new SubmissionRow
         {
@@ -341,6 +374,14 @@ public class HoldingsImportService
         };
         return true;
     }
+
+    // Form 13F reports as of a calendar quarter end; any other period is a filer or parser error
+    // that would publish a phantom quarter on every stock the filer holds, so the row is refused.
+    internal static bool IsForm13FOutsideQuarterEnd(Dictionary<string, string> row) =>
+        GetValue(row, "SUBMISSIONTYPE") is { } formType
+        && formType.ToHoldingsFilingType() == FilingType.Form13F
+        && TryParseDateOnly(GetValue(row, "PERIODOFREPORT"), out var period)
+        && !HoldingsCorpusCoverage.IsCalendarQuarterEnd(period);
 
     internal static void DeduplicateSubmissions(ImportContext context)
     {
@@ -431,6 +472,10 @@ public class HoldingsImportService
 
             TryParseDateOnly(submission.FilingDate, out var filingDate);
 
+            var confidentialOmitted = GetValue(row, "ISCONFIDENTIALOMITTED");
+            if (!string.IsNullOrWhiteSpace(confidentialOmitted))
+                context.ConfidentialOmittedByAccession[accession] = IsYes(confidentialOmitted);
+
             int? entryTotal = null;
             if (int.TryParse(GetValue(row, "TABLEENTRYTOTAL"), out var entries) && entries >= 0)
                 entryTotal = entries;
@@ -497,7 +542,6 @@ public class HoldingsImportService
             StateOrCountry = Get("FILINGMANAGER_STATEORCOUNTRY"),
             Form13FFileNumber = Get("FORM13FFILENUMBER"),
             CrdNumber = Get("CRDNUMBER"),
-            ConfidentialTreatment = Get("CONFIDENTIALTREATMENT"),
         };
         return true;
     }
@@ -510,6 +554,9 @@ public class HoldingsImportService
         Mapped,
         NoInfoTable,
         NoTrackedStocks,
+
+        // Source CUSIPs exist and none resolves while the directory already tracks CUSIPs.
+        UntrackedPositionsOnly,
     }
 
     private async Task<CusipMappingOutcome> BuildCusipMapping(
@@ -616,6 +663,22 @@ public class HoldingsImportService
 
         if (cusipMapping.Count == 0)
         {
+            // Placeholder rows (CUSIP 000000000), bonds, warrants and delisted or mistyped CUSIPs
+            // never resolve; with a seeded directory that is the filing's shape, not a cold start.
+            if (
+                uniqueCusips.Count > 0
+                && await query.AnyAsync(
+                    stock => stock.Securities.Any(security => security.Cusip != null),
+                    cancellationToken
+                )
+            )
+            {
+                _logger.LogInformation(
+                    "None of the {Count} source CUSIP(s) in this data set resolves to a tracked security",
+                    uniqueCusips.Count
+                );
+                return CusipMappingOutcome.UntrackedPositionsOnly;
+            }
             _logger.LogInformation(
                 "No tracked stocks mapped for this data set (CUSIPs may not be seeded yet) — will retry on a later cycle"
             );
@@ -966,7 +1029,15 @@ public class HoldingsImportService
             cikToHolderId[holder.Cik] = holder.Id;
         }
 
-        RefreshExistingHolderConfidentialTreatment(context, existingHolders);
+        var latestStoredReportDates = await holderRepo.GetLatest13FReportDates(
+            existingHolders.Select(holder => holder.Id).ToList(),
+            cancellationToken
+        );
+        RefreshExistingHolderConfidentialTreatment(
+            context,
+            existingHolders,
+            latestStoredReportDates
+        );
         CreateMissingHolders(context, existingHolders, holderRepo, cikToHolderId);
 
         await holderRepo.SaveChanges();
@@ -975,53 +1046,81 @@ public class HoldingsImportService
         context.CikToHolderId = cikToHolderId;
     }
 
-    // Refresh the confidential-treatment flag on holders we already track from
-    // their latest filing's cover page; their identity columns stay as first seen.
-    // Keyed by canonical CIK up front: a linear scan per holder is O(holders × submissions),
-    // which a quarterly bulk data set (~8k of each) turns into tens of millions of
-    // comparisons — and its first-match pick was import-order-arbitrary when a
-    // filer has several submissions (multiple quarters) in one data set.
+    // Refresh the confidential-treatment flag on holders we already track from their newest report
+    // in this import, unless a stored 13F covers a later quarter; identity columns stay as first seen.
     internal void RefreshExistingHolderConfidentialTreatment(
         ImportContext context,
-        List<InstitutionalHolder> existingHolders
+        List<InstitutionalHolder> existingHolders,
+        IReadOnlyDictionary<Guid, DateOnly> latestStoredReportDates
     )
     {
-        var latestByCanonicalCik = BuildLatestSubmissionByCanonicalCik(context.Submissions.Values);
+        var omittedByCanonicalCik = BuildLatestReportConfidentialOmission(context);
 
         foreach (var holder in existingHolders)
         {
             var canonicalCik = CikNormalizer.Canonicalize(holder.Cik);
             if (
                 canonicalCik == null
-                || !latestByCanonicalCik.TryGetValue(canonicalCik, out var submission)
+                || !omittedByCanonicalCik.TryGetValue(canonicalCik, out var report)
             )
                 continue;
-            context.CoverPages.TryGetValue(submission.AccessionNumber, out var cp);
-            if (cp != null)
-                holder.ConfidentialTreatmentRequested = IsYes(cp.ConfidentialTreatment);
+            if (
+                latestStoredReportDates.TryGetValue(holder.Id, out var storedPeriod)
+                && storedPeriod > report.Period
+            )
+                continue;
+            holder.ConfidentialTreatmentRequested = report.Omitted;
         }
     }
 
-    internal static Dictionary<string, SubmissionRow> BuildLatestSubmissionByCanonicalCik(
-        IEnumerable<SubmissionRow> submissions
-    )
+    // Whether each filer's newest report (latest original or RESTATEMENT for the newest period) omits
+    // confidential positions, by canonical CIK; a NEW HOLDINGS amendment only adds what it discloses.
+    internal static Dictionary<
+        string,
+        (DateOnly Period, bool Omitted)
+    > BuildLatestReportConfidentialOmission(ImportContext context)
     {
         var latestByCik = new Dictionary<string, SubmissionRow>(StringComparer.Ordinal);
-        foreach (var submission in submissions)
+        foreach (var submission in context.Submissions.Values)
         {
             var canonicalCik = CikNormalizer.Canonicalize(submission.Cik);
-            if (canonicalCik == null)
+            if (canonicalCik == null || IsNewHoldingsAmendment(submission.AccessionNumber, context))
                 continue;
             if (
                 !latestByCik.TryGetValue(canonicalCik, out var current)
-                || CompareByFilingDateThenAccession(submission, current) > 0
+                || CompareByPeriodThenFilingDate(submission, current) > 0
             )
             {
                 latestByCik[canonicalCik] = submission;
             }
         }
 
-        return latestByCik;
+        var omittedByCik = new Dictionary<string, (DateOnly Period, bool Omitted)>(
+            StringComparer.Ordinal
+        );
+        foreach (var (canonicalCik, submission) in latestByCik)
+        {
+            if (
+                context.ConfidentialOmittedByAccession.TryGetValue(
+                    submission.AccessionNumber,
+                    out var omitted
+                )
+            )
+            {
+                TryParseDateOnly(submission.PeriodOfReport, out var period);
+                omittedByCik[canonicalCik] = (period, omitted);
+            }
+        }
+
+        return omittedByCik;
+    }
+
+    internal static int CompareByPeriodThenFilingDate(SubmissionRow left, SubmissionRow right)
+    {
+        TryParseDateOnly(left.PeriodOfReport, out var leftPeriod);
+        TryParseDateOnly(right.PeriodOfReport, out var rightPeriod);
+        var byPeriod = leftPeriod.CompareTo(rightPeriod);
+        return byPeriod != 0 ? byPeriod : CompareByFilingDateThenAccession(left, right);
     }
 
     // The most recently filed submission per CIK — same ordering contract as
@@ -1069,6 +1168,7 @@ public class HoldingsImportService
             holder => holder.Cik,
             StringComparer.Ordinal
         );
+        var omittedByCanonicalCik = BuildLatestReportConfidentialOmission(context);
 
         foreach (var submission in context.Submissions.Values)
         {
@@ -1091,6 +1191,11 @@ public class HoldingsImportService
             }
 
             context.CoverPages.TryGetValue(submission.AccessionNumber, out var coverPage);
+            var canonicalCik = CikNormalizer.Canonicalize(submission.Cik);
+            var confidentialOmitted =
+                canonicalCik != null
+                && omittedByCanonicalCik.TryGetValue(canonicalCik, out var report)
+                && report.Omitted;
 
             // Cover-page strings are unbounded in the source TSV/XML; one over-length
             // value rejects the whole batch flush (22001) and discards the filing's
@@ -1104,7 +1209,7 @@ public class HoldingsImportService
                 Form13FFileNumber = ClampLength(coverPage?.Form13FFileNumber, 32),
                 CrdNumber = ClampLength(coverPage?.CrdNumber, 32),
                 Classification = FundClassifierService.Classify(coverPage?.CompanyName),
-                ConfidentialTreatmentRequested = IsYes(coverPage?.ConfidentialTreatment),
+                ConfidentialTreatmentRequested = confidentialOmitted,
             };
 
             holderRepo.Add(holder);
@@ -2089,13 +2194,35 @@ public class HoldingsImportService
             return new HoldingsFlushResult(0, SkippedStaleParent: true);
         TryParseDateOnly(submission.PeriodOfReport, out var reportDate);
         var filingType = submission.FormType.ToHoldingsFilingType() ?? FilingType.Form13F;
+        // Quarters this accession is also stored under, read before any lock so every book lock
+        // is taken ascending ahead of the issuer locks, the order every other writer uses.
+        var vacatedDates =
+            filingType == FilingType.Form13F && context.PeriodSweptAccessions.Add(accession)
+                ? await LoadDatesOutsideReportPeriod(
+                    dbContext,
+                    holderId,
+                    accession,
+                    reportDate,
+                    cancellationToken
+                )
+                : [];
         await using var transaction = await dbContext.Database.BeginTransactionAsync(
             cancellationToken
         );
-        var bookLock =
-            $"holdings-book:{holderId}:{reportDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)}:{(int)filingType}";
+        var bookLocks = vacatedDates
+            .Append(reportDate)
+            .Select(date =>
+                $"holdings-book:{holderId}:{date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)}:{(int)filingType}"
+            )
+            .OrderBy(key => key, StringComparer.Ordinal)
+            .ToArray();
         await dbContext.Database.ExecuteSqlInterpolatedAsync(
-            $"SELECT pg_advisory_xact_lock(hashtextextended({bookLock}, 0))",
+            $"""
+            WITH ordered_books AS MATERIALIZED (
+                SELECT key FROM unnest({bookLocks}) AS books(key) ORDER BY key
+            )
+            SELECT pg_advisory_xact_lock(hashtextextended(key, 0)) FROM ordered_books
+            """,
             cancellationToken
         );
         // Validate the stable issuer owner immediately before writing. Removing a legacy
@@ -2153,11 +2280,21 @@ public class HoldingsImportService
             row.Cusip = identity.Cusip;
             row.ListedTicker = identity.ListedTicker;
         }
+        if (vacatedDates.Count > 0)
+            await DeleteRowsOutsideReportPeriod(
+                dbContext,
+                holderId,
+                accession,
+                reportDate,
+                vacatedDates,
+                cancellationToken
+            );
         await HandleAmendment(dbContext, accession, context, cancellationToken);
         if (safeHoldings.Count == 0)
         {
             if (context.ConfirmedZeroRestatement is { } zero && zero.AccessionNumber == accession)
                 await StoreZeroRestatement(dbContext, zero, holderId, cancellationToken);
+            await MarkVacatedQuartersDirty(dbContext, vacatedDates, cancellationToken);
             await transaction.CommitAsync(cancellationToken);
             return new HoldingsFlushResult(0, SkippedStaleParent: false);
         }
@@ -2248,11 +2385,78 @@ public class HoldingsImportService
 
         await dbContext.SaveChangesAsync(cancellationToken);
 
+        // Stamped last: the snapshot rows carry the drain's lease, so they must not stay locked
+        // behind the position upsert.
+        await MarkVacatedQuartersDirty(dbContext, vacatedDates, cancellationToken);
         if (transaction != null)
             await transaction.CommitAsync(cancellationToken);
 
         return new HoldingsFlushResult(safeHoldings.Count, SkippedStaleParent: skipped > 0);
     }
+
+    // A filing's rows live only under its period of report; rows of this accession stored under
+    // any other quarter are stale labels of this same filing.
+    private static Task<List<DateOnly>> LoadDatesOutsideReportPeriod(
+        EquiblesFinancialDbContext dbContext,
+        Guid holderId,
+        string accession,
+        DateOnly reportDate,
+        CancellationToken cancellationToken
+    ) =>
+        dbContext
+            .Set<InstitutionalHolding>()
+            .Where(h =>
+                h.InstitutionalHolderId == holderId
+                && h.AccessionNumber == accession
+                && h.FilingType == FilingType.Form13F
+                && h.ReportDate != reportDate
+            )
+            .Select(h => h.ReportDate)
+            .Distinct()
+            .OrderBy(date => date)
+            .ToListAsync(cancellationToken);
+
+    // Runs under the book locks of every vacated date; a date that appeared after the read is
+    // swept by the accession's next import.
+    private async Task DeleteRowsOutsideReportPeriod(
+        EquiblesFinancialDbContext dbContext,
+        Guid holderId,
+        string accession,
+        DateOnly reportDate,
+        List<DateOnly> vacatedDates,
+        CancellationToken cancellationToken
+    )
+    {
+        var deleted = await dbContext
+            .Set<InstitutionalHolding>()
+            .Where(h =>
+                h.InstitutionalHolderId == holderId
+                && h.AccessionNumber == accession
+                && h.FilingType == FilingType.Form13F
+                && vacatedDates.Contains(h.ReportDate)
+            )
+            .ExecuteDeleteAsync(cancellationToken);
+        _logger.LogInformation(
+            "Deleted {Count} row(s) of 13F {Accession} stored under {StaleDates}; its period of report is {Period}",
+            deleted,
+            accession,
+            vacatedDates,
+            reportDate
+        );
+    }
+
+    private static Task MarkVacatedQuartersDirty(
+        EquiblesFinancialDbContext dbContext,
+        List<DateOnly> vacatedDates,
+        CancellationToken cancellationToken
+    ) =>
+        vacatedDates.Count == 0
+            ? Task.CompletedTask
+            : HoldingsRollupRefresher.MarkAumSnapshotsDirty(
+                dbContext,
+                vacatedDates,
+                cancellationToken
+            );
 
     private static async Task StoreZeroRestatement(
         EquiblesFinancialDbContext dbContext,

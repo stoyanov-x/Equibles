@@ -2786,11 +2786,11 @@ namespace Equibles.Migrations.Migrations
                         .HasDatabaseName("IX_InstitutionalHolding_StockQuarterExposure")
                         .HasAnnotation("Npgsql:CreatedConcurrently", true);
 
-                    NpgsqlIndexBuilderExtensions.IncludeProperties(b.HasIndex("EquityIssuerId", "ReportDate"), new[] { "InstitutionalHolderId", "Value", "Shares", "ListedTicker", "FilingType", "OptionType" });
+                    NpgsqlIndexBuilderExtensions.IncludeProperties(b.HasIndex("EquityIssuerId", "ReportDate"), new[] { "InstitutionalHolderId", "Value", "Shares", "ListedTicker", "FilingType", "OptionType", "ShareType" });
 
                     b.HasIndex("InstitutionalHolderId", "ReportDate");
 
-                    NpgsqlIndexBuilderExtensions.IncludeProperties(b.HasIndex("InstitutionalHolderId", "ReportDate"), new[] { "EquityIssuerId", "Value", "Shares", "FilingDate", "FilingType" });
+                    NpgsqlIndexBuilderExtensions.IncludeProperties(b.HasIndex("InstitutionalHolderId", "ReportDate"), new[] { "EquityIssuerId", "Value", "Shares", "FilingDate", "FilingType", "OptionType" });
 
                     b.HasIndex("ShareType", "Id")
                         .HasDatabaseName("IX_InstitutionalHolding_Principal")
@@ -2800,6 +2800,8 @@ namespace Equibles.Migrations.Migrations
                     b.HasIndex("EquityIssuerId", "ListedTicker", "ReportDate")
                         .HasDatabaseName("IX_InstitutionalHolding_ValuePending_Pairs")
                         .HasFilter("\"ValuePending\"");
+
+                    NpgsqlIndexBuilderExtensions.IncludeProperties(b.HasIndex("EquityIssuerId", "ListedTicker", "ReportDate"), new[] { "ShareType" });
 
                     b.HasIndex("EquityIssuerId", "ReportDate", "InstitutionalHolderId")
                         .HasDatabaseName("IX_InstitutionalHolding_StockQuarterCommonValue")
@@ -2812,14 +2814,21 @@ namespace Equibles.Migrations.Migrations
 
                     NpgsqlIndexBuilderExtensions.IncludeProperties(b.HasIndex("ReportDate", "EquityIssuerId", "InstitutionalHolderId"), new[] { "Shares", "Value" });
 
-                    b.HasIndex("ReportDate", "InstitutionalHolderId", "EquityIssuerId");
+                    b.HasIndex("ReportDate", "InstitutionalHolderId", "EquityIssuerId")
+                        .HasDatabaseName("IX_InstitutionalHolding_QuarterRebuild")
+                        .HasAnnotation("Npgsql:CreatedConcurrently", true);
 
-                    NpgsqlIndexBuilderExtensions.IncludeProperties(b.HasIndex("ReportDate", "InstitutionalHolderId", "EquityIssuerId"), new[] { "Shares", "Value" });
+                    NpgsqlIndexBuilderExtensions.IncludeProperties(b.HasIndex("ReportDate", "InstitutionalHolderId", "EquityIssuerId"), new[] { "Shares", "Value", "FilingType", "FilingDate", "AccessionNumber", "ListedTicker" });
 
                     b.HasIndex("EquityIssuerId", "InstitutionalHolderId", "ReportDate", "ShareType", "OptionType", "FilingType", "ListedTicker")
                         .IsUnique();
 
                     NpgsqlIndexBuilderExtensions.AreNullsDistinct(b.HasIndex("EquityIssuerId", "InstitutionalHolderId", "ReportDate", "ShareType", "OptionType", "FilingType", "ListedTicker"), false);
+
+                    b.HasIndex(new[] { "Id" }, "IX_InstitutionalHolding_FiledReviseRepair")
+                        .HasDatabaseName("IX_InstitutionalHolding_FiledReviseRepair")
+                        .HasFilter("NOT \"ValuePending\" AND \"ShareType\" = 0 AND NOT \"ValueUnavailable\" AND \"ValueSource\" = 1 AND \"FiledValue\" IS NOT NULL AND \"FiledValue\" > 0 AND \"Value\" = \"FiledValue\" AND \"Shares\" > 0")
+                        .HasAnnotation("Npgsql:CreatedConcurrently", true);
 
                     b.HasIndex(new[] { "Id" }, "IX_InstitutionalHolding_ImplausibleDerivationRepair")
                         .HasDatabaseName("IX_InstitutionalHolding_ImplausibleDerivationRepair")
@@ -2829,6 +2838,11 @@ namespace Equibles.Migrations.Migrations
                     b.HasIndex(new[] { "EquityIssuerId", "Shares" }, "IX_InstitutionalHolding_ImpossiblePositionRepair")
                         .HasDatabaseName("IX_InstitutionalHolding_ImpossiblePositionRepair")
                         .HasFilter("\"ShareType\" = 0 AND NOT \"ValueUnavailable\" AND \"Shares\" > 1000000")
+                        .HasAnnotation("Npgsql:CreatedConcurrently", true);
+
+                    b.HasIndex(new[] { "Id" }, "IX_InstitutionalHolding_UnmarkedZeroRepair")
+                        .HasDatabaseName("IX_InstitutionalHolding_UnmarkedZeroRepair")
+                        .HasFilter("\"Value\" = 0 AND NOT \"ValuePending\" AND NOT \"ValueUnavailable\" AND (\"FiledValue\" IS NULL OR \"FiledValue\" <= 0)")
                         .HasAnnotation("Npgsql:CreatedConcurrently", true);
 
                     b.ToTable("InstitutionalHolding");
@@ -3040,10 +3054,28 @@ namespace Equibles.Migrations.Migrations
                     b.Property<DateTime>("ComputedAt")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<int?>("CurrentFilerCount")
+                        .HasColumnType("integer");
+
                     b.Property<long>("CurrentShares")
                         .HasColumnType("bigint");
 
+                    b.Property<long?>("CurrentValue")
+                        .HasColumnType("bigint");
+
+                    b.Property<double?>("HolderValueSquaredSum")
+                        .HasColumnType("double precision");
+
                     b.Property<long>("PreviousShares")
+                        .HasColumnType("bigint");
+
+                    b.Property<long?>("TopFiveValue")
+                        .HasColumnType("bigint");
+
+                    b.Property<long?>("TopOneValue")
+                        .HasColumnType("bigint");
+
+                    b.Property<long?>("TopTenValue")
                         .HasColumnType("bigint");
 
                     b.HasKey("EquityIssuerId", "ReportDate", "IsCombined", "PriceSeriesTicker");
@@ -3338,6 +3370,9 @@ namespace Equibles.Migrations.Migrations
 
                     b.Property<DateOnly?>("OriginalFilingDate")
                         .HasColumnType("date");
+
+                    b.Property<int?>("OwnerRelationship")
+                        .HasColumnType("integer");
 
                     b.Property<int>("OwnershipNature")
                         .HasColumnType("integer");

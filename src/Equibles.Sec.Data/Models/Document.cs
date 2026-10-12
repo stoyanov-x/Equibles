@@ -109,6 +109,15 @@ public class Document
     /// </summary>
     public const int NormalizedContentBuilderVersion = 1;
 
+    // JSON recovery remains limited to empty text; inline reports also replay prose-layout fixes.
+    public const int EsefEmptyContentRecoveryVersion = 5;
+    public const int EsefContentBuilderVersion = 6;
+
+    public static int ContentBuilderVersion(DocumentType documentType) =>
+        documentType?.IsEsef() == true
+            ? EsefContentBuilderVersion
+            : NormalizedContentBuilderVersion;
+
     [MaxLength(2000)]
     public string SourceUrl { get; set; }
 

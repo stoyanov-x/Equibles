@@ -263,6 +263,12 @@ public class AumSnapshotRebuildWorkerTests : IAsyncLifetime
                         ReportDate = quarter,
                         PriceSeriesTicker = aapl.Presentation.Listing.Ticker,
                         CurrentShares = 1_000,
+                        CurrentValue = 100_000,
+                        CurrentFilerCount = 1,
+                        HolderValueSquaredSum = 100_000d * 100_000,
+                        TopOneValue = 100_000,
+                        TopFiveValue = 100_000,
+                        TopTenValue = 100_000,
                     }
                 );
             }
@@ -460,6 +466,12 @@ public class AumSnapshotRebuildWorkerTests : IAsyncLifetime
                         ReportDate = quarter,
                         PriceSeriesTicker = aapl.Presentation.Listing.Ticker,
                         CurrentShares = 1_000,
+                        CurrentValue = 100_000,
+                        CurrentFilerCount = 1,
+                        HolderValueSquaredSum = 100_000d * 100_000,
+                        TopOneValue = 100_000,
+                        TopFiveValue = 100_000,
+                        TopTenValue = 100_000,
                     }
                 );
             }
@@ -676,6 +688,12 @@ public class AumSnapshotRebuildWorkerTests : IAsyncLifetime
                     ReportDate = quarter,
                     PriceSeriesTicker = aapl.Presentation.Listing.Ticker,
                     CurrentShares = 1_000,
+                    CurrentValue = 100_000,
+                    CurrentFilerCount = 1,
+                    HolderValueSquaredSum = 100_000d * 100_000,
+                    TopOneValue = 100_000,
+                    TopFiveValue = 100_000,
+                    TopTenValue = 100_000,
                     ComputedAt = computedAt,
                 }
             );

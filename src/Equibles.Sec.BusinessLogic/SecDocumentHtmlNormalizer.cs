@@ -20,6 +20,8 @@ public class SecDocumentHtmlNormalizer : ISecDocumentHtmlNormalizer
     {
         _steps =
         [
+            new PositionedProseConversionStep(),
+            new InlineXbrlProseConversionStep(),
             new XbrlStripStep(),
             new TableNormalizationStep(_parser),
             new PaginationRemovalStep(),
@@ -51,6 +53,8 @@ public class SecDocumentHtmlNormalizer : ISecDocumentHtmlNormalizer
     private string RunSteps(string html)
     {
         var tempDoc = _parser.ParseDocument(html);
+
+        StylesheetProseConversionStep.Execute(tempDoc, html);
 
         foreach (var step in _steps)
         {

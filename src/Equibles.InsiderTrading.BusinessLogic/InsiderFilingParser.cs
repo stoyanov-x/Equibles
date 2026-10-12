@@ -59,6 +59,7 @@ public static class InsiderFilingParser
         // element, so it applies to every row this filing contributes — stamp it
         // on each as they are added.
         var rule10b5One = ParseRule10b5One(root);
+        var ownerRelationship = ParseOwnerRelationship(root);
         var originalFilingDate = isAmendment ? ParseDateOfOriginalSubmission(root) : null;
 
         var sourceOrder = 0;
@@ -78,6 +79,7 @@ public static class InsiderFilingParser
                 return;
             tx.TransactionOrder = order;
             tx.IsRule10b5One = rule10b5One;
+            tx.OwnerRelationship = ownerRelationship;
             tx.OriginalFilingDate = originalFilingDate;
             tx.FilingForm = ParseOwnershipForm(filing.Form);
             transactions.Add(tx);
@@ -210,6 +212,29 @@ public static class InsiderFilingParser
     {
         var element = root.Element("aff10b5One");
         return element == null ? null : ParseBool(element.Value);
+    }
+
+    // Every joint filer holds an interest in the reported trade, so the rows carry the union of
+    // their boxes; null when no reporting owner states a relationship.
+    public static InsiderRelationship? ParseOwnerRelationship(XElement root)
+    {
+        InsiderRelationship? relationship = null;
+        foreach (var owner in root.Elements("reportingOwner"))
+        {
+            var boxes = owner.Element("reportingOwnerRelationship");
+            if (boxes == null)
+                continue;
+            relationship ??= InsiderRelationship.None;
+            if (ParseBool(boxes.Element("isDirector")?.Value))
+                relationship |= InsiderRelationship.Director;
+            if (ParseBool(boxes.Element("isOfficer")?.Value))
+                relationship |= InsiderRelationship.Officer;
+            if (ParseBool(boxes.Element("isTenPercentOwner")?.Value))
+                relationship |= InsiderRelationship.TenPercentOwner;
+            if (ParseBool(boxes.Element("isOther")?.Value))
+                relationship |= InsiderRelationship.Other;
+        }
+        return relationship;
     }
 
     // The 0-shares row recorded for a noSecuritiesOwned Form 3 — the owner's zero

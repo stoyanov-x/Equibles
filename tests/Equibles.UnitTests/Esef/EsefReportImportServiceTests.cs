@@ -301,18 +301,18 @@ public class EsefReportImportServiceTests
             .Be(annual ? 12 : null);
     }
 
-    [Fact]
-    public async Task Import_TaggedInterimKeepsItsEnvelopeWithoutInventingAnAnnualCalendar()
+    [Theory]
+    [InlineData("ennogie-2026-interim-excerpt.xhtml", "549300JUGBT2EH17X827")]
+    [InlineData("dfds-2026-interim-excerpt.xhtml", "549300JZVW1Y1UZ5UK38")]
+    public async Task Import_TaggedInterimKeepsItsEnvelopeWithoutInventingAnAnnualCalendar(
+        string asset,
+        string lei
+    )
     {
         var report = File.ReadAllText(
-                Path.Combine(
-                    AppContext.BaseDirectory,
-                    "TestAssets",
-                    "Esef",
-                    "ennogie-2026-interim-excerpt.xhtml"
-                )
+                Path.Combine(AppContext.BaseDirectory, "TestAssets", "Esef", asset)
             )
-            .Replace("549300JUGBT2EH17X827", Lei);
+            .Replace(lei, Lei);
         var harness = await Harness.Create(
             Issuer("FR"),
             rewriteIndex: index =>
@@ -812,6 +812,34 @@ public class EsefReportImportServiceTests
             .Contain(LatestFrenchJson)
             .And.NotContain(LatestFrenchReport);
         (await harness.Context.Set<EsefOversizedReport>().CountAsync()).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Import_JsonBorrowingNotes_KeepsOriginalAndAnnualEvidence()
+    {
+        var json = File.ReadAllText(
+                Path.Combine(
+                    AppContext.BaseDirectory,
+                    "TestAssets",
+                    "Esef",
+                    "better-collective-2025-json-notes-excerpt.json"
+                )
+            )
+            .Replace("2549001EPXH6NK7I2R78", Lei);
+        var issuer = Issuer("FR");
+        var harness = await Harness.Create(issuer, jsonReport: json);
+        await SeedHtmlRefusal(harness);
+
+        await harness.Service.Import(CancellationToken.None);
+
+        var saved = harness.Saved.Should().ContainSingle().Subject;
+        saved.Xbrl.Type.Should().Be(XbrlType.JsonXbrl);
+        saved.Xbrl.RawBytes.Should().Equal(System.Text.Encoding.UTF8.GetBytes(json));
+        System.Text.Encoding.UTF8.GetString(saved.Content).Should().Contain("319 mEUR");
+        saved.DocumentType.Should().Be(DocumentType.EsefAnnualReport);
+        saved.SourceUrl.Should().EndWith(LatestFrenchJson);
+        issuer.FiscalYearEndMonth.Should().Be(12);
+        issuer.FiscalYearEndDay.Should().Be(31);
     }
 
     [Theory]

@@ -210,20 +210,48 @@ public class DocumentNormalizationBackfillPostgresTests : ParadeDbMcpTestBase
     }
 
     [Theory]
-    [InlineData("EsefAnnualReport")]
-    [InlineData("EsefReport")]
-    public async Task Backfill_EsefReplacesOnlyDerivedContentAndFinishesItsQueueEntry(string form)
+    [InlineData("EsefAnnualReport", 1, false, false)]
+    [InlineData("EsefReport", 1, false, false)]
+    [InlineData("EsefAnnualReport", 2, false, false)]
+    [InlineData("EsefReport", 2, false, false)]
+    [InlineData("EsefAnnualReport", 3, false, false)]
+    [InlineData("EsefReport", 3, false, false)]
+    [InlineData("EsefAnnualReport", 4, false, false)]
+    [InlineData("EsefReport", 4, false, false)]
+    [InlineData("EsefAnnualReport", 4, true, false)]
+    [InlineData("EsefReport", 4, true, false)]
+    [InlineData("EsefAnnualReport", 4, true, true)]
+    [InlineData("EsefAnnualReport", 5, false, false)]
+    [InlineData("EsefReport", 5, false, false)]
+    public async Task Backfill_EsefReplacesOnlyDerivedContentAndFinishesItsQueueEntry(
+        string form,
+        int version,
+        bool json,
+        bool noNotes
+    )
     {
-        var document = await SeedLegacyDocument("ESEF");
+        var document = await SeedLegacyDocument(
+            "ESEF",
+            version == 5 ? "readable older text"u8.ToArray() : []
+        );
+        document.NormalizedContentVersion = version;
         var original = GzipCompressor.Compress(
             Encoding.UTF8.GetBytes(
-                "<html xmlns='http://www.w3.org/1999/xhtml'><head><title/></head><body><p>Retained annual report</p></body></html>"
+                json
+                    ? (
+                        noNotes
+                            ? JsonReport.Replace("DisclosureOfBorrowingsExplanatory", "Borrowings")
+                            : JsonReport
+                    )
+                    : "<html xmlns='http://www.w3.org/1999/xhtml'><head><title/></head><body><p>Retained annual report</p></body></html>"
             )
         );
         document.DocumentType = DocumentType.FromValue(form);
         document.Issuer.Cik = null;
         document.AccessionNumber = "esef:retained";
-        document.XbrlType = XbrlType.InlineIxbrl;
+        document.XbrlType = json ? XbrlType.JsonXbrl : XbrlType.InlineIxbrl;
+        document.Issuer.LegalEntityIdentifier = "2549001EPXH6NK7I2R78";
+        document.ReportingForDate = new DateOnly(2025, 12, 31);
         document.XbrlStatus = XbrlCaptureStatus.Captured;
         document.XbrlContent = new Equibles.Media.Data.Models.File
         {
@@ -243,7 +271,8 @@ public class DocumentNormalizationBackfillPostgresTests : ParadeDbMcpTestBase
 
         var result = await sut.Backfill(1);
 
-        result.Replaced.Should().Be(1);
+        result.Replaced.Should().Be(noNotes ? 0 : 1);
+        result.Unchanged.Should().Be(noNotes ? 1 : 0);
         await using var verify = Fixture.CreateDbContext();
         var saved = await verify
             .Set<Document>()
@@ -254,16 +283,140 @@ public class DocumentNormalizationBackfillPostgresTests : ParadeDbMcpTestBase
             .SingleAsync(d => d.Id == document.Id);
         saved.XbrlContentId.Should().Be(originalId);
         saved.XbrlContent.FileContent.Bytes.Should().Equal(original);
-        saved.ContentId.Should().NotBe(oldTextId);
-        Encoding
-            .UTF8.GetString(saved.Content.FileContent.Bytes)
-            .Should()
-            .Contain("Retained annual report");
+        if (noNotes)
+            saved.ContentId.Should().Be(oldTextId);
+        else
+            saved.ContentId.Should().NotBe(oldTextId);
+        var text = Encoding.UTF8.GetString(saved.Content.FileContent.Bytes);
+        if (noNotes)
+            text.Should().BeEmpty();
+        else
+            text.Should().Contain("Retained annual report");
         saved.ChunkedAt.Should().BeNull();
-        saved.NormalizedContentVersion.Should().Be(Document.NormalizedContentBuilderVersion);
+        saved.NormalizedContentVersion.Should().Be(Document.EsefContentBuilderVersion);
         (await sut.Backfill(1)).Processed.Should().Be(0);
         await client.DidNotReceiveWithAnyArgs().GetDocumentContent(default, default, default);
     }
+
+    [Fact]
+    public async Task Backfill_UnchangedReadableEsef_PreservesIndexedChunksAndCompletesReplay()
+    {
+        const string html = "<html><body><p>Readable retained report.</p></body></html>";
+        var text = EsefReportContent.Build(
+            html,
+            new SecDocumentHtmlNormalizer(),
+            new SecDocumentHtmlToMarkdownConverter()
+        );
+        var document = await SeedLegacyDocument("ESEF", text);
+        document.DocumentType = DocumentType.EsefReport;
+        document.NormalizedContentVersion = 1;
+        document.Issuer.Cik = null;
+        document.XbrlType = XbrlType.InlineIxbrl;
+        document.XbrlStatus = XbrlCaptureStatus.Captured;
+        document.XbrlContent = new Equibles.Media.Data.Models.File
+        {
+            Name = "retained",
+            Extension = "gz",
+            ContentType = "application/gzip",
+            FileContent = new Equibles.Media.Data.Models.FileContent
+            {
+                Bytes = GzipCompressor.Compress(Encoding.UTF8.GetBytes(html)),
+            },
+        };
+        document.ChunkedAt = DateTime.UtcNow;
+        document.ChunkAttempts = 2;
+        var chunkedAt = document.ChunkedAt;
+        var contentId = document.ContentId;
+        DbContext.Add(document.XbrlContent);
+        var chunk = new Chunk
+        {
+            DocumentId = document.Id,
+            Index = 0,
+            StartPosition = 0,
+            EndPosition = text.Length,
+            StartLineNumber = 1,
+            Content = Encoding.UTF8.GetString(text),
+            DocumentType = DocumentType.EsefReport,
+            ReportingDate = document.ReportingDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc),
+        };
+        DbContext.Add(chunk);
+        await DbContext.SaveChangesAsync();
+        DbContext.ChangeTracker.Clear();
+        var client = Substitute.For<ISecEdgarClient>();
+        var sut = BuildSut(client);
+
+        var result = await sut.Backfill(1);
+
+        result.Unchanged.Should().Be(1);
+        result.Failed.Should().Be(0);
+        await using var verify = Fixture.CreateDbContext();
+        var saved = await verify.Set<Document>().SingleAsync(row => row.Id == document.Id);
+        saved.ContentId.Should().Be(contentId);
+        saved.ChunkedAt.Should().BeCloseTo(chunkedAt.Value, TimeSpan.FromMilliseconds(1));
+        saved.ChunkAttempts.Should().Be(2);
+        saved.NormalizedContentVersion.Should().Be(Document.EsefContentBuilderVersion);
+        saved.NormalizedContentAttempts.Should().Be(0);
+        (await verify.Set<Chunk>().SingleAsync(row => row.DocumentId == document.Id))
+            .Id.Should()
+            .Be(chunk.Id);
+        (await sut.Backfill(1)).Processed.Should().Be(0);
+        await client.DidNotReceiveWithAnyArgs().GetDocumentContent(default, default, default);
+    }
+
+    [Fact]
+    public async Task Backfill_ReadableEsefWithSizeRefusal_PersistsFailureWithoutErasingText()
+    {
+        var document = await SeedLegacyDocument("ESEF", "Readable original body"u8.ToArray());
+        document.DocumentType = DocumentType.EsefReport;
+        document.NormalizedContentVersion = 1;
+        document.Issuer.Cik = null;
+        document.XbrlType = XbrlType.InlineIxbrl;
+        document.XbrlStatus = XbrlCaptureStatus.Captured;
+        var html =
+            "<html><body><p>"
+            + new string('a', EsefReportContent.MaxRetrievalHtmlChars + 1)
+            + "</p></body></html>";
+        document.XbrlContent = new Equibles.Media.Data.Models.File
+        {
+            Name = "retained",
+            Extension = "gz",
+            ContentType = "application/gzip",
+            FileContent = new Equibles.Media.Data.Models.FileContent
+            {
+                Bytes = GzipCompressor.Compress(Encoding.UTF8.GetBytes(html)),
+            },
+        };
+        var contentId = document.ContentId;
+        DbContext.Add(document.XbrlContent);
+        await DbContext.SaveChangesAsync();
+        DbContext.ChangeTracker.Clear();
+
+        var result = await BuildSut(Substitute.For<ISecEdgarClient>()).Backfill(1);
+
+        result.Failed.Should().Be(1);
+        await using var verify = Fixture.CreateDbContext();
+        var saved = await verify
+            .Set<Document>()
+            .Include(row => row.Content)
+                .ThenInclude(file => file.FileContent)
+            .SingleAsync(row => row.Id == document.Id);
+        saved.ContentId.Should().Be(contentId);
+        saved.Content.FileContent.Bytes.Should().Equal("Readable original body"u8.ToArray());
+        saved.NormalizedContentVersion.Should().Be(1);
+        saved.NormalizedContentAttempts.Should().Be(1);
+    }
+
+    private const string JsonReport = """
+        {"documentInfo":{"documentType":"https://xbrl.org/2021/xbrl-json",
+        "namespaces":{"ifrs-full":"https://xbrl.ifrs.org/taxonomy/2024-03-27/ifrs-full",
+        "scheme":"http://standards.iso.org/iso/17442","iso4217":"http://www.xbrl.org/2003/iso4217"},
+        "taxonomy":["https://example.test/taxonomy.xsd"]},"facts":{
+        "assets":{"value":"100","dimensions":{"concept":"ifrs-full:Assets",
+        "entity":"scheme:2549001EPXH6NK7I2R78","period":"2026-01-01T00:00:00","unit":"iso4217:EUR"}},
+        "notes":{"value":"<p>Retained annual report borrowing note.</p>","dimensions":{
+        "concept":"ifrs-full:DisclosureOfBorrowingsExplanatory","entity":"scheme:2549001EPXH6NK7I2R78",
+        "period":"2025-01-01T00:00:00/2026-01-01T00:00:00","language":"en"}}}}
+        """;
 
     private async Task<Document> SeedLegacyDocument(string ticker, byte[] content = null)
     {

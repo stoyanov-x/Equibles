@@ -808,6 +808,7 @@ public class InstitutionalHoldingsTools
                 + "coverage — preferred shares, bonds, warrants, untracked share classes — so the "
                 + "filing's own declared total can exceed the figure above._"
         );
+        AppendConfidentialTreatmentWarning(result, holder, "portfolio");
 
         var pagedNote = McpOutput.PagedTruncationNote(holdings.Count, totalRows, offset);
         if (pagedNote.Length > 0)
@@ -821,12 +822,7 @@ public class InstitutionalHoldingsTools
 
     // How a 13F line should be described to a reader: the security type, not the activity bucket.
     private static string PositionType(OptionType? optionType, ShareType shareType) =>
-        optionType switch
-        {
-            Equibles.Holdings.Data.Models.OptionType.Put => "Put",
-            Equibles.Holdings.Data.Models.OptionType.Call => "Call",
-            _ => shareType == ShareType.Principal ? "Principal" : "Common",
-        };
+        HoldingInstrument.Label(optionType, shareType);
 
     [McpServerTool(
         Name = "SearchInstitutions",
@@ -1861,13 +1857,7 @@ public class InstitutionalHoldingsTools
             "_QoQ turnover = (Σ |Δ shares × current price proxy|) / (2 × tracked 13F value), where the per-share price proxy is the current quarter's Value / Shares._"
         );
 
-        if (holder.ConfidentialTreatmentRequested)
-        {
-            result.AppendLine();
-            result.AppendLine(
-                "⚠️ **Confidential Treatment** — This manager has requested confidential treatment for one or more investments in the most recent 13F filing. The portfolio shown may be incomplete."
-            );
-        }
+        AppendConfidentialTreatmentWarning(result, holder, "portfolio");
 
         return result.ToString();
     }
@@ -1907,13 +1897,7 @@ public class InstitutionalHoldingsTools
         );
         result.AppendLine(PublishedValueCaveat);
 
-        if (holder.ConfidentialTreatmentRequested)
-        {
-            result.AppendLine();
-            result.AppendLine(
-                "⚠️ **Confidential Treatment** — This manager has requested confidential treatment for one or more investments in the most recent 13F filing. The allocation shown may be incomplete."
-            );
-        }
+        AppendConfidentialTreatmentWarning(result, holder, "allocation");
 
         return result.ToString();
     }
@@ -1985,7 +1969,7 @@ public class InstitutionalHoldingsTools
         ReadOnly = true
     )]
     [Description(
-        "Get an institution's quarterly position-change activity — Initiated / Increased / Reduced / Exited stocks diffed against the immediately prior quarter. Returns the buckets as one markdown section per bucket, sorted by absolute Δ market-value desc (Δ Value includes price movement, not just trading). Use `bucket` to filter to a single bucket. Use this to answer 'what did this fund do this quarter?'"
+        "Get an institution's quarterly position-change activity — Initiated / Increased / Reduced / Exited stocks diffed against the immediately prior quarter. Common shares, put/call positions and principal amounts are separate rows labelled by Type. Returns the buckets as one markdown section per bucket, sorted by absolute Δ market-value desc (Δ Value includes price movement, not just trading). Use `bucket` to filter to a single bucket. Use this to answer 'what did this fund do this quarter?'"
     )]
     public Task<string> GetInstitutionQuarterlyActivity(
         [Description(
@@ -2111,13 +2095,31 @@ public class InstitutionalHoldingsTools
         if (rendered == 0)
         {
             result.AppendLine("_No matching buckets._");
+            AppendConfidentialTreatmentWarning(result, holder, "activity");
             return result.ToString();
         }
 
         result.AppendLine(
             "_Δ Value is the change in published position value. Values normally use report-date closing prices, may fall back to filer values, and can be zero when unavailable; the change includes price movement, not just trading — it also drives the per-bucket ordering._"
         );
+        AppendConfidentialTreatmentWarning(result, holder, "activity");
         return result.ToString();
+    }
+
+    // Omitted positions surface later in a 13F-HR/A, so a reader must not take the filed table as complete.
+    private static void AppendConfidentialTreatmentWarning(
+        StringBuilder result,
+        InstitutionalHolder holder,
+        string subject
+    )
+    {
+        if (!holder.ConfidentialTreatmentRequested)
+            return;
+        result.AppendLine();
+        result.AppendLine(
+            "⚠️ **Confidential Treatment** — This manager has requested confidential treatment for one or more investments in the most recent 13F filing. "
+                + $"The {subject} shown may be incomplete."
+        );
     }
 
     private static bool AppendActivitySection(
@@ -2141,11 +2143,11 @@ public class InstitutionalHoldingsTools
             return false;
         }
         result.AppendNumberedTable(
-            "| # | Ticker | Company | Prior | New | Δ Shares | Δ Value ($M) |",
-            "|---|--------|---------|-------|-----|---------|-------------|",
+            "| # | Ticker | Company | Type | Prior | New | Δ Shares | Δ Value ($M) |",
+            "|---|--------|---------|------|-------|-----|---------|-------------|",
             rows,
             (rank, r) =>
-                $"| {rank} | {r.Ticker} | {r.Name} | {McpFormat.WholeNumber(r.PreviousShares)} | {McpFormat.WholeNumber(r.CurrentShares)} | {FormatSignedShares(r.DeltaShares)} | {FormatSignedMillions(r.DeltaValue)} |"
+                $"| {rank} | {r.Ticker} | {r.Name} | {r.Instrument} | {McpFormat.WholeNumber(r.PreviousShares)} | {McpFormat.WholeNumber(r.CurrentShares)} | {FormatSignedShares(r.DeltaShares)} | {FormatSignedMillions(r.DeltaValue)} |"
         );
         result.AppendLine();
         return true;
@@ -2588,6 +2590,9 @@ public class InstitutionalHoldingsTools
         {
             foreach (var r in rows)
             {
+                // Principal amounts are filed dollars, never shares; a split cannot restate them.
+                if (r.ShareType == ShareType.Principal)
+                    continue;
                 var loadedSplits = SplitsFor(splitsByStock, r.CommonStockId);
                 var splits = string.IsNullOrWhiteSpace(r.PrimaryTicker)
                     ? loadedSplits

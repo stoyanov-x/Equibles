@@ -41,9 +41,12 @@ public class InsiderTransaction
     /// rows) stayed null (#7164, EquiblesCommercial); v8 stamps the authoritative
     /// Form 3/4/5 family so amendments cannot supersede a different ownership form;
     /// v9 tags the no-securities-owned sentinel as a holding so it participates only
-    /// in holding-section supersession; v10 restores source-row identity through rejected dates.
+    /// in holding-section supersession; v10 restores source-row identity through rejected dates;
+    /// v11 re-reads spelled-out ADS ratios above twenty ("sixty", "thirty-five") so per-ADS
+    /// prices on ordinary-share rows are restated to per-ordinary; v12 records the reporting
+    /// owner's relationship boxes on each row.
     /// </summary>
-    public const int CurrentParserVersion = 10;
+    public const int CurrentParserVersion = 12;
 
     public Guid Id { get; set; } = Guid.NewGuid();
 
@@ -142,6 +145,12 @@ public class InsiderTransaction
     /// before this was captured; those are reclassified by a reprocess pass.
     /// </summary>
     public InsiderSecurityKind SecurityKind { get; set; } = InsiderSecurityKind.Unknown;
+
+    /// <summary>
+    /// The relationship boxes ticked by this filing's reporting owners (the union across joint
+    /// filers); null until derived at parser version 12 or when no owner states one.
+    /// </summary>
+    public InsiderRelationship? OwnerRelationship { get; set; }
 
     /// <summary>
     /// Parsing-algorithm version that produced this row. See

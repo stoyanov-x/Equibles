@@ -80,6 +80,9 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
                 h.ListedTicker,
                 h.FilingType,
                 h.OptionType,
+                // The per-stock quarter book groups by the row grain, so ShareType rides along;
+                // without it every row of the stock was a heap fetch (42 s for the most-held one).
+                h.ShareType,
             })
             .IsCreatedConcurrently();
 
@@ -149,6 +152,9 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
                 h.Shares,
                 h.FilingDate,
                 h.FilingType,
+                // The holder's common-share total (a position page's portfolio-weight denominator)
+                // sums Value where OptionType is null; it ran per request on every position page.
+                h.OptionType,
             });
 
         // Covering index for the per-stock 13F ranking pages (Most-Held Stocks,
@@ -169,13 +175,10 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
             })
             .IncludeProperties(h => new { h.Shares, h.Value });
 
-        // Covering index for the per-holder 13F ranking pages (AUM Movers,
-        // Top by AUM, Double-Down): WHERE ReportDate IN (<quarter>[, <prior>])
-        // GROUP BY InstitutionalHolderId with COUNT(DISTINCT CommonStockId) and
-        // SUM(Shares)/SUM(Value). Mirror of the per-stock ranking index above but
-        // with the holder as the group key, so the same quarter-filtered scan runs
-        // index-only with no sort. The InstitutionalHolderId-leading covering index
-        // higher up can't serve it — it can't seek the ReportDate filter.
+        // Serves the per-holder 13F ranking pages and every quarter-slice read of the snapshot
+        // rebuild (ReportDate = <quarter>[ OR <prior>] AND FilingType = 13F) as one contiguous
+        // index-only range, instead of skip-scanning a holder- or stock-leading index or fetching
+        // each heap tuple for AccessionNumber.
         builder
             .Entity<InstitutionalHolding>()
             .HasIndex(h => new
@@ -184,7 +187,17 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
                 h.InstitutionalHolderId,
                 h.EquityIssuerId,
             })
-            .IncludeProperties(h => new { h.Shares, h.Value });
+            .HasDatabaseName("IX_InstitutionalHolding_QuarterRebuild")
+            .IncludeProperties(h => new
+            {
+                h.Shares,
+                h.Value,
+                h.FilingType,
+                h.FilingDate,
+                h.AccessionNumber,
+                h.ListedTicker,
+            })
+            .IsCreatedConcurrently();
 
         // Partial index for the repricing lane — in steady state ~0% of rows are
         // pending, so a full btree wastes space; without any index the lane's
@@ -204,6 +217,9 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
                 h.ReportDate,
             })
             .HasDatabaseName("IX_InstitutionalHolding_ValuePending_Pairs")
+            // The pair scan keeps only share rows; carrying ShareType keeps it index-only across
+            // millions of pending rows. ShareType is row identity and never changes, so HOT holds.
+            .IncludeProperties(h => h.ShareType)
             .HasFilter("\"ValuePending\"");
 
         // Worklist for the bounded stuck-zero repair. The table holds tens of millions of
@@ -232,6 +248,35 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
             .HasFilter(
                 "NOT \"ValuePending\" AND \"ShareType\" = 0 AND \"ValueSource\" <> 1 "
                     + "AND \"Shares\" > 0 AND \"Value\"::numeric > 1000000.0 * \"Shares\"::numeric"
+            )
+            .IsCreatedConcurrently();
+
+        // Worklist for the filed-publish revise phase: Filed rows are under 1% of the corpus, and
+        // without it every page sequentially scanned the whole table to find them. The retry stamp
+        // stays out of every holdings index so the lane's daily retry updates remain HOT; the phase
+        // filters stamped rows itself.
+        builder
+            .Entity<InstitutionalHolding>()
+            .HasIndex(h => h.Id, "IX_InstitutionalHolding_FiledReviseRepair")
+            .HasDatabaseName("IX_InstitutionalHolding_FiledReviseRepair")
+            .HasFilter(
+                "NOT \"ValuePending\" AND \"ShareType\" = 0 AND NOT \"ValueUnavailable\" "
+                    + "AND \"ValueSource\" = 1 "
+                    + "AND \"FiledValue\" IS NOT NULL AND \"FiledValue\" > 0 "
+                    + "AND \"Value\" = \"FiledValue\" AND \"Shares\" > 0"
+            )
+            .IsCreatedConcurrently();
+
+        // Worklist for the unmarked-zero stamp: abandoned zeros with no filed figure to publish,
+        // the complement of the stuck-zero predicate on FiledValue; ValueRetryCount stays out for
+        // the same reason as above.
+        builder
+            .Entity<InstitutionalHolding>()
+            .HasIndex(h => h.Id, "IX_InstitutionalHolding_UnmarkedZeroRepair")
+            .HasDatabaseName("IX_InstitutionalHolding_UnmarkedZeroRepair")
+            .HasFilter(
+                "\"Value\" = 0 AND NOT \"ValuePending\" AND NOT \"ValueUnavailable\" "
+                    + "AND (\"FiledValue\" IS NULL OR \"FiledValue\" <= 0)"
             )
             .IsCreatedConcurrently();
 
