@@ -128,6 +128,19 @@ def main() -> int:
     # Optional: serve prebuilt GHCR images instead of building from source.
     rewrite_to_images(services)
 
+    # Meridian-only change #3: cloakbrowser must be pinned to a MULTI-ARCH digest.
+    # Upstream pins `cloakhq/cloakbrowser:0.3.31@sha256:61dee1b4...`, and that
+    # digest is a single-image manifest (application/vnd.oci.image.manifest),
+    # not the index. Pinning a single-image manifest overrides platform
+    # selection, so EVERY host pulls amd64: on the arm64 Pi the container died
+    # with `exec /entrypoint.sh: exec format error`, and because worker has
+    # `depends_on: cloakbrowser: service_started`, the worker never started.
+    # The index digest below is the same 0.3.31 release with both platforms.
+    if "cloakbrowser" in services:
+        services["cloakbrowser"]["image"] = (
+            "cloakhq/cloakbrowser:0.3.31@sha256:440907001735f4e2764e614e1b40c40bc0317d34b83c0315897dea443cbe5fcc"
+        )
+
     with open(OUT, "w") as fh:
         yaml.safe_dump(merged, fh, sort_keys=False, default_flow_style=False, width=1000)
 

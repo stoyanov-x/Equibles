@@ -110,7 +110,7 @@ services:
     restart: unless-stopped
     image: ghcr.io/stoyanov-x/equibles-worker:main
   cloakbrowser:
-    image: cloakhq/cloakbrowser:0.3.31@sha256:61dee1b490ee8f74b040bc02c3d5384c7f64420b87ccaa26a33f213d07df3f73
+    image: cloakhq/cloakbrowser:0.3.31@sha256:440907001735f4e2764e614e1b40c40bc0317d34b83c0315897dea443cbe5fcc
     command:
     - cloakserve
     - --idle-timeout=300
