@@ -1684,7 +1684,7 @@ public class InstitutionalHoldingRepository : BaseRepository<InstitutionalHoldin
         if (sourceReportDate >= targetReportDate || splits.Count == 0)
             return shares;
 
-        var scoped = PriceSeriesSplitScope.ForListing(splits, primaryTicker, priceSeriesTicker);
+        var scoped = ShareCountSplitScope.ForListedSeries(splits, primaryTicker, priceSeriesTicker);
         var sourceFactor = SplitAdjustment.ShareCountFactor(sourceReportDate, scoped);
         var targetFactor = SplitAdjustment.ShareCountFactor(targetReportDate, scoped);
         return targetFactor == 0m
@@ -2217,6 +2217,15 @@ public class InstitutionalHoldingRepository : BaseRepository<InstitutionalHoldin
         return GetCombinedQuarterByStock(stock, current, previous)
             .Include(h => h.InstitutionalHolder);
     }
+
+    // Current successions whose successor's first 13F is one of these quarters.
+    public IQueryable<HolderSuccession> GetSuccessionsFirstReportedOn(
+        IReadOnlyCollection<DateOnly> reportDates
+    ) =>
+        DbContext
+            .Set<HolderSuccession>()
+            .Where(succession => reportDates.Contains(succession.SuccessorFirstReportDate))
+            .StillSucceeded(DbContext);
 
     // Distinct holder ids among the given set that filed ANY 13F at reportDate — the "has this
     // fund reported yet?" test behind the combined view's reported-so-far counts.

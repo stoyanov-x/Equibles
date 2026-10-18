@@ -1,0 +1,69 @@
+using Equibles.Sec.Data.Models;
+using Equibles.Sec.FinancialFacts.Data.Enums;
+using Equibles.Sec.FinancialFacts.Data.Models;
+using Equibles.Sec.FinancialFacts.Data.Statements;
+
+namespace Equibles.UnitTests.Sec;
+
+public class FinancialFactSeriesShaperPickBestFactAsOriginallyReportedTests
+{
+    [Fact]
+    public void PickBestFact_AsOriginallyReportedTrue_PicksEarliestFiledFact()
+    {
+        // PickBestFact's contract (FinancialFactSeriesShaper) flips
+        // filed-date / accession ordering based on `asOriginallyReported`:
+        // default = latest-filed (the restated value); true = earliest-filed
+        // (the original, pre-restatement value). The flag is the entire
+        // reason the helper exists — restatement history is auditor-relevant
+        // and the LLM caller explicitly requests "as originally reported"
+        // when they want to compare the original 10-K to a later 10-K/A.
+        // A refactor that drops the flag handling (always returning the
+        // latest filing) would compile, pass any default-mode test, and
+        // silently lie about the original value — surfacing the restatement
+        // instead. Pin: two same-concept facts, second filed later, with
+        // asOriginallyReported=true returns the FIRST (earliest) fact.
+        var stockId = Guid.NewGuid();
+        var conceptId = Guid.NewGuid();
+        var original = new FinancialFact
+        {
+            EquityIssuerId = stockId,
+            FinancialConceptId = conceptId,
+            Value = 1_000m,
+            FiledDate = new DateOnly(2024, 5, 1),
+            AccessionNumber = "0000320193-24-000123",
+            Unit = "USD",
+            PeriodStart = new DateOnly(2024, 1, 1),
+            PeriodEnd = new DateOnly(2024, 3, 31),
+            FiscalYear = 2024,
+            FiscalPeriod = SecFiscalPeriod.Q1,
+            PeriodType = FactPeriodType.Duration,
+            Form = DocumentType.TenK,
+        };
+        var restated = new FinancialFact
+        {
+            EquityIssuerId = stockId,
+            FinancialConceptId = conceptId,
+            Value = 1_200m,
+            FiledDate = new DateOnly(2024, 9, 15),
+            AccessionNumber = "0000320193-24-000999",
+            Unit = "USD",
+            PeriodStart = new DateOnly(2024, 1, 1),
+            PeriodEnd = new DateOnly(2024, 3, 31),
+            FiscalYear = 2024,
+            FiscalPeriod = SecFiscalPeriod.Q1,
+            PeriodType = FactPeriodType.Duration,
+            Form = DocumentType.TenK,
+        };
+        var conceptPriority = new Dictionary<Guid, int> { [conceptId] = 0 };
+
+        var result = FinancialFactSeriesShaper.PickBestFact(
+            new[] { restated, original },
+            conceptPriority,
+            true,
+            null
+        );
+
+        result.Value.Should().Be(1_000m);
+        result.FiledDate.Should().Be(new DateOnly(2024, 5, 1));
+    }
+}

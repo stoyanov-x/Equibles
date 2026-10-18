@@ -43,6 +43,10 @@ public interface IDocumentPersistenceService
         // A document whose statements SEC never rendered says so here, so the capture lane that fetches
         // those renderings never queues it. The default leaves an EDGAR filing for that lane to examine.
         XbrlCaptureStatus reportedStatements = XbrlCaptureStatus.NotChecked,
+        // EDGAR's acceptance time from the submission header (UTC); null when the source carries none.
+        DateTime? acceptedAt = null,
+        // The filing's own PDF when its primary document is one; stored as the reader's original.
+        byte[] asFiledPdf = null,
         CancellationToken cancellationToken = default
     );
 

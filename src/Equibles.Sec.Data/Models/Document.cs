@@ -63,6 +63,15 @@ public class Document
 
     public DateOnly ReportingForDate { get; set; }
 
+    /// <summary>
+    /// The period the filing covers, or null when EDGAR states none (a registration statement,
+    /// a tender offer, some proxies); the column stores that absence as <see cref="DateOnly.MinValue"/>.
+    /// </summary>
+    public DateOnly? StatedReportingForDate => StatedPeriod(ReportingForDate);
+
+    public static DateOnly? StatedPeriod(DateOnly reportingForDate) =>
+        reportingForDate == DateOnly.MinValue ? null : reportingForDate;
+
     public int LineCount { get; set; }
 
     /// <summary>
@@ -107,7 +116,13 @@ public class Document
     /// Current stored-text pipeline version. Bump after a normalization or conversion change
     /// that must be applied to already-ingested EDGAR documents.
     /// </summary>
-    public const int NormalizedContentBuilderVersion = 1;
+    public const int NormalizedContentBuilderVersion = 2;
+
+    /// <summary>
+    /// The first version any content builder stamps; a document below it never had its text
+    /// rebuilt. ESEF text counts as readable from here, independent of the EDGAR version above.
+    /// </summary>
+    public const int FirstContentBuilderVersion = 1;
 
     // JSON recovery remains limited to empty text; inline reports also replay prose-layout fixes.
     public const int EsefEmptyContentRecoveryVersion = 5;
@@ -128,6 +143,12 @@ public class Document
     /// </summary>
     [MaxLength(32)]
     public string AccessionNumber { get; set; }
+
+    /// <summary>
+    /// When EDGAR accepted the filing (UTC), read from the submission's SEC-HEADER at ingestion.
+    /// Null for filings ingested before capture began and for documents that are not EDGAR filings.
+    /// </summary>
+    public DateTime? AcceptedAt { get; set; }
 
     /// <summary>
     /// Comma-joined SEC item numbers reported by this filing, e.g. <c>"2.02,9.01"</c> on an
@@ -169,8 +190,9 @@ public class Document
     /// How many times the backfill has tried (and failed to reach a terminal result) to
     /// capture this document's XBRL. The backfill stops selecting a document once this hits
     /// its retry ceiling, so a permanently-unfetchable filing can't starve the rest of the
-    /// queue. Only meaningful while <see cref="XbrlStatus"/> is
-    /// <see cref="XbrlCaptureStatus.NotChecked"/>.
+    /// queue. Meaningful while <see cref="XbrlStatus"/> is
+    /// <see cref="XbrlCaptureStatus.NotChecked"/>, or while the inline document-set recapture
+    /// re-reads a captured filing; a finished re-read stamps the ceiling.
     /// </summary>
     public int XbrlCaptureAttempts { get; set; }
 
@@ -224,6 +246,13 @@ public class Document
 
     /// <summary>Size in bytes of the stitched as-filed HTML before gzip compression. Null when none built.</summary>
     public long? AsFiledHtmlUncompressedSize { get; set; }
+
+    /// <summary>
+    /// The filing's own PDF when its primary document is one (an annual report to security holders,
+    /// a paper filing); readers show it as the original. Null for every other filing.
+    /// </summary>
+    public Guid? AsFiledPdfContentId { get; set; }
+    public virtual File AsFiledPdfContent { get; set; }
 
     /// <summary>
     /// Version of the as-filed HTML stitcher that last processed this document. 0 = never built.
@@ -326,7 +355,7 @@ public class Document
     /// backoffice "pending" metric can reference it without depending on the hosted-service
     /// assembly. Bump after a parser change to re-derive the corpus.
     /// </summary>
-    public const int ReportedStatementsParserVersion = 3;
+    public const int ReportedStatementsParserVersion = 4;
 
     public DateTime CreationTime { get; set; } = DateTime.UtcNow;
 }

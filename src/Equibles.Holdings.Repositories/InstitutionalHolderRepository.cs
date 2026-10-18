@@ -1,6 +1,7 @@
 using Equibles.CommonStocks.Data.Helpers;
 using Equibles.Data;
 using Equibles.Holdings.Data.Models;
+using Equibles.Holdings.Repositories.Extensions;
 using Equibles.Holdings.Repositories.Models;
 using Microsoft.EntityFrameworkCore;
 
@@ -41,6 +42,109 @@ public class InstitutionalHolderRepository : BaseRepository<InstitutionalHolder>
             .GroupBy(f => f.InstitutionalHolderId)
             .Select(g => new { HolderId = g.Key, ReportDate = g.Max(f => f.ReportDate) })
             .ToDictionaryAsync(r => r.HolderId, r => r.ReportDate, cancellationToken);
+    }
+
+    // CIKs of every holder that filed at least one 13F report, as stored (either padding).
+    public IQueryable<string> Get13FFilerCiks()
+    {
+        var filings = DbContext
+            .Set<InstitutionalFiling>()
+            .Where(f => f.FilingType == FilingType.Form13F);
+        return GetAll()
+            .Where(h => filings.Any(f => f.InstitutionalHolderId == h.Id))
+            .Select(h => h.Cik);
+    }
+
+    // Holders whose identity numbers were never read from a cover page since IdentityAccession
+    // existed, each with its newest 13F filings (latest report, then filing date, then accession).
+    public async Task<List<HolderIdentityBackfillCandidate>> GetIdentityBackfillCandidates(
+        int take,
+        int filingsPerHolder,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var filings = DbContext
+            .Set<InstitutionalFiling>()
+            .Where(f => f.FilingType == FilingType.Form13F);
+        var holders = await GetAll()
+            .Where(h =>
+                h.IdentityAccession == null && filings.Any(f => f.InstitutionalHolderId == h.Id)
+            )
+            .OrderBy(h => h.Id)
+            .Take(take)
+            .Select(h => new
+            {
+                h.Id,
+                h.Cik,
+                h.Form13FFileNumber,
+                h.CrdNumber,
+                h.SecFileNumber,
+            })
+            .ToListAsync(cancellationToken);
+        if (holders.Count == 0)
+            return [];
+
+        var holderIds = holders.Select(h => h.Id).ToList();
+        var rows = await filings
+            .Where(f => holderIds.Contains(f.InstitutionalHolderId))
+            .Select(f => new
+            {
+                f.InstitutionalHolderId,
+                f.AccessionNumber,
+                f.ReportDate,
+                f.FilingDate,
+            })
+            .ToListAsync(cancellationToken);
+        var filingsByHolder = rows.GroupBy(r => r.InstitutionalHolderId)
+            .ToDictionary(
+                g => g.Key,
+                g =>
+                    (IReadOnlyList<HolderIdentityBackfillFiling>)
+                        g.OrderByDescending(r => r.ReportDate)
+                            .ThenByDescending(r => r.FilingDate)
+                            .ThenByDescending(r => r.AccessionNumber, StringComparer.Ordinal)
+                            .Take(filingsPerHolder)
+                            .Select(r => new HolderIdentityBackfillFiling(
+                                r.AccessionNumber,
+                                r.FilingDate
+                            ))
+                            .ToList()
+            );
+
+        return holders
+            .Where(h => filingsByHolder.ContainsKey(h.Id))
+            .Select(h => new HolderIdentityBackfillCandidate(
+                h.Id,
+                h.Cik,
+                h.Form13FFileNumber,
+                h.CrdNumber,
+                h.SecFileNumber,
+                filingsByHolder[h.Id]
+            ))
+            .ToList();
+    }
+
+    // Writes a cover page's resolved identity numbers, unless an import stamped the holder first:
+    // an import always reads a cover at least as new, so the backfill never overwrites it.
+    public Task<int> ApplyBackfilledIdentity(
+        Guid holderId,
+        string accessionNumber,
+        string form13FFileNumber,
+        string crdNumber,
+        string secFileNumber,
+        CancellationToken cancellationToken = default
+    )
+    {
+        return GetAll()
+            .Where(h => h.Id == holderId && h.IdentityAccession == null)
+            .ExecuteUpdateAsync(
+                set =>
+                    set.SetProperty(h => h.Form13FFileNumber, form13FFileNumber)
+                        .SetProperty(h => h.CrdNumber, crdNumber)
+                        .SetProperty(h => h.SecFileNumber, secFileNumber)
+                        .SetProperty(h => h.IdentityAccession, accessionNumber),
+                cancellationToken
+            );
     }
 
     public async Task<List<InstitutionalHolder>> GetByCiks(
@@ -241,6 +345,82 @@ public class InstitutionalHolderRepository : BaseRepository<InstitutionalHolder>
         int maxResults,
         CancellationToken cancellationToken = default
     ) => await RankWithStats(SearchNameOrCik(search), maxResults, cancellationToken);
+
+    public async Task<List<InstitutionalHolderSearchMatch>> SearchNameOrCikLargestFirstWithStats(
+        string search,
+        IReadOnlySet<HolderEntityType> entityTypes,
+        int maxResults,
+        CancellationToken cancellationToken = default
+    ) =>
+        await RankWithStats(
+            OfEntityTypes(SearchNameOrCik(search), entityTypes),
+            maxResults,
+            cancellationToken
+        );
+
+    // Holders whose profile has one of these entity types; Unknown also matches a holder not
+    // yet profiled. Null types leave the source unfiltered.
+    public IQueryable<InstitutionalHolder> OfEntityTypes(
+        IQueryable<InstitutionalHolder> source,
+        IReadOnlySet<HolderEntityType> entityTypes
+    )
+    {
+        if (entityTypes == null)
+            return source;
+        var profiles = DbContext.Set<InstitutionalHolderProfile>();
+        var listed = entityTypes.ToArray();
+        return entityTypes.Contains(HolderEntityType.Unknown)
+            ? source.Where(holder =>
+                profiles.Any(profile =>
+                    profile.InstitutionalHolderId == holder.Id
+                    && listed.Contains(profile.EntityType)
+                ) || !profiles.Any(profile => profile.InstitutionalHolderId == holder.Id)
+            )
+            : source.Where(holder =>
+                profiles.Any(profile =>
+                    profile.InstitutionalHolderId == holder.Id
+                    && listed.Contains(profile.EntityType)
+                )
+            );
+    }
+
+    // Each listed holder's profiled entity type; a holder not yet profiled is absent.
+    public Task<Dictionary<Guid, HolderEntityType>> GetEntityTypes(
+        IReadOnlyCollection<Guid> holderIds,
+        CancellationToken cancellationToken = default
+    ) =>
+        DbContext
+            .Set<InstitutionalHolderProfile>()
+            .Where(profile => holderIds.Contains(profile.InstitutionalHolderId))
+            .ToDictionaryAsync(
+                profile => profile.InstitutionalHolderId,
+                profile => profile.EntityType,
+                cancellationToken
+            );
+
+    // The holder's entity type, null when it is not yet profiled.
+    public Task<HolderEntityType?> GetEntityType(
+        InstitutionalHolder holder,
+        CancellationToken cancellationToken = default
+    ) =>
+        GetProfile(holder)
+            .Select(profile => (HolderEntityType?)profile.EntityType)
+            .FirstOrDefaultAsync(cancellationToken);
+
+    public IQueryable<InstitutionalHolderProfile> GetProfile(InstitutionalHolder holder) =>
+        DbContext
+            .Set<InstitutionalHolderProfile>()
+            .Where(profile => profile.InstitutionalHolderId == holder.Id);
+
+    // The holder's current successions, as predecessor or successor.
+    public IQueryable<HolderSuccession> GetSuccessions(InstitutionalHolder holder) =>
+        DbContext
+            .Set<HolderSuccession>()
+            .Where(succession =>
+                succession.PredecessorHolderId == holder.Id
+                || succession.SuccessorHolderId == holder.Id
+            )
+            .StillSucceeded(DbContext);
 
     private async Task<List<InstitutionalHolderSearchMatch>> RankWithStats(
         IQueryable<InstitutionalHolder> source,

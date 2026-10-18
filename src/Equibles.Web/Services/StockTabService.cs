@@ -111,9 +111,9 @@ public class StockTabService
         _stockSplitRepository = stockSplitRepository;
     }
 
-    // The stock's splits effective as of today, for restating share balances onto today's
-    // post-split basis at read time (stored rows stay as filed). Empty when the optional
-    // repository is absent (test constructors), which keeps every consumer as-filed.
+    // Every listing's splits effective as of today, for restating share balances onto today's
+    // post-split basis at read time (stored rows stay as filed); consumers narrow them with
+    // ShareCountSplitScope. Empty when the optional repository is absent (test constructors).
     private async Task<IReadOnlyList<StockSplit>> LoadEffectiveSplits(EquityIssuer stock)
     {
         if (_stockSplitRepository == null)
@@ -121,10 +121,6 @@ public class StockTabService
         return await _stockSplitRepository
             .GetEffectiveByStock(stock.Id, DateOnly.FromDateTime(DateTime.UtcNow))
             .AsNoTracking()
-            .Where(split =>
-                split.PriceSeriesTicker == null
-                || split.PriceSeriesTicker == stock.Presentation.Listing.Ticker
-            )
             .ToListAsync();
     }
 
@@ -217,8 +213,16 @@ public class StockTabService
             TotalBuyerCount = HoldingsTopMoversSelector.CountBuyers(grouped),
             TotalSellerCount = HoldingsTopMoversSelector.CountSellers(grouped),
             IsCombinedAvailable = isCombinedAvailable,
+            HolderTypes = await LoadHolderTypes(allChanges),
         };
     }
+
+    private Task<Dictionary<Guid, HolderEntityType>> LoadHolderTypes(
+        IEnumerable<HolderPositionChange> changes
+    ) =>
+        _institutionalHolderRepository.GetEntityTypes(
+            changes.Select(change => change.InstitutionalHolderId).Distinct().ToList()
+        );
 
     public async Task<HoldingsTabViewModel> LoadHoldingsCombinedTab(EquityIssuer stock)
     {
@@ -308,6 +312,7 @@ public class StockTabService
             BucketCounts = grouped.ToDictionary(g => g.Key, g => g.Value.Count),
             IsCombinedView = true,
             IsCombinedAvailable = true,
+            HolderTypes = await LoadHolderTypes(holders),
         };
     }
 
@@ -383,7 +388,7 @@ public class StockTabService
     // uses only splits attributed to that exact series (a sibling share class's split must
     // never rescale them).
     private async Task<List<StockSplit>> LoadPrimarySeriesSplits(EquityIssuer stock) =>
-        PriceSeriesSplitScope.ForListing(
+        ShareCountSplitScope.ForListedSeries(
             await LoadEffectiveSplits(stock),
             stock.Presentation.Listing.Ticker,
             stock.Presentation.Listing.Ticker
@@ -986,6 +991,7 @@ public class StockTabService
         {
             Stock = stock,
             Holder = holder,
+            HolderType = await _institutionalHolderRepository.GetEntityType(holder),
             Holdings = holdings,
         };
     }

@@ -16,7 +16,8 @@ namespace Equibles.Sec.HostedService.Services;
 /// already-fetched submission envelope — see <see cref="SecDocumentEnvelopeParser.TryBuildAsFiledHtml"/>.
 /// Then downloads the images that page references (8-K deck slides, logos) from EDGAR so the
 /// viewer can serve them from our own origin instead of hotlinking SEC (which 403s browsers).
-/// Periodic reports also retain their primary HTML and images, including reports without exhibits.
+/// Standalone forms (periodic reports, proxies, registrations, tender offers, late notices) also
+/// retain their primary HTML and images when they have no exhibits.
 /// The HTML stitch costs no extra EDGAR round-trip; the image download does one fetch per image,
 /// through the shared rate-limited SEC client.
 /// </summary>
@@ -34,7 +35,7 @@ public class AsFiledHtmlCaptureService
     // Upper bound on the stitched page we'll store, matching the viewer's serve-time cap
     // (DocumentOriginalHtmlProvider.MaxOriginalHtmlBytes). A page bigger than this could never be
     // served, so we drop it at capture rather than persist an un-servable blob — the viewer then
-    // degrades to the primary-only inline-iXBRL page. Keep the two caps in sync.
+    // degrades to the captured inline-iXBRL document set. Keep the two caps in sync.
     private const long MaxHtmlBytes = 30L * 1024 * 1024;
 
     private readonly AsFiledHtmlCaptureOptions _options;

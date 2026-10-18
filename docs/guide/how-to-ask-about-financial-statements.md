@@ -15,7 +15,7 @@ Name a company, a statement, and a period:
 - "What did Microsoft's balance sheet look like last fiscal year?"
 - "Pull NVDA's cash-flow statement for its latest annual period."
 
-The assistant calls the `GetFinancialStatement` tool and replies with the standard line items — revenue, net income, total assets, operating cash flow, and the rest — for the fiscal year and period you asked for, using the latest restated values. Every line is anchored to one statement period end. Quarterly flow rows always span one quarter: when a filer reports only cumulative USD facts, the tool derives the quarter by exact subtraction from the compatible preceding cumulative fact and marks its basis; an unprovable YTD-only line is omitted.
+The assistant calls the `GetFinancialStatement` tool and replies with the standard line items — revenue, net income, total assets, operating cash flow, and the rest — for the fiscal year and period you asked for, using the latest restated values. Every line is anchored to one statement period end. Quarterly flow rows always span one quarter: when a filer reports only cumulative facts in a currency, the tool derives the quarter by exact subtraction from the compatible preceding cumulative fact and marks its basis; an unprovable YTD-only line is omitted.
 
 ## Follow one metric over time
 
@@ -24,7 +24,7 @@ To track a single concept across periods rather than a whole statement:
 - "How has Apple's revenue changed over the last several years?"
 - "Show me Tesla's diluted EPS history."
 
-The assistant uses `GetFinancialFact`, which returns a time series with one row per fiscal period and the exact start/end span. Common concepts include revenue, net income, diluted EPS, total assets, and operating cash flow. If the alias ends more than roughly 18 months before the company's other structured facts, the result warns that the filer may have switched XBRL tags; an absent recent row is not treated as proof that the measure stopped.
+The assistant uses `GetFinancialFact`, which returns a time series with the exact start/end span: one row per fiscal period for flows such as revenue, and one row per as-of date for balances and share counts. Common concepts include revenue, net income, diluted EPS, total assets, and operating cash flow. If the alias ends more than roughly 18 months before the company's other structured facts, the result warns that the filer may have switched XBRL tags; an absent recent row is not treated as proof that the measure stopped.
 
 ## Compare companies side by side
 

@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Text;
+using Equibles.CommonStocks.Data.Helpers;
 using Equibles.CommonStocks.Data.Models;
 using Equibles.CommonStocks.Repositories;
 using Equibles.CommonStocks.Repositories.Extensions;
@@ -67,7 +68,10 @@ public class RevenueBreakdownTools
             + "consolidated figures use GetFinancialStatement or GetFinancialFact."
     )]
     public Task<string> GetRevenueBreakdown(
-        [Description("Stock ticker symbol (e.g., AAPL, MSFT)")] string ticker,
+        [Description(
+            "Stock ticker symbol (e.g., AAPL, MSFT); a listing on another exchange is MIC:TICKER (XPAR:AIR)."
+        )]
+            string ticker,
         [Description("Most recent fiscal years to include (default 8, max 12)")]
             int maxYears = DefaultYears
     )
@@ -79,7 +83,7 @@ public class RevenueBreakdownTools
                     return "A ticker symbol is required.";
 
                 var (stock, stockError) =
-                    await _commonStockRepository.ResolveByTickerIncludingDelisted(ticker);
+                    await _commonStockRepository.ResolveIssuerIncludingDelisted(ticker);
                 if (stockError != null)
                     return stockError;
 
@@ -127,10 +131,8 @@ public class RevenueBreakdownTools
                     .Where(f =>
                         conceptIds.Contains(f.FinancialConceptId)
                         && f.PeriodType == FactPeriodType.Duration
-                        && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MinAnnualSpanDays)
-                            <= f.PeriodEnd
-                        && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MaxAnnualSpanDays)
-                            >= f.PeriodEnd
+                        && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MinAnnual) <= f.PeriodEnd
+                        && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MaxAnnual) >= f.PeriodEnd
                     )
                     .Select(f => new
                     {
@@ -187,7 +189,7 @@ public class RevenueBreakdownTools
                 var years = Math.Clamp(maxYears, 1, MaxYearsCap);
                 var result = new StringBuilder();
                 result.AppendLine(
-                    $"Revenue breakdown for {stock.Presentation.Listing.Ticker} ({FactMarkdown.Cell(stock.Name)}) — "
+                    $"Revenue breakdown for {EquityListingSymbol.Display(stock)} ({FactMarkdown.Cell(stock.Name)}) — "
                         + "annual fiscal years, latest restated values:"
                 );
                 if (rows.Count == 0)
@@ -241,7 +243,7 @@ public class RevenueBreakdownTools
                     totals
                 );
                 if (rows.Count == 0 && !hasSegmentOperatingIncome)
-                    return $"{stock.Presentation.Listing.Ticker} has no dimensional revenue or segment operating "
+                    return $"{EquityListingSymbol.Display(stock)} has no dimensional revenue or segment operating "
                         + "income tagging on record.";
 
                 return result.ToString();
@@ -267,8 +269,8 @@ public class RevenueBreakdownTools
             .Where(f =>
                 conceptIds.Contains(f.FinancialConceptId)
                 && f.PeriodType == FactPeriodType.Duration
-                && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MinAnnualSpanDays) <= f.PeriodEnd
-                && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MaxAnnualSpanDays) >= f.PeriodEnd
+                && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MinAnnual) <= f.PeriodEnd
+                && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MaxAnnual) >= f.PeriodEnd
                 && f.DimensionsKey != ""
                 && f.Dimensions.Count(d => axes.Contains(d.Axis)) == 1
                 && f.Dimensions.All(d =>
@@ -304,8 +306,8 @@ public class RevenueBreakdownTools
             .Where(f =>
                 conceptIds.Contains(f.FinancialConceptId)
                 && f.PeriodType == FactPeriodType.Duration
-                && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MinAnnualSpanDays) <= f.PeriodEnd
-                && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MaxAnnualSpanDays) >= f.PeriodEnd
+                && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MinAnnual) <= f.PeriodEnd
+                && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MaxAnnual) >= f.PeriodEnd
                 && f.DimensionsKey != ""
                 && f.Dimensions.Count(d => RevenueBreakdownCore.AllAxes.Contains(d.Axis)) == 2
                 && f.Dimensions.All(d =>
@@ -380,8 +382,8 @@ public class RevenueBreakdownTools
             .Where(f =>
                 conceptIds.Contains(f.FinancialConceptId)
                 && f.PeriodType == FactPeriodType.Duration
-                && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MinAnnualSpanDays) <= f.PeriodEnd
-                && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MaxAnnualSpanDays) >= f.PeriodEnd
+                && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MinAnnual) <= f.PeriodEnd
+                && f.PeriodStart.AddDays(FiscalPeriodSpanDays.MaxAnnual) >= f.PeriodEnd
             )
             .Select(f => new
             {

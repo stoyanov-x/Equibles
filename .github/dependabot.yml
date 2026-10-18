@@ -18,19 +18,18 @@ updates:
     labels:
       - "type: dependencies"
     ignore:
-      # SixLabors.ImageSharp 4.x requires a paid commercial license.
-      # Stay on the 3.x line, which remains under the Six Labors Split License.
+      # SixLabors.ImageSharp 3.2.0 and 4.x enforce a Six Labors license key on
+      # Release builds. Stay on 3.1.x; untrusted decodes exclude TIFF.
       - dependency-name: "SixLabors.ImageSharp"
-        update-types: ["version-update:semver-major"]
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
       # MassTransit 9.x requires a paid commercial license. Stay on the 8.x
       # line (Apache-2.0) — covers MassTransit, .EntityFrameworkCore and
       # .SqlTransport.PostgreSQL.
       - dependency-name: "MassTransit*"
         update-types: ["version-update:semver-major"]
-      # Microsoft.Bcl.Memory is a deliberate direct pin at 9.0.16 that
+      # Microsoft.Bcl.Memory is a deliberate direct pin on the 10.0 line that
       # overrides the transitive high-severity advisory NU1903
-      # (GHSA-73j8-2gch-69rq). Block major bumps so the 10.x PR can't reopen;
-      # 9.0.x patches are still allowed.
+      # (GHSA-73j8-2gch-69rq). Block major bumps; 10.0.x patches are still allowed.
       - dependency-name: "Microsoft.Bcl.Memory"
         update-types: ["version-update:semver-major"]
       # Microsoft.Playwright is held at 1.60.0 as the known production

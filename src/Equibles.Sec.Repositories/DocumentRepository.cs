@@ -59,7 +59,7 @@ public class DocumentRepository : BaseRepository<Document>
     }
 
     public IQueryable<Document> GetByTicker(string ticker) =>
-        GetAll().ForUsTicker(ticker, DbContext);
+        GetAll().ForListingSymbol(ticker, DbContext);
 
     public IQueryable<Document> GetByDocumentType(DocumentType documentType)
     {
@@ -173,7 +173,12 @@ public class DocumentRepository : BaseRepository<Document>
         return GetAll()
             .Where(d =>
                 (
-                    d.NormalizedContentVersion < Document.NormalizedContentBuilderVersion
+                    d.NormalizedContentVersion < Document.FirstContentBuilderVersion
+                    || (
+                        d.NormalizedContentVersion < Document.NormalizedContentBuilderVersion
+                        && d.DocumentType != DocumentType.EsefAnnualReport
+                        && d.DocumentType != DocumentType.EsefReport
+                    )
                     || (
                         (
                             d.DocumentType == DocumentType.EsefAnnualReport

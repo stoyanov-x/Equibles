@@ -1,6 +1,7 @@
 using Equibles.CommonStocks.Data.Models;
 using Equibles.CommonStocks.Repositories;
 using Equibles.Core.AutoWiring;
+using Equibles.Core.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -85,7 +86,15 @@ public class EquityDirectoryIdentityImporter(IServiceScopeFactory scopeFactory)
                     "Directory source conflicts with the issuer's legal identity."
                 );
             issuer.LegalEntityIdentifier ??= input.LegalEntityIdentifier;
-            if (string.IsNullOrWhiteSpace(issuer.Name))
+            // Only the source that supplied the current name may replace it, and SEC names always govern.
+            if (
+                string.IsNullOrWhiteSpace(issuer.Name)
+                || issuer.Cik == null
+                    && input.ReplacedIssuerNames.Contains(
+                        issuer.Name,
+                        StringComparer.OrdinalIgnoreCase
+                    )
+            )
                 issuer.Name = input.IssuerName;
         }
         issuer.NameAliases = issuer
@@ -237,6 +246,26 @@ public class EquityDirectoryIdentityImporter(IServiceScopeFactory scopeFactory)
                 .Distinct()
                 .ToListAsync(cancellationToken)
         );
+        // A code whose ISIN shares an actively listed security's CUSIP issuer number is another line of that issuer, such
+        // as a temporary counter or rights line, never another company; a withdrawn sibling never decides.
+        var issuerNumber = InternationalSecurityIdentifiers.CusipIssuerNumber(input.Isin);
+        if (issuerNumber != null)
+            candidates.UnionWith(
+                (
+                    await repository
+                        .GetSecurities()
+                        .Where(row =>
+                            row.Isin.StartsWith(issuerNumber)
+                            && row.Listings.Any(listing => listing.Active)
+                        )
+                        .Select(row => new { row.Isin, row.EquityIssuerId })
+                        .ToListAsync(cancellationToken)
+                )
+                    .Where(row =>
+                        InternationalSecurityIdentifiers.CusipIssuerNumber(row.Isin) == issuerNumber
+                    )
+                    .Select(row => row.EquityIssuerId)
+            );
         if (candidates.Count > 1)
             throw new InvalidDataException(
                 "Directory identifiers resolve to conflicting issuers; refusing an inferred merge."

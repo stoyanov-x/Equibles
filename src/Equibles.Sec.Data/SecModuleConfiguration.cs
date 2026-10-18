@@ -71,6 +71,9 @@ public class SecModuleConfiguration : Equibles.Data.IFinancialModule
         builder.Entity<FailedFilingIngest>();
         builder.Entity<EsefOversizedReport>();
         builder.Entity<FormAdvAdviser>();
+        builder.Entity<FormAdvAdviserClientType>();
+        builder.Entity<FormAdvRosterImport>();
+        builder.Entity<SecFilerProfile>();
         builder
             .Entity<FormDFiling>()
             .HasOne(row => row.Issuer)
@@ -95,17 +98,38 @@ public class SecModuleConfiguration : Equibles.Data.IFinancialModule
             .HasForeignKey(row => row.EquityIssuerId)
             .OnDelete(DeleteBehavior.Restrict);
         builder.Entity<NCenServiceProvider>();
-        builder
-            .Entity<NportFiling>()
-            .HasOne(row => row.Issuer)
-            .WithMany()
-            .HasForeignKey(row => row.EquityIssuerId)
-            .OnDelete(DeleteBehavior.Restrict);
+        builder.Entity<NCenDataSetImport>();
+        builder.Entity<NCenRegistrantReport>();
+        builder.Entity<NCenFundReport>();
+        builder.Entity<NCenFundAdviser>();
+        builder.Entity<NCenFundShareClass>();
+        builder.Entity<NCenFundExchangeListing>();
+        builder.Entity<NportFiling>(b =>
+        {
+            b.HasOne(row => row.Issuer)
+                .WithMany()
+                .HasForeignKey(row => row.EquityIssuerId)
+                .OnDelete(DeleteBehavior.Restrict);
+            // A series' reports are read by its SEC series id from a period floor and the
+            // latest-per-period check re-reads that range; the issuer- and registrant-wide indexes
+            // made the planner start from every holding of the CUSIP instead.
+            b.HasIndex(f => new { f.SeriesId, f.ReportPeriodDate })
+                .IncludeProperties(f => new
+                {
+                    f.EquityIssuerId,
+                    f.RegistrantCik,
+                    f.FilingDate,
+                    f.AccessionNumber,
+                })
+                .HasDatabaseName("IX_NportFiling_SeriesPeriod")
+                .IsCreatedConcurrently();
+        });
         builder.Entity<NportHolding>(b =>
         {
-            b.HasIndex(h => h.Cusip)
+            // A fund's position in one security is read per filing of the series, so the filing is
+            // a key column: as a payload, each join probe walked the CUSIP's whole entry range.
+            b.HasIndex(h => new { h.Cusip, h.NportFilingId })
                 .HasDatabaseName("IX_NportHolding_CusipFiling")
-                .IncludeProperties(h => h.NportFilingId)
                 .IsCreatedConcurrently();
             // Foreign securities carry no CUSIP, so a fund's position in them is found by ISIN.
             b.HasIndex(h => h.Isin)

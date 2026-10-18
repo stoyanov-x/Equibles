@@ -11,7 +11,6 @@ using Equibles.Sec.BusinessLogic;
 using Equibles.Sec.Data.Models;
 using Equibles.Sec.HostedService.Configuration;
 using Equibles.Sec.HostedService.Contracts;
-using Equibles.Sec.HostedService.Extensions;
 using Equibles.Sec.HostedService.Models;
 using Equibles.Sec.HostedService.Services;
 using Equibles.Sec.Repositories;
@@ -36,13 +35,10 @@ public class DocumentScraper : IDocumentScraper
 
     // Annual foreign-filer forms tried (in order) when SEC metadata and 10-Ks are both
     // absent. 20-F first, then 40-F — Canadian cross-listed companies file 40-F instead.
-    private static readonly (
-        DocumentTypeFilter Filter,
-        string FormName
-    )[] ForeignFilerAnnualForms =
+    private static readonly DocumentType[] ForeignFilerAnnualForms =
     [
-        (DocumentTypeFilter.TwentyF, "20-F"),
-        (DocumentTypeFilter.FortyF, "40-F"),
+        DocumentType.TwentyF,
+        DocumentType.FortyF,
     ];
 
     // When the company directory was last synced from SEC. Static because the
@@ -89,31 +85,36 @@ public class DocumentScraper : IDocumentScraper
 
             var companiesUntracked = await GetAllCompaniesWithNoTracking();
 
-            var targets = _options.UseEventDrivenDiscovery
-                ? await SelectEventDrivenTargets(companiesUntracked, cancellationToken)
-                : companiesUntracked;
-
-            _logger.LogInformation(
-                "Found {CompanyCount} companies to process for documents",
-                targets.Count
-            );
-
-            foreach (EquityIssuer companyUntracked in targets)
+            if (_options.UseEventDrivenDiscovery)
             {
-                if (cancellationToken.IsCancellationRequested)
-                    break;
-
-                var companyExists = await ProcessCompanyDocumentsWithScope(
-                    companyUntracked,
-                    result
+                var (discovered, reconciliation) = await SelectEventDrivenTargets(
+                    companiesUntracked,
+                    cancellationToken
                 );
-                if (!companyExists)
-                    continue;
-
-                if (_options.UseEventDrivenDiscovery)
-                    await StampFilingSyncState(companyUntracked);
-
-                result.CompaniesProcessed++;
+                await ProcessPreemptingReconciliation(
+                    discovered,
+                    reconciliation,
+                    () =>
+                        _filingDiscoveryService.DiscoverCompaniesFromRecentFeed(
+                            companiesUntracked,
+                            cancellationToken
+                        ),
+                    company => ProcessTarget(company, stampSyncState: true, result),
+                    cancellationToken
+                );
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Found {CompanyCount} companies to process for documents",
+                    companiesUntracked.Count
+                );
+                foreach (var company in companiesUntracked)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                        break;
+                    await ProcessTarget(company, stampSyncState: false, result);
+                }
             }
 
             if (result.DeferredFilings.Count > 0)
@@ -155,13 +156,13 @@ public class DocumentScraper : IDocumentScraper
     /// The cycle's work list under event-driven discovery: companies flagged by
     /// the real-time feeds, plus the reconciliation batch — never-synced
     /// companies (fresh onboarding, full historical backfill) and companies
-    /// whose last enumeration went stale. Discovery targets come first so a
-    /// fresh filing is never queued behind a long reconciliation batch.
+    /// whose last enumeration went stale. Discovery targets come first, and the
+    /// cycle re-polls discovery before each reconciliation company.
     /// </summary>
-    private async Task<List<EquityIssuer>> SelectEventDrivenTargets(
-        List<EquityIssuer> companies,
-        CancellationToken cancellationToken
-    )
+    private async Task<(
+        List<EquityIssuer> Discovered,
+        List<EquityIssuer> Reconciliation
+    )> SelectEventDrivenTargets(List<EquityIssuer> companies, CancellationToken cancellationToken)
     {
         var discovered = await _filingDiscoveryService.DiscoverCompaniesWithNewFilings(
             companies,
@@ -183,7 +184,59 @@ public class DocumentScraper : IDocumentScraper
             );
         }
 
-        return [.. discovered, .. reconciliation];
+        return (discovered, reconciliation);
+    }
+
+    /// <summary>
+    /// Processes the discovered companies, then the reconciliation batch with fresh filings preempting it:
+    /// a re-sweep can ingest years of filings, so newly flagged companies run before each one, and a company
+    /// already processed this cycle is not re-swept.
+    /// </summary>
+    internal static async Task ProcessPreemptingReconciliation(
+        IEnumerable<EquityIssuer> discovered,
+        IEnumerable<EquityIssuer> reconciliation,
+        Func<Task<List<EquityIssuer>>> pollFresh,
+        Func<EquityIssuer, Task> process,
+        CancellationToken cancellationToken
+    )
+    {
+        var processed = new HashSet<Guid>();
+
+        async Task Run(IEnumerable<EquityIssuer> companies)
+        {
+            foreach (var company in companies)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                    return;
+                processed.Add(company.Id);
+                await process(company);
+            }
+        }
+
+        await Run(discovered);
+        foreach (var company in reconciliation)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return;
+            await Run(await pollFresh());
+            if (!processed.Contains(company.Id))
+                await Run([company]);
+        }
+    }
+
+    private async Task ProcessTarget(
+        EquityIssuer company,
+        bool stampSyncState,
+        ScrapingResult result
+    )
+    {
+        if (!await ProcessCompanyDocumentsWithScope(company, result))
+            return;
+
+        if (stampSyncState)
+            await StampFilingSyncState(company);
+
+        result.CompaniesProcessed++;
     }
 
     private async Task<List<EquityIssuer>> SelectReconciliationBatch(
@@ -362,11 +415,11 @@ public class DocumentScraper : IDocumentScraper
 
             foreach (var documentType in _options.DocumentTypesToSync)
             {
-                var secFilter = documentType.ToSecEdgarFilter();
-                if (secFilter == null)
+                var secForm = SecForms.Find(documentType);
+                if (secForm == null)
                 {
                     _logger.LogWarning(
-                        "No SEC Edgar filter mapping found for document type: {DocumentType}",
+                        "Document type {DocumentType} is not an SEC form; skipping it",
                         documentType
                     );
                     continue;
@@ -375,7 +428,7 @@ public class DocumentScraper : IDocumentScraper
                 await ProcessDocumentTypeForCompany(
                     company,
                     documentType,
-                    secFilter.Value,
+                    secForm.EdgarForm,
                     result,
                     secEdgarClient,
                     persistenceService,
@@ -484,15 +537,18 @@ public class DocumentScraper : IDocumentScraper
 
             // No 10-K filings — try annual foreign-filer forms from the cached
             // submissions JSON (zero extra SEC requests), 20-F first then 40-F.
-            foreach (var (filter, formName) in ForeignFilerAnnualForms)
+            foreach (var form in ForeignFilerAnnualForms)
             {
-                var reportDate = await secEdgarClient.GetMostRecentReportDate(company.Cik, filter);
+                var reportDate = await secEdgarClient.GetMostRecentReportDate(
+                    company.Cik,
+                    form.DisplayName
+                );
                 if (reportDate is { } date)
                 {
                     _logger.LogInformation(
                         "SEC metadata has no fiscal year-end for {Ticker}; inferred from {Form} report date {Date}",
                         (company.Presentation?.Listing?.Ticker ?? company.Cik),
-                        formName,
+                        form.DisplayName,
                         date
                     );
                     await commonStockManager.SetFiscalYearEnd(company, date.Month, date.Day);
@@ -529,7 +585,7 @@ public class DocumentScraper : IDocumentScraper
     private async Task ProcessDocumentTypeForCompany(
         EquityIssuer company,
         DocumentType documentType,
-        DocumentTypeFilter secFilter,
+        string edgarForm,
         ScrapingResult result,
         ISecEdgarClient secEdgarClient,
         IDocumentPersistenceService persistenceService,
@@ -547,7 +603,7 @@ public class DocumentScraper : IDocumentScraper
             var filings = await CollectFilingsAcrossCiks(
                 company,
                 documentType,
-                secFilter,
+                edgarForm,
                 result,
                 secEdgarClient
             );
@@ -664,7 +720,7 @@ public class DocumentScraper : IDocumentScraper
     private async Task<List<FilingData>> CollectFilingsAcrossCiks(
         EquityIssuer company,
         DocumentType documentType,
-        DocumentTypeFilter secFilter,
+        string edgarForm,
         ScrapingResult result,
         ISecEdgarClient secEdgarClient
     )
@@ -685,7 +741,7 @@ public class DocumentScraper : IDocumentScraper
             List<FilingData> cikFilings;
             try
             {
-                cikFilings = await secEdgarClient.GetCompanyFilings(cik, secFilter, fromDate);
+                cikFilings = await secEdgarClient.GetCompanyFilings(cik, edgarForm, fromDate);
             }
             catch (HttpRequestException ex)
             {
@@ -742,7 +798,7 @@ public class DocumentScraper : IDocumentScraper
     {
         try
         {
-            var detectedType = DocumentTypeExtensions.FromFormName(filing.Form);
+            var detectedType = SecForms.ForEdgarForm(filing.Form)?.Type;
             if (detectedType == null)
             {
                 _logger.LogWarning(
@@ -1098,10 +1154,11 @@ public class DocumentScraper : IDocumentScraper
 
                 var normalizedHtml = normalizer.Normalize(content);
                 var markdownDocument = converter.Convert(normalizedHtml);
+                byte[] asFiledPdf = null;
 
                 if (string.IsNullOrWhiteSpace(markdownDocument))
                 {
-                    markdownDocument = await TryExtractPdfFallback(
+                    (markdownDocument, asFiledPdf) = await TryExtractPdfFallback(
                         secEdgarClient,
                         pdfTextExtractor,
                         content,
@@ -1126,6 +1183,8 @@ public class DocumentScraper : IDocumentScraper
                     filing.Items,
                     xbrl,
                     asFiledHtml,
+                    acceptedAt: SecSubmissionHeader.AcceptedAt(content),
+                    asFiledPdf: asFiledPdf,
                     cancellationToken: cancellationToken
                 );
 
@@ -1140,11 +1199,10 @@ public class DocumentScraper : IDocumentScraper
         );
     }
 
-    // Paper-filed submissions (typically older 6-K/20-F) wrap a uuencoded PDF
-    // and have no HTML for the normalizer to consume. Fetch the standalone PDF
-    // artifact and extract its text instead. Returns null to signal "skip this
-    // filing" — the caller short-circuits without persisting.
-    private async Task<string> TryExtractPdfFallback(
+    // A PDF primary (an annual report to holders, an older paper 6-K/20-F) has no HTML for the
+    // normalizer: fetch the standalone PDF, extract its text, and return the PDF as the original.
+    // A null markdown means "skip this filing" and the caller persists nothing.
+    private async Task<(string Markdown, byte[] Pdf)> TryExtractPdfFallback(
         ISecEdgarClient secEdgarClient,
         IPdfTextExtractor pdfTextExtractor,
         string content,
@@ -1163,7 +1221,7 @@ public class DocumentScraper : IDocumentScraper
                 filing.FilingDate,
                 filing.DocumentUrl
             );
-            return null;
+            return (null, null);
         }
 
         var pdfBytes = await secEdgarClient.GetDocumentFileBytes(
@@ -1172,10 +1230,30 @@ public class DocumentScraper : IDocumentScraper
             pdfFilename,
             cancellationToken
         );
+        // Only the submission's own primary document is its original; a PDF exhibit is text evidence only.
+        var original =
+            pdfBytes is { Length: > 0 }
+            && SecDocumentEnvelopeParser.IsPrimaryDocument(content, pdfFilename)
+                ? pdfBytes
+                : null;
         var markdown = pdfTextExtractor.Extract(pdfBytes);
 
         if (string.IsNullOrWhiteSpace(markdown))
         {
+            if (original != null)
+            {
+                // An image-only PDF primary is still a reader's original; storing it without text also
+                // keeps the reconciliation sweep from downloading it again every day.
+                _logger.LogInformation(
+                    "Storing the PDF original of {Ticker} - {DocumentType} - {FilingDate} without text: {Filename} has none to extract.",
+                    (companyOutContext.Presentation?.Listing?.Ticker ?? companyOutContext.Cik),
+                    documentType,
+                    filing.FilingDate,
+                    pdfFilename
+                );
+                return (string.Empty, original);
+            }
+
             // PDF was located but yielded no extractable text — either the artifact was
             // missing (404, logged by the client), or it's an image-only scan needing OCR.
             _logger.LogWarning(
@@ -1186,7 +1264,7 @@ public class DocumentScraper : IDocumentScraper
                 pdfFilename,
                 filing.DocumentUrl
             );
-            return null;
+            return (null, null);
         }
 
         _logger.LogInformation(
@@ -1197,7 +1275,7 @@ public class DocumentScraper : IDocumentScraper
             pdfFilename
         );
 
-        return markdown;
+        return (markdown, original);
     }
 
     private static void RecordError(ScrapingResult result, string label, Exception ex)

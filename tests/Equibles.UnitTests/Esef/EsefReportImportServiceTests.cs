@@ -1150,6 +1150,8 @@ public class EsefReportImportServiceTests
                     Arg.Any<XbrlCaptureResult>(),
                     Arg.Any<AsFiledHtmlCaptureResult>(),
                     Arg.Any<XbrlCaptureStatus>(),
+                    Arg.Any<DateTime?>(),
+                    Arg.Any<byte[]>(),
                     Arg.Any<CancellationToken>()
                 )
                 .Returns(call =>

@@ -21,13 +21,13 @@ One section per module. Each tool name is exactly what the MCP client sees; the 
 
 `InstitutionalHoldingsTools`:
 
-- `GetTopHolders` — top institutional holders of a given ticker for a `ReportDate`.
+- `GetTopHolders` — top institutional holders of a given ticker for a `ReportDate`, each with its holder type from regulatory records (last column); `holderTypes` keeps only the listed types (`adv`, `era`, `ia`, `bank`, `ins`, `bd`, `fund`, `plan`, `nonus`, `unk`) while percentages stay over all institutions.
 - `GetInstitutionalOwnershipHistory` — historical ownership trend (shares, value, holder count) per quarter.
 - `GetInstitutionPortfolio` — full portfolio of one institution for a `ReportDate`.
-- `SearchInstitutions` — punctuation-independent all-token name/CIK search with a sparse any-token fallback, largest within the recently-active 13F bucket first. Rows include CIK, latest report date, reported 13F AUM, tracked position count, and location. Verified flagship aliases include Fidelity/FMR, Vanguard, and BlackRock; institution-scoped tools stay strict, reject an ambiguous partial name, and return candidate CIKs.
+- `SearchInstitutions` — punctuation-independent all-token name/CIK search with a sparse any-token fallback, largest within the recently-active 13F bucket first. Rows include CIK, latest report date, reported 13F AUM, tracked position count, location, and holder type; `holderTypes` filters by type in the search itself. Verified flagship aliases include Fidelity/FMR, Vanguard, and BlackRock; institution-scoped tools stay strict, reject an ambiguous partial name, and return candidate CIKs.
 - `GetTopInstitutionalBuyersSellers` — biggest absolute share additions and reductions for a ticker vs. the prior `ReportDate`; flags new and sold-out positions.
 - `GetMarketWide13FActivity` — market-wide leaderboard for a quarter, selected by `bucket`: `top-buys`, `top-sells`, `new-positions`, `sold-out-positions`; Δ value includes the quarter's price move on held shares, so Δ shares is the position-change measure.
-- `GetInstitutionSummary` — portfolio header for one filer at a `ReportDate`: AUM, position count, top-10 / top-25 concentration, QoQ turnover, latest / prior dates.
+- `GetInstitutionSummary` — portfolio header for one filer at a `ReportDate`: AUM, position count, top-10 / top-25 concentration, QoQ turnover, latest / prior dates, then its holder profile from regulatory records (entity type and the record that decided it, Form ADV adviser facts, registered funds advised, LEI, SIC) and any earlier or later CIK its 13F reports continue under.
 - `GetInstitutionSectorAllocation` — one filer's portfolio grouped by industry / sector for its latest 13F report; stocks lacking a classification collapse into an "Unclassified" row.
 - `GetInstitutionQuarterlyActivity` — one filer's position changes vs. the prior quarter, bucketed into Initiated / Increased / Reduced / Exited; optional `bucket` filter to a single bucket.
 - `CompareInstitutionPortfolios` — 13F portfolio overlap between two filers at their latest common `ReportDate`: Jaccard similarity, dollar-weighted overlap, and a side-by-side stock table with per-fund shares + percent of portfolio.
@@ -52,9 +52,9 @@ One section per module. Each tool name is exactly what the MCP client sees; the 
 
 `RagSearchTools` (BM25 lexical ranking is always available; embeddings add semantic ranking; exact mode does literal matching):
 
-- `SearchDocuments` — hybrid BM25 and semantic search across indexed SEC documents, optionally scoped by `ticker`; without embeddings it retains ranked BM25 results.
+- `SearchDocuments` — hybrid BM25 and semantic search across indexed SEC documents, optionally scoped by `ticker` (a bare ticker is the US listing; `MIC:TICKER`, such as `XPAR:AIR`, reads that listing's issuer); without embeddings it retains ranked BM25 results. `match: phrase` returns only excerpts containing the exact phrase.
 - `SearchDocument` — semantic or exact literal search inside a specific document.
-- `ListFilings` — list stored filings newest first, market-wide or for one company, with date, document-type, and exact 8-K item-number filters.
+- `ListFilings` — list stored filings newest first, market-wide or for one company (a bare ticker or `MIC:TICKER`, whose list includes its ESEF reports), with date, document-type, and exact 8-K item-number filters.
 
 `FailToDeliverTools`:
 
@@ -66,7 +66,7 @@ One section per module. Each tool name is exactly what the MCP client sees; the 
 
 `NportTools`:
 
-- `GetFundsHoldingStock` — reverse lookup: the registered funds and ETFs holding a given stock, matched by CUSIP against each fund series' most recent NPORT-P report (so an exited position never shows as current). Returns registrant and series, reporting period, position size, USD value, share of the fund's net assets, and payoff profile (Long/Short), largest positions first.
+- `GetFundsHoldingStock` — reverse lookup: the registered funds and ETFs holding a given stock, matched by CUSIP, or by ISIN for a listing outside the US (`MIC:TICKER`), against each fund series' most recent NPORT-P report (so an exited position never shows as current). Returns registrant and series, reporting period, position size, USD value, share of the fund's net assets, and payoff profile (Long/Short), largest positions first.
 
 `FundDirectoryTools`:
 
@@ -91,7 +91,7 @@ One section per module. Each tool name is exactly what the MCP client sees; the 
 
 `FinancialStatementTools`:
 
-- `GetFinancialStatement` — full income statement / balance sheet / cash flow for a ticker + fiscal period, anchored to one actual period end. Quarterly USD flows are discrete quarters; a missing quarter is derived only by exact subtraction of compatible cumulative facts and marked in the `Basis` column.
+- `GetFinancialStatement` — full income statement / balance sheet / cash flow for a ticker + fiscal period, anchored to one actual period end. Quarterly currency flows are discrete quarters; a missing quarter is derived only by exact subtraction of compatible cumulative facts and marked in the `Basis` column.
 
 `RevenueBreakdownTools`:
 

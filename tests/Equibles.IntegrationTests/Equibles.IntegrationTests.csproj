@@ -16,6 +16,16 @@
       Link="TestAssets/Holdings/13f-zero-restatement-submission.txt"
       CopyToOutputDirectory="PreserveNewest"
     />
+    <Content
+      Include="../Equibles.UnitTests/TestAssets/Holdings/13f-notices/*.tsv"
+      Link="TestAssets/Holdings/13f-notices/%(Filename)%(Extension)"
+      CopyToOutputDirectory="PreserveNewest"
+    />
+    <Content
+      Include="../Equibles.UnitTests/TestAssets/Holdings13DG/sc13ga-morgan-stanley-x0202.xml;../Equibles.UnitTests/TestAssets/Holdings13DG/sc13d-multiple-type-codes.xml"
+      Link="TestAssets/Holdings13DG/%(Filename)%(Extension)"
+      CopyToOutputDirectory="PreserveNewest"
+    />
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
@@ -48,6 +58,11 @@
     <Content
       Include="../Equibles.UnitTests/TestAssets/EquityMarkets/Firds/*.xml"
       Link="TestAssets/EquityMarkets/Firds/%(Filename)%(Extension)"
+      CopyToOutputDirectory="PreserveNewest"
+    />
+    <Content
+      Include="../Equibles.UnitTests/TestAssets/NCen/**/*.tsv"
+      Link="TestAssets/NCen/%(RecursiveDir)%(Filename)%(Extension)"
       CopyToOutputDirectory="PreserveNewest"
     />
     <Content Include="TestAssets\**\*">

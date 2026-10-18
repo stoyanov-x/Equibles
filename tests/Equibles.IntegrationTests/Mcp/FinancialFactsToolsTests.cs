@@ -202,14 +202,246 @@ public class FinancialFactsToolsTests : ParadeDbMcpTestBase
             : "$24.62";
         result.Should().Contain($"| {expected} | USD/shares |");
         if (splitScope == "primary")
-            result.Should().Contain("Per-share values are split-adjusted");
+            result.Should().Contain("are split-adjusted to today's share basis");
         else
-            result.Should().NotContain("Per-share values are split-adjusted");
+            result.Should().NotContain("are split-adjusted to today's share basis");
         if (splitScope == "unresolved")
             result.Should().Contain("split attribution is unresolved");
         else
             result.Should().NotContain("split attribution is unresolved");
     }
+
+    // A share count is stated on its filing date's basis: Alphabet's FY2021 count from the
+    // FY2021 10-K (before the 20:1) multiplies; the FY2022 10-K's restated comparative stays.
+    [Theory]
+    [InlineData("2022-02-02", 662_000_000, "13,240,000,000", true)]
+    [InlineData("2023-02-03", 13_242_000_000, "13,242,000,000", false)]
+    public async Task GetFinancialFact_WeightedShareCount_RestatesFromItsFilingDate(
+        string filed,
+        long value,
+        string expected,
+        bool adjusted
+    )
+    {
+        EquityIssuer stock = Equibles.TestSupport.EquityIssuerSeed.Create(
+            Id: Guid.NewGuid(),
+            Ticker: "GOOGL",
+            Name: "Alphabet Inc.",
+            Cik: "0001652044"
+        );
+        var shares = AddConcept("WeightedAverageNumberOfDilutedSharesOutstanding");
+        DbContext.Set<EquityIssuer>().Add(stock);
+        DbContext
+            .Set<StockSplit>()
+            .Add(
+                new StockSplit
+                {
+                    EquityIssuerId = stock.Id,
+                    EquityListingId = stock.Presentation.EquityListingId,
+                    PriceSeriesTicker = "GOOGL",
+                    EffectiveDate = new DateOnly(2022, 7, 18),
+                    Numerator = 20m,
+                    Denominator = 1m,
+                }
+            );
+        DbContext
+            .Set<FinancialFact>()
+            .Add(
+                new FinancialFact
+                {
+                    EquityIssuerId = stock.Id,
+                    FinancialConceptId = shares.Id,
+                    Unit = "shares",
+                    PeriodType = FactPeriodType.Duration,
+                    PeriodStart = new DateOnly(2021, 1, 1),
+                    PeriodEnd = new DateOnly(2021, 12, 31),
+                    Value = value,
+                    FiscalYear = 2021,
+                    FiscalPeriod = SecFiscalPeriod.FullYear,
+                    Form = DocumentType.TenK,
+                    FiledDate = DateOnly.Parse(filed),
+                    AccessionNumber = "googl-fy",
+                }
+            );
+        await DbContext.SaveChangesAsync();
+
+        var result = await Sut().GetFinancialFact("GOOGL", "weighted-average-shares-diluted");
+
+        result.Should().Contain($"| {expected} | shares |");
+        if (adjusted)
+            result.Should().Contain("are split-adjusted to today's share basis");
+        else
+            result.Should().NotContain("split-adjusted");
+    }
+
+    // A share count is identified by its as-of date. The 10-K cover count dated in January falls
+    // in next year's Q1 beside the Q1 10-Q's own counts, and the balance-sheet count sits at each
+    // period end; one row per fiscal period kept only the latest date and hid the rest.
+    [Fact]
+    public async Task GetFinancialFact_SharesOutstanding_PublishesEveryAsOfDate()
+    {
+        var stock = Apple();
+        DbContext.Set<EquityIssuer>().Add(stock);
+        var cover = new FinancialConcept
+        {
+            Id = Guid.NewGuid(),
+            Taxonomy = FactTaxonomy.Dei,
+            Tag = "EntityCommonStockSharesOutstanding",
+            Label = "EntityCommonStockSharesOutstanding",
+        };
+        DbContext.Set<FinancialConcept>().Add(cover);
+        var sheet = AddConcept("CommonStockSharesOutstanding");
+        AddCount(
+            stock,
+            sheet,
+            new DateOnly(2023, 12, 30),
+            2023,
+            SecFiscalPeriod.FullYear,
+            15_550_061_000,
+            DocumentType.TenK,
+            "2024-02-02",
+            "fy23"
+        );
+        AddCount(
+            stock,
+            cover,
+            new DateOnly(2024, 1, 19),
+            2024,
+            SecFiscalPeriod.Q1,
+            15_441_881_000,
+            DocumentType.TenK,
+            "2024-02-02",
+            "fy23"
+        );
+        AddCount(
+            stock,
+            sheet,
+            new DateOnly(2024, 3, 30),
+            2024,
+            SecFiscalPeriod.Q1,
+            15_337_686_000,
+            DocumentType.TenQ,
+            "2024-05-03",
+            "q1"
+        );
+        AddCount(
+            stock,
+            sheet,
+            new DateOnly(2023, 12, 30),
+            2024,
+            SecFiscalPeriod.Q1,
+            15_550_061_000,
+            DocumentType.TenQ,
+            "2024-05-03",
+            "q1"
+        );
+        AddCount(
+            stock,
+            cover,
+            new DateOnly(2024, 4, 19),
+            2024,
+            SecFiscalPeriod.Q1,
+            15_284_155_000,
+            DocumentType.TenQ,
+            "2024-05-03",
+            "q1"
+        );
+        await DbContext.SaveChangesAsync();
+
+        var result = await Sut().GetFinancialFact("AAPL", "shares-outstanding");
+
+        result.Should().Contain("| 2024-04-19 | 2024 | Q1 | 15,284,155,000 |");
+        result.Should().Contain("| 2024-03-30 | 2024 | Q1 | 15,337,686,000 |");
+        result.Should().Contain("| 2024-01-19 | 2024 | Q1 | 15,441,881,000 |");
+        result
+            .Should()
+            .Contain(
+                "| 2023-12-30 | 2023 | FY | 15,550,061,000 |",
+                "a date keeps its own filing's stamp"
+            );
+        result.Split("15,550,061,000").Should().HaveCount(2, "one row per as-of date");
+    }
+
+    // Company Facts files a reported discrete Q4 under fp=FY. The fiscal-period filter runs on the
+    // picked rows, so a Q4 request still sees the promoted quarter and an FY request the year.
+    [Fact]
+    public async Task GetFinancialFact_FiscalPeriodFilter_SeesThePromotedFourthQuarter()
+    {
+        var stock = Apple();
+        DbContext.Set<EquityIssuer>().Add(stock);
+        var revenue = AddConcept("Revenues");
+        AddSpan(stock, revenue, "2019-01-28", "2020-01-26", SecFiscalPeriod.FullYear, 10_918m);
+        AddSpan(stock, revenue, "2019-10-28", "2020-01-26", SecFiscalPeriod.FullYear, 3_105m);
+        AddSpan(stock, revenue, "2019-07-29", "2019-10-27", SecFiscalPeriod.Q3, 3_014m);
+        await DbContext.SaveChangesAsync();
+
+        var fourth = await Sut().GetFinancialFact("AAPL", "revenue", fiscalPeriod: "Q4");
+        var year = await Sut().GetFinancialFact("AAPL", "revenue", fiscalPeriod: "FY");
+
+        fourth.Should().Contain("| 2019-10-28 | 2020-01-26 | 2020 | Q4 |");
+        fourth.Should().NotContain("2019-07-29").And.NotContain("| 2019-01-28 |");
+        year.Should().Contain("| 2019-01-28 | 2020-01-26 | 2020 | FY |");
+        year.Should().NotContain("| 2019-10-28 |");
+    }
+
+    private void AddSpan(
+        EquityIssuer stock,
+        FinancialConcept concept,
+        string start,
+        string end,
+        SecFiscalPeriod period,
+        decimal value
+    ) =>
+        DbContext
+            .Set<FinancialFact>()
+            .Add(
+                new FinancialFact
+                {
+                    EquityIssuerId = stock.Id,
+                    FinancialConceptId = concept.Id,
+                    Unit = "USD",
+                    PeriodType = FactPeriodType.Duration,
+                    PeriodStart = DateOnly.Parse(start),
+                    PeriodEnd = DateOnly.Parse(end),
+                    Value = value,
+                    FiscalYear = 2020,
+                    FiscalPeriod = period,
+                    Form = DocumentType.TenK,
+                    FiledDate = new DateOnly(2020, 2, 20),
+                    AccessionNumber = "fy20",
+                }
+            );
+
+    private void AddCount(
+        EquityIssuer stock,
+        FinancialConcept concept,
+        DateOnly asOf,
+        int fy,
+        SecFiscalPeriod period,
+        decimal value,
+        DocumentType form,
+        string filed,
+        string accn
+    ) =>
+        DbContext
+            .Set<FinancialFact>()
+            .Add(
+                new FinancialFact
+                {
+                    EquityIssuerId = stock.Id,
+                    FinancialConceptId = concept.Id,
+                    Unit = "shares",
+                    PeriodType = FactPeriodType.Instant,
+                    PeriodStart = asOf,
+                    PeriodEnd = asOf,
+                    Value = value,
+                    FiscalYear = fy,
+                    FiscalPeriod = period,
+                    Form = form,
+                    FiledDate = DateOnly.Parse(filed),
+                    AccessionNumber = accn,
+                }
+            );
 
     [Fact]
     public async Task GetFinancialFact_RestatementAndTagSwitch_LatestRestatedAcrossAliasTags()

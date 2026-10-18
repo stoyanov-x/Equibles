@@ -183,6 +183,15 @@ public class HoldingsScraperWorker : BaseScraperWorker
         // Reapply their later tail only after the entire oldest-first bulk pass has finished.
         await ApplyPendingRealtimeReplay(stoppingToken);
 
+        await BackfillHolderIdentity(stoppingToken);
+        await RefreshHolderFilerProfiles(stoppingToken);
+        // After the filer profiles, so the holder profiles read fresh SIC codes.
+        await RefreshHolderProfiles(stoppingToken);
+
+        await SyncForm13FNotices(fileNames, stoppingToken);
+        // After the notices, which name the managers that report for a filer that stopped.
+        await RefreshHolderSuccessions(stoppingToken);
+
         // Position coverage does not depend on valuation. Check it before maintenance can
         // spend the cycle repricing a large backlog, but let maintenance survive SEC outages.
         try
@@ -734,6 +743,93 @@ public class HoldingsScraperWorker : BaseScraperWorker
             MaxRetries
         );
         return false;
+    }
+
+    // Bounded per cycle so the one-off cover-page reads never crowd out the realtime 13F sweep,
+    // which shares the SEC rate limiter.
+    internal const int HolderIdentityBackfillPerCycle = 2000;
+
+    private async Task BackfillHolderIdentity(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var scope = ScopeFactory.CreateAsyncScope();
+            await scope
+                .ServiceProvider.GetRequiredService<HolderIdentityBackfillService>()
+                .Run(HolderIdentityBackfillPerCycle, cancellationToken);
+        }
+        catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            Logger.LogError(exception, "Holder identity backfill failed; retrying next cycle");
+        }
+    }
+
+    // Bounded per cycle because each data set is a full archive download.
+    internal const int Form13FNoticeDataSetsPerCycle = 8;
+
+    private async Task SyncForm13FNotices(
+        IReadOnlyCollection<string> fileNames,
+        CancellationToken cancellationToken
+    )
+    {
+        try
+        {
+            await using var scope = ScopeFactory.CreateAsyncScope();
+            await scope
+                .ServiceProvider.GetRequiredService<Form13FNoticeSyncService>()
+                .SyncMissing(fileNames, Form13FNoticeDataSetsPerCycle, cancellationToken);
+        }
+        catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            Logger.LogError(exception, "13F notice sync failed; retrying next cycle");
+        }
+    }
+
+    internal const int HolderFilerProfilesPerCycle = 2000;
+
+    private async Task RefreshHolderFilerProfiles(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var scope = ScopeFactory.CreateAsyncScope();
+            await scope
+                .ServiceProvider.GetRequiredService<HolderFilerProfileRefreshService>()
+                .Run(HolderFilerProfilesPerCycle, cancellationToken);
+        }
+        catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            Logger.LogError(exception, "Holder EDGAR profile refresh failed; retrying next cycle");
+        }
+    }
+
+    private async Task RefreshHolderProfiles(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var scope = ScopeFactory.CreateAsyncScope();
+            await scope
+                .ServiceProvider.GetRequiredService<HolderProfileRefreshService>()
+                .Run(DateOnly.FromDateTime(DateTime.UtcNow), cancellationToken);
+        }
+        catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            Logger.LogError(exception, "Holder profile refresh failed; retrying next cycle");
+        }
+    }
+
+    private async Task RefreshHolderSuccessions(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var scope = ScopeFactory.CreateAsyncScope();
+            await scope
+                .ServiceProvider.GetRequiredService<HolderSuccessionRefreshService>()
+                .Run(DateOnly.FromDateTime(DateTime.UtcNow), cancellationToken);
+        }
+        catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            Logger.LogError(exception, "Holder succession refresh failed; retrying next cycle");
+        }
     }
 
     private async Task BackfillHolderClassifications(CancellationToken cancellationToken)

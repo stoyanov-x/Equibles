@@ -2,6 +2,7 @@ using System.ComponentModel;
 using Equibles.CommonStocks.Data.Helpers;
 using Equibles.CommonStocks.Data.Models;
 using Equibles.CommonStocks.Repositories;
+using Equibles.CommonStocks.Repositories.Extensions;
 using Equibles.Core.Extensions;
 using Equibles.Errors.BusinessLogic;
 using Equibles.Errors.BusinessLogic.Extensions;
@@ -24,15 +25,6 @@ public class RagSearchTools
 {
     private const int MaxExcludedTickers = 25;
 
-    // A BM25 statement-budget timeout is the one search failure the caller can act on, so name
-    // the stall instead of the executor's catch-all (production, 2026-09-02). A corpus-wide search
-    // has no bounded fallback, so a narrower call is what works; a scoped one already degraded.
-    internal const string UnscopedSearchTimedOutMessage =
-        "The search timed out before it could rank the excerpts. Narrow it with a ticker, or shorten the query to its 3-4 most specific terms, then retry.";
-
-    internal const string ScopedSearchTimedOutMessage =
-        "The search timed out before it could rank the excerpts. Retry the same call, or shorten the query to its 3-4 most specific terms.";
-
     // Attribute descriptions are compile-time constants, so they cannot enumerate types
     // registered at host startup (DocumentType.Register). They name the built-in filing
     // values plus the most useful registered example, and the strict rejection below
@@ -42,10 +34,10 @@ public class RagSearchTools
     // to round-trip through ParseDocumentType in THIS build, and EarningsCallTranscript
     // is registered by the commercial host only.
     private const string DocumentTypeDescription =
-        "Document type filter. Accepts a registered type value — 'TenK', 'TenQ', 'EightK', 'TenKa', 'TenQa', 'EightKa', 'TwentyF', 'SixK', 'FortyF', 'TwentyFa', 'SixKa', or 'FortyFa' — or its display name (e.g. '10-K', '20-F/A'), plus any deployment-registered type, such as EarningsCallTranscript (display name: Earnings Call) for earnings-call transcripts where available. An unrecognized value returns an error listing every accepted value.";
+        "Document type filter: a registered value such as 'TenK', 'TenQa', 'EightK', 'TwentyF', 'Def14A', 'Defa14A', 'SThree' or 'TenderOfferThirdParty', or its SEC form name ('10-K', '20-F/A', 'DEFA14A', 'S-3ASR', 'SC TO-T', 'NT 10-Q'), plus deployment-registered types such as EarningsCallTranscript. An unrecognized value returns an error listing every accepted value.";
 
     private const string DocumentTypesDescription =
-        "Optional document types. Accepts registered values such as TenK, TenQ, EightK, TwentyF, SixK, FortyF, or deployment-registered types such as EarningsCallTranscript. Display names such as 10-K are also accepted; an invalid value returns the full accepted list.";
+        "Optional document types. Accepts registered values such as TenK, TenQ, EightK, TwentyF, SixK, FortyF, Def14A, SOne, or deployment-registered types such as EarningsCallTranscript. SEC form names such as 10-K, DEFA14A, S-3, SC TO-T or NT 10-K are also accepted; an invalid value returns the full accepted list.";
 
     private const string MaxExcerptCharsDescription =
         "Maximum characters per excerpt (default: 0 = full excerpt). Set a small value (e.g. 400) for a compact scan across many results; truncated excerpts end with an explicit note.";
@@ -82,14 +74,16 @@ public class RagSearchTools
 
     [McpServerTool(Name = "SearchDocuments", Title = "Search SEC Filings", ReadOnly = true)]
     [Description(
-        "Search SEC filings and earnings-call transcripts with hybrid keyword and semantic retrieval. Omit ticker to search every company, or provide one ticker to search only that company. Returns excerpts with document IDs for SearchDocument or ReadDocumentLines. Use excludeTickers and maxResultsPerCompany only for market-wide discovery; use ListFilings to browse filings newest first without a text query."
+        "Search SEC filings and earnings-call transcripts with hybrid keyword and semantic retrieval, or with match 'phrase' for only the excerpts containing an exact phrase. Omit ticker to search every company, or provide one ticker to search only that company. Returns excerpts with document IDs for SearchDocument or ReadDocumentLines. Use excludeTickers and maxResultsPerCompany only for market-wide discovery; use ListFilings to browse filings newest first without a text query."
     )]
     public Task<string> SearchDocuments(
         [Description(
-            "Search query — plain keywords or a short natural-language phrase. When too few excerpts match every word, the search automatically broadens to match any of the words; concise, filing-phrased terms (e.g. 'Data Center revenue') still rank best."
+            "Search query — plain keywords or a short natural-language phrase. In ranked mode, when too few excerpts match every word, the search automatically broadens to match any of the words; concise, filing-phrased terms (e.g. 'Data Center revenue') still rank best. In phrase mode, the exact phrase to find."
         )]
             string query,
-        [Description("Optional company ticker. Omit to search across all companies.")]
+        [Description(
+            "Optional company ticker; a listing outside the US is MIC:TICKER (e.g. XPAR:AIR). Omit to search across all companies."
+        )]
             string ticker = null,
         [Description("Maximum number of results to return (default: 5, max: 500)")]
             int maxResults = 5,
@@ -104,7 +98,11 @@ public class RagSearchTools
             "Maximum results from any single company (default: 0 = unlimited). Set a small value (e.g. 2) to spread results across more companies for discovery-style queries."
         )]
             int maxResultsPerCompany = 0,
-        [Description(MaxExcerptCharsDescription)] int maxExcerptChars = 0
+        [Description(MaxExcerptCharsDescription)] int maxExcerptChars = 0,
+        [Description(
+            "How the query matches: 'ranked' (default — relevance-ranked keyword and semantic retrieval that broadens to any of the words when results are sparse) or 'phrase' (only excerpts containing the query's words consecutively and in order; case and punctuation are ignored)."
+        )]
+            string match = "ranked"
     )
     {
         return _runner.Execute(
@@ -113,6 +111,9 @@ public class RagSearchTools
                 var dateError = ValidateDateRange(startDate, endDate);
                 if (dateError != null)
                     return dateError;
+
+                if (!TryParseSearchMatch(match, out var searchMatch))
+                    return $"Unknown match \"{match}\" — pass 'ranked' (default) or 'phrase'.";
 
                 if (!TryParseDocumentTypes(documentTypes, out var parsedTypes, out var typeError))
                     return typeError;
@@ -127,28 +128,24 @@ public class RagSearchTools
                     if (parsedTickers != null)
                         return "ticker and excludeTickers cannot be combined.";
 
-                    var normalizedTicker = McpToolExecutor.NormalizeTicker(ticker);
-                    if (normalizedTicker == null)
-                        return McpToolExecutor.StockNotFound(ticker);
-
-                    EquityIssuer stock = await _commonStockRepository.GetUsByTicker(
-                        normalizedTicker
-                    );
-                    if (stock == null)
-                        return McpToolExecutor.StockNotFound(ticker);
+                    var (_, filer, filerError) = await ResolveFiler(ticker);
+                    if (filerError != null)
+                        return filerError;
 
                     chunks = await SearchOrTimeoutFault(
                         () =>
                             _ragManager.SearchRelevantChunksByCompany(
                                 query,
-                                stock.Presentation.Listing.Ticker,
+                                filer,
                                 maxResults,
                                 parsedTypes,
                                 ToDateOnly(startDate),
                                 ToDateOnly(endDate),
-                                broadenSparseResults: true
+                                broadenSparseResults: true,
+                                match: searchMatch
                             ),
-                        scoped: true
+                        scoped: true,
+                        match: searchMatch
                     );
                 }
                 else
@@ -163,9 +160,11 @@ public class RagSearchTools
                                 ToDateOnly(endDate),
                                 parsedTickers,
                                 Math.Max(maxResultsPerCompany, 0),
-                                broadenSparseResults: true
+                                broadenSparseResults: true,
+                                match: searchMatch
                             ),
-                        scoped: false
+                        scoped: false,
+                        match: searchMatch
                     );
                 }
 
@@ -260,10 +259,12 @@ public class RagSearchTools
 
     [McpServerTool(Name = "ListFilings", Title = "List Filings", ReadOnly = true)]
     [Description(
-        "List stored SEC filings and earnings-call transcripts newest first. Omit ticker for a market-wide feed or provide one ticker for a company-specific list. Returns company identity, document IDs, types, filing and reporting dates, SEC item numbers, line counts, and page totals. Supports date, document-type, and exact SEC item-number filters. Hidden document types remain excluded unless explicitly requested. Pass a returned ID to SearchDocument or ReadDocumentLines."
+        "List stored SEC filings and earnings-call transcripts newest first. Omit ticker for a market-wide feed or provide one ticker for a company-specific list. Returns company identity, document IDs, types, filing and reporting dates, SEC item numbers, line counts, EDGAR accession numbers and acceptance times (UTC; blank for filings stored before October 2026), and page totals. Supports date, document-type, and exact SEC item-number filters. Hidden document types remain excluded unless explicitly requested. Pass a returned ID to SearchDocument or ReadDocumentLines."
     )]
     public Task<string> ListFilings(
-        [Description("Optional company ticker symbol (e.g., AAPL, MSFT). Omit for all companies.")]
+        [Description(
+            "Optional company ticker symbol (e.g., AAPL, MSFT); a listing outside the US is MIC:TICKER (e.g. XPAR:AIR), whose list includes its ESEF reports. Omit for all companies."
+        )]
             string ticker = null,
         [Description("Page number for pagination (default: 1)")] int page = 1,
         [Description("Maximum number of documents per page (default: 10)")] int maxItems = 10,
@@ -297,15 +298,12 @@ public class RagSearchTools
                     return $"Invalid itemNumber '{itemNumber}'. Use an SEC item number such as 2.02, 5.02, or 1.01.";
 
                 EquityIssuer stock = null;
+                string filer = null;
                 if (!string.IsNullOrWhiteSpace(ticker))
                 {
-                    var normalizedTicker = McpToolExecutor.NormalizeTicker(ticker);
-                    if (normalizedTicker == null)
-                        return McpToolExecutor.StockNotFound(ticker);
-
-                    stock = await _commonStockRepository.GetUsByTicker(normalizedTicker);
-                    if (stock == null)
-                        return McpToolExecutor.StockNotFound(ticker);
+                    (stock, filer, var filerError) = await ResolveFiler(ticker);
+                    if (filerError != null)
+                        return filerError;
                 }
 
                 maxItems = McpLimit.Clamp(maxItems);
@@ -318,14 +316,14 @@ public class RagSearchTools
                 try
                 {
                     totalCount = await _secDocumentService.CountDocuments(
-                        stock?.Presentation?.Listing?.Ticker,
+                        filer,
                         startDate,
                         endDate,
                         parsedType,
                         normalizedItemNumber
                     );
                     documents = await _secDocumentService.GetRecentDocuments(
-                        stock?.Presentation?.Listing?.Ticker,
+                        filer,
                         startDate,
                         endDate,
                         maxItems,
@@ -351,15 +349,10 @@ public class RagSearchTools
                     if (!hasFilters)
                         return stock == null
                             ? "No filings are stored."
-                            : $"No documents found for ticker {stock.Presentation.Listing.Ticker}";
+                            : $"No documents found for ticker {filer}";
 
-                    var scope =
-                        stock == null
-                            ? "the market-wide corpus"
-                            : stock.Presentation.Listing.Ticker;
-                    var unfiltered = await _secDocumentService.CountDocuments(
-                        stock?.Presentation?.Listing?.Ticker
-                    );
+                    var scope = stock == null ? "the market-wide corpus" : filer;
+                    var unfiltered = await _secDocumentService.CountDocuments(filer);
                     return $"No documents match the given filters for {scope} — {McpFormat.WholeNumber(unfiltered)} document(s) exist without them. Relax documentType/itemNumber/startDate/endDate.";
                 }
 
@@ -370,9 +363,9 @@ public class RagSearchTools
                 var result = MarkdownTable.Start(
                     stock == null
                         ? $"Market-wide filings — page {page} of {McpFormat.WholeNumber(totalPages)} ({McpFormat.WholeNumber(totalCount)} documents):"
-                        : $"Financial documents for {MarkdownTable.EscapeCell(stock.Name)} ({MarkdownTable.EscapeCell(stock.Presentation.Listing.Ticker)}) — page {page} of {McpFormat.WholeNumber(totalPages)} ({McpFormat.WholeNumber(totalCount)} documents):",
-                    "Ticker | Company | ID | Type | Filed | Reporting For | Items | Lines",
-                    "-------|---------|----|------|-------|---------------|-------|------"
+                        : $"Financial documents for {MarkdownTable.EscapeCell(stock.Name)} ({MarkdownTable.EscapeCell(filer)}) — page {page} of {McpFormat.WholeNumber(totalPages)} ({McpFormat.WholeNumber(totalCount)} documents):",
+                    "Ticker | Company | ID | Type | Filed | Reporting For | Items | Lines | Accession | Accepted (UTC)",
+                    "-------|---------|----|------|-------|---------------|-------|-------|-----------|---------------"
                 );
 
                 result.AppendRows(
@@ -380,7 +373,13 @@ public class RagSearchTools
                     doc =>
                     {
                         var items = string.Join(",", SecFilingItemNumber.ParseStored(doc.Items));
-                        return $"{MarkdownTable.EscapeCell(doc.Ticker)} | {MarkdownTable.EscapeCell(doc.CompanyName)} | {doc.Id} | {doc.DocumentType} | {McpFormat.Invariant(doc.ReportingDate, "yyyy-MM-dd")} | {McpFormat.Invariant(doc.ReportingForDate, "yyyy-MM-dd")} | {MarkdownTable.EscapeCell(items, "—")} | {McpFormat.WholeNumber(doc.LineCount)}";
+                        var accepted = doc.AcceptedAt is { } at
+                            ? McpFormat.Invariant(at, "yyyy-MM-dd HH:mm:ss")
+                            : "—";
+                        var period = doc.ReportingForDate is { } date
+                            ? McpFormat.Invariant(date, "yyyy-MM-dd")
+                            : "—";
+                        return $"{MarkdownTable.EscapeCell(doc.Ticker)} | {MarkdownTable.EscapeCell(doc.CompanyName)} | {doc.Id} | {doc.DocumentType} | {McpFormat.Invariant(doc.ReportingDate, "yyyy-MM-dd")} | {period} | {MarkdownTable.EscapeCell(items, "—")} | {McpFormat.WholeNumber(doc.LineCount)} | {MarkdownTable.EscapeCell(doc.AccessionNumber, "—")} | {accepted}";
                     }
                 );
 
@@ -448,6 +447,37 @@ public class RagSearchTools
                 )
         );
 
+    // A bare ticker is the US filer, as before. MIC:TICKER, or a provider suffix after a US miss, names
+    // a listing outside the US, scoped to that issuer's documents under the listing's display symbol.
+    private async Task<(EquityIssuer Stock, string Filer, string Error)> ResolveFiler(string ticker)
+    {
+        if (EquityListingSymbol.TryParse(ticker, out _, out _))
+        {
+            var (venueStock, venue, venueError) = await _commonStockRepository.ResolveListing(
+                ticker
+            );
+            return venue == null
+                ? (null, null, venueError)
+                : (venueStock, EquityListingSymbol.Display(venue), null);
+        }
+
+        var normalizedTicker = McpToolExecutor.NormalizeTicker(ticker);
+        if (normalizedTicker == null)
+            return (null, null, McpToolExecutor.StockNotFound(ticker));
+        EquityIssuer stock = await _commonStockRepository.GetUsByTicker(normalizedTicker);
+        if (stock != null)
+            return (stock, stock.Presentation.Listing.Ticker, null);
+
+        var notFound = McpToolExecutor.StockNotFound(ticker);
+        var (suffixStock, suffixVenue, _) = await _commonStockRepository.ResolveSuffixAfterUsMiss(
+            ticker,
+            notFound
+        );
+        return suffixVenue == null
+            ? (null, null, notFound)
+            : (suffixStock, EquityListingSymbol.Display(suffixVenue), null);
+    }
+
     private static bool TryParseTickers(
         IReadOnlyCollection<string> tickers,
         out IReadOnlyCollection<string> parsed,
@@ -492,14 +522,13 @@ public class RagSearchTools
             ? $"startDate {McpFormat.Invariant(startDate.Value, "yyyy-MM-dd")} is after endDate {McpFormat.Invariant(endDate.Value, "yyyy-MM-dd")} — swap the values."
             : null;
 
-    // Signposts a result shortfall so the caller knows relaxing filters (not paging or
-    // retrying) is the next move. Empty results keep the plain empty-state message.
     // Turns a BM25 statement-budget timeout into a fault the caller can act on, keeping the
     // original exception attached so the recorded Errors row still shows what actually failed.
     // Every other failure keeps the executor's catch-all wording.
     internal static async Task<List<Chunk>> SearchOrTimeoutFault(
         Func<Task<List<Chunk>>> search,
-        bool scoped
+        bool scoped,
+        SearchMatch match = SearchMatch.Ranked
     )
     {
         try
@@ -508,13 +537,28 @@ public class RagSearchTools
         }
         catch (ChunkSearchTimeoutException exception)
         {
-            throw new McpToolFaultException(
-                scoped ? ScopedSearchTimedOutMessage : UnscopedSearchTimedOutMessage,
-                exception
-            );
+            throw new McpToolFaultException(SearchTimeoutAdvice.For(scoped, match), exception);
         }
     }
 
+    internal static bool TryParseSearchMatch(string value, out SearchMatch match)
+    {
+        switch ((value ?? "ranked").Trim().ToLowerInvariant())
+        {
+            case "ranked":
+                match = SearchMatch.Ranked;
+                return true;
+            case "phrase":
+                match = SearchMatch.Phrase;
+                return true;
+            default:
+                match = SearchMatch.Ranked;
+                return false;
+        }
+    }
+
+    // Signposts a result shortfall so the caller knows relaxing filters (not paging or
+    // retrying) is the next move. Empty results keep the plain empty-state message.
     private static string AppendShortfallNote(string context, int returned, int requested) =>
         returned > 0 && returned < requested
             ? context

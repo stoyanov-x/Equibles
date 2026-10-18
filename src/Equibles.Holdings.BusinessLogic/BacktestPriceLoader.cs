@@ -91,10 +91,7 @@ public class BacktestPriceLoader
         if (!listingKeys.Contains(benchmarkKey))
             listingKeys.Add(benchmarkKey);
 
-        var priceWindowFrom =
-            from > DateOnly.MinValue.AddDays(PriceLookbackDays)
-                ? from.AddDays(-PriceLookbackDays)
-                : DateOnly.MinValue;
+        var priceWindowFrom = PriceWindowStart(from);
         var splits = await _splitRepository
             .GetAll()
             .Where(split =>
@@ -103,13 +100,14 @@ public class BacktestPriceLoader
                 && split.EffectiveDate <= to
             )
             .ToListAsync(cancellationToken);
+        var splitsByIssuer = new IssuerSplitIndex(splits);
 
         var splitDatesByListing = new Dictionary<ListingKey, DateOnly[]>();
         foreach (var key in listingKeys)
         {
             var primaryTicker = primaryTickers.GetValueOrDefault(key.CommonStockId);
             var scoped = PriceSeriesSplitScope.ForPriceComparison(
-                splits.Where(split => split.EquityIssuerId == key.CommonStockId),
+                splitsByIssuer.For(key.CommonStockId),
                 key.ListedTicker
             );
             splitDatesByListing[key] = scoped
@@ -147,7 +145,7 @@ public class BacktestPriceLoader
             stockByListing,
             priceWindowFrom,
             to,
-            splits,
+            splitsByIssuer,
             cancellationToken
         );
         var pricesByListing = rows.Select(row => new
@@ -284,6 +282,46 @@ public class BacktestPriceLoader
 
     private static string NormalizeTicker(string ticker) => ticker?.Trim().ToUpperInvariant();
 
+    private static DateOnly PriceWindowStart(DateOnly from) =>
+        from > DateOnly.MinValue.AddDays(PriceLookbackDays)
+            ? from.AddDays(-PriceLookbackDays)
+            : DateOnly.MinValue;
+
+    /// <summary>
+    /// Whether the <paramref name="listedTicker"/> listing of <paramref name="stock"/> has any
+    /// close a backtest over <paramref name="from"/>..<paramref name="to"/> would read.
+    /// </summary>
+    public async Task<bool> HasPrices(
+        EquityIssuer stock,
+        string listedTicker,
+        DateOnly from,
+        DateOnly to,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var ticker = NormalizeTicker(listedTicker);
+        var listings = await _priceRepository
+            .GetUsListingReferences([stock.Id])
+            .Select(listing => new { listing.Id, listing.Ticker })
+            .ToListAsync(cancellationToken);
+        var listingIds = listings
+            .Where(listing => NormalizeTicker(listing.Ticker) == ticker)
+            .Select(listing => listing.Id)
+            .ToList();
+        if (listingIds.Count == 0)
+            return false;
+        var priceWindowFrom = PriceWindowStart(from);
+        return await _priceRepository
+            .GetUsSeries()
+            .AnyAsync(
+                price =>
+                    listingIds.Contains(price.EquityListingId)
+                    && price.Date >= priceWindowFrom
+                    && price.Date <= to,
+                cancellationToken
+            );
+    }
+
     // Every listing is read through the process-wide series cache. A miss, or a listing whose
     // stock gained a split since its rows were read, is read for the whole window; a cached
     // listing is re-read from the unsettled tail before its last cached date, so the newest
@@ -294,7 +332,7 @@ public class BacktestPriceLoader
         IReadOnlyDictionary<Guid, Guid> stockByListing,
         DateOnly priceWindowFrom,
         DateOnly to,
-        IReadOnlyList<StockSplit> splits,
+        IssuerSplitIndex splitsByIssuer,
         CancellationToken cancellationToken
     )
     {
@@ -305,15 +343,17 @@ public class BacktestPriceLoader
         {
             if (
                 _seriesCache.TryGet(listingId, priceWindowFrom, out var cached)
-                && !RestatedSince(splits, stockId, cached.LoadedAt)
+                && !RestatedSince(splitsByIssuer.For(stockId), cached.LoadedAt)
             )
             {
                 hits.Add((listingId, cached));
             }
             else
             {
-                // Yesterday's generation would otherwise hold its capacity until it expires.
-                _seriesCache.Remove(listingId, priceWindowFrom.AddDays(-1));
+                // Yesterday's generation would otherwise hold its capacity until it expires; a
+                // window clamped to the first representable day has no earlier generation.
+                if (priceWindowFrom > DateOnly.MinValue)
+                    _seriesCache.Remove(listingId, priceWindowFrom.AddDays(-1));
                 misses.Add(listingId);
             }
         }
@@ -409,14 +449,9 @@ public class BacktestPriceLoader
         return tail < priceWindowFrom ? priceWindowFrom : tail;
     }
 
-    private static bool RestatedSince(
-        IReadOnlyList<StockSplit> splits,
-        Guid stockId,
-        DateTime loadedAt
-    ) =>
-        splits.Any(split =>
-            split.EquityIssuerId == stockId
-            && (split.CreationTime > loadedAt || split.PriceAdjustmentAppliedTime > loadedAt)
+    private static bool RestatedSince(IEnumerable<StockSplit> issuerSplits, DateTime loadedAt) =>
+        issuerSplits.Any(split =>
+            split.CreationTime > loadedAt || split.PriceAdjustmentAppliedTime > loadedAt
         );
 
     private async Task<List<QueriedPriceRow>> QueryRows(

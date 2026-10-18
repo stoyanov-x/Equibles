@@ -24,9 +24,14 @@ public interface ISecEdgarClient
         string cik,
         CancellationToken cancellationToken = default
     );
+
+    /// <summary>
+    /// A company's filings, optionally only those whose EDGAR form string equals
+    /// <paramref name="edgarForm"/> exactly (e.g. <c>"10-K"</c>, <c>"SC TO-T/A"</c>).
+    /// </summary>
     Task<List<FilingData>> GetCompanyFilings(
         string cik,
-        DocumentTypeFilter? documentType = null,
+        string edgarForm = null,
         DateOnly? fromDate = null,
         DateOnly? toDate = null
     );
@@ -96,6 +101,16 @@ public interface ISecEdgarClient
     );
 
     /// <summary>
+    /// Whether EDGAR still publishes the filing's directory. Only a 404 answers false; any
+    /// other failure throws, so an unreachable directory never reads as a removed filing.
+    /// </summary>
+    Task<bool> FilingExists(
+        string cik,
+        string accessionNumber,
+        CancellationToken cancellationToken = default
+    );
+
+    /// <summary>
     /// Fetches one page of EDGAR's "Latest Filings" ATOM feed — the real-time
     /// stream of accepted submissions across all filers. The feed is a rolling
     /// window of the most recent entries only, so callers that must not miss a
@@ -115,5 +130,5 @@ public interface ISecEdgarClient
     /// <see cref="GetCompanyMetadata"/>). Only examines recent filings — no
     /// archive fetching. Returns null when no filing of the given type exists.
     /// </summary>
-    Task<DateOnly?> GetMostRecentReportDate(string cik, DocumentTypeFilter formType);
+    Task<DateOnly?> GetMostRecentReportDate(string cik, string edgarForm);
 }

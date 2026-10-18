@@ -155,6 +155,9 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
                 // The holder's common-share total (a position page's portfolio-weight denominator)
                 // sums Value where OptionType is null; it ran per request on every position page.
                 h.OptionType,
+                // The fund-scoring history read projects ListedTicker; without it every row of a
+                // filer's history was fetched from the heap, the worker's heaviest statement.
+                h.ListedTicker,
             });
 
         // Covering index for the per-stock 13F ranking pages (Most-Held Stocks,
@@ -296,6 +299,9 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
 
         builder.Entity<UnmappedCusip>();
         builder.Entity<FilingOtherManager>();
+        builder.Entity<Form13FNotice>();
+        builder.Entity<Form13FNoticeReporter>();
+        builder.Entity<Form13FNoticeDataSet>();
         builder.Entity<ProcessedDataSet>();
         builder.Entity<HoldingsCusipRescan>();
         builder.Entity<ProcessedFiling>();
@@ -303,7 +309,28 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
         builder.Entity<HoldingLabelConvergenceState>();
         builder.Entity<InstitutionalFiling>();
         builder.Entity<RealtimeSweepState>();
+        builder.Entity<BeneficialOwnershipFiling>();
+        builder.Entity<HolderClassificationEvidence>();
+        builder.Entity<InstitutionalHolderProfile>();
+        builder.Entity<HolderSuccession>();
+        builder.Entity<BeneficialOwnershipReportingPerson>();
         builder.Entity<FundScore>();
+        builder.Entity<FundScoreAttempt>();
+
+        // Holder-intelligence engine: per-quarter drain state, per-holder metrics and the
+        // presence bitmask tenure reads, unique per exact listing with a null primary.
+        builder.Entity<HolderIntelligenceQuarterState>();
+        builder.Entity<HolderQuarterlyMetrics>();
+        builder
+            .Entity<HolderStockPresence>()
+            .HasIndex(p => new
+            {
+                p.InstitutionalHolderId,
+                p.EquityIssuerId,
+                p.ListedTicker,
+            })
+            .IsUnique()
+            .AreNullsDistinct(false);
 
         // Audit trail for on-demand 13F reconciliation runs; its CreationTime and
         // InstitutionalHolderId indexes are declared as attributes on the entity.

@@ -65,23 +65,11 @@ public class InsiderFilingReprocessWorker : BaseScraperWorker
 
             var backfillStateRepo =
                 sweepScope.ServiceProvider.GetRequiredService<BackfillStateRepository>();
-            if (await backfillStateRepo.GetByName(ShareslessReopenMarker) == null)
-            {
-                var reopened = await sweep.ReopenShareslessVerdicts(stoppingToken);
-                if (reopened < InsiderMisrepairedPriceSweep.MaxRowsPerCycle)
-                {
-                    // Drained in this pass — stamp the marker so the non-self-terminating
-                    // predicate never re-opens rows the fixed validator re-flagged.
-                    backfillStateRepo.Add(
-                        new BackfillState
-                        {
-                            Name = ShareslessReopenMarker,
-                            LastFullRescanAt = DateTime.UtcNow,
-                        }
-                    );
-                    await backfillStateRepo.SaveChanges();
-                }
-            }
+            await RunOneShot(
+                backfillStateRepo,
+                ShareslessReopenMarker,
+                () => sweep.ReopenShareslessVerdicts(stoppingToken)
+            );
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
@@ -117,5 +105,26 @@ public class InsiderFilingReprocessWorker : BaseScraperWorker
                     backfillResult.Pending
                 );
         }
+    }
+
+    // Runs a non-self-terminating pass until one drains below the cycle bound, then stamps the
+    // marker so the pass never re-touches rows the validator has since re-judged.
+    private static async Task RunOneShot(
+        BackfillStateRepository backfillStateRepo,
+        string markerName,
+        Func<Task<int>> pass
+    )
+    {
+        if (await backfillStateRepo.GetByName(markerName) != null)
+            return;
+
+        var touched = await pass();
+        if (touched >= InsiderMisrepairedPriceSweep.MaxRowsPerCycle)
+            return;
+
+        backfillStateRepo.Add(
+            new BackfillState { Name = markerName, LastFullRescanAt = DateTime.UtcNow }
+        );
+        await backfillStateRepo.SaveChanges();
     }
 }

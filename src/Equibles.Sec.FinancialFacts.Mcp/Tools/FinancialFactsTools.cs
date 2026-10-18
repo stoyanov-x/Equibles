@@ -15,6 +15,7 @@ using Equibles.Errors.Data.Models;
 using Equibles.Mcp;
 using Equibles.Mcp.Helpers;
 using Equibles.Sec.Data.Models;
+using Equibles.Sec.FinancialFacts.BusinessLogic.Splits;
 using Equibles.Sec.FinancialFacts.Data;
 using Equibles.Sec.FinancialFacts.Data.Enums;
 using Equibles.Sec.FinancialFacts.Data.Models;
@@ -60,8 +61,10 @@ public class FinancialFactsTools
     [Description(
         "Get a single financial concept (e.g. revenue, net income, diluted EPS, total "
             + "assets, operating cash flow) over time for a company, sourced from SEC "
-            + "Company Facts (structured XBRL). Returns a time series, one row per fiscal "
-            + "period, using the latest restated value unless asOriginallyReported is set. "
+            + "Company Facts (structured XBRL), or from the issuer's regulatory filings for a "
+            + "listing outside the US. Returns a time series using the latest "
+            + "restated value unless asOriginallyReported is set: one row per fiscal period for "
+            + "flows, one row per as-of date for balances and share counts. "
             + "Each row carries its actual period start/end; fiscal years/quarters follow the "
             + "company's own fiscal calendar. Warns when the selected alias ends materially "
             + "before the company's other structured facts, which can indicate an XBRL tag "
@@ -70,7 +73,10 @@ public class FinancialFactsTools
             + "compare peers use CompareFinancialFact."
     )]
     public Task<string> GetFinancialFact(
-        [Description("Stock ticker symbol (e.g., AAPL, MSFT)")] string ticker,
+        [Description(
+            "Stock ticker symbol (e.g., AAPL, MSFT); a listing on another exchange is MIC:TICKER (XPAR:AIR)."
+        )]
+            string ticker,
         [Description(
             "Concept alias, e.g. 'revenue', 'net-income', 'eps-diluted', 'total-assets', "
                 + "'operating-cash-flow'. Call with an unknown value to list supported aliases."
@@ -104,7 +110,7 @@ public class FinancialFactsTools
                     return $"A concept is required. {SupportedAliasesNote()}";
 
                 var (stock, stockError) =
-                    await _commonStockRepository.ResolveByTickerIncludingDelisted(ticker);
+                    await _commonStockRepository.ResolveIssuerIncludingDelisted(ticker);
                 if (stockError != null)
                     return stockError;
 
@@ -139,9 +145,9 @@ public class FinancialFactsTools
                 // conceptId → alias priority (0 = the alias's primary tag). Used
                 // to break ties deterministically when one period carries facts
                 // under several of the alias's tags (the ASC 606 transition).
-                var conceptPriority = await ResolveConceptPriority(conceptRefs);
+                var (conceptPriority, conceptsById) = await ResolveConcepts(conceptRefs);
                 if (conceptPriority.Count == 0)
-                    return $"No '{concept}' data has been ingested for {stock.Presentation.Listing.Ticker}.";
+                    return $"No '{concept}' data has been ingested for {EquityListingSymbol.Display(stock)}.";
 
                 var facts = await _financialFactRepository
                     .GetConsolidatedByIssuerId(stock.Id)
@@ -153,49 +159,20 @@ public class FinancialFactsTools
                 var aliasLatestPeriodEnd =
                     facts.Count == 0 ? (DateOnly?)null : facts.Max(f => f.PeriodEnd);
                 var coverageNote = BuildCoverageNote(
-                    stock.Presentation.Listing.Ticker,
+                    EquityListingSymbol.Display(stock),
                     aliasLatestPeriodEnd,
                     companyLatestPeriodEnd
                 );
 
-                // Reported discrete fourth quarters hide under fp=FY — the same
-                // fiscal identity as the annual figure — so grouping by stamp
-                // alone never surfaces them as Q4 rows. Promote them first (see
-                // ReportedQuarterPromotion; a full-year total can never qualify).
-                var allFacts = ReportedQuarterPromotion.WithPromotedFourthQuarters(facts);
-
-                // Form / period-end / fiscal-period filtering in memory: a
-                // single concept's history is small, and DocumentType is a
-                // value-converted type so equality is kept off the SQL side
-                // for provider safety. The fiscal-period filter runs after
-                // promotion so a Q4 request sees the promoted rows.
-                var filtered = allFacts.Where(f =>
-                    (formFilter == null || f.Form == formFilter)
-                    && (fromBound == null || f.PeriodEnd >= fromBound.Value)
-                    && (toBound == null || f.PeriodEnd <= toBound.Value)
-                    && (periodFilter == null || f.FiscalPeriod == periodFilter.Value)
-                );
-
-                // One row per fiscal period. The alias may span several tags and
-                // a single period can carry facts under more than one of them
-                // (the ASC 606 transition year tags both Revenues and the new
-                // concept). Pick deterministically: a canonical periodic source
-                // wins, then the alias's primary tag, then the latest filing — or
-                // the earliest within that source priority, when the caller wants
-                // the figure as originally reported. The picked
-                // rows are then deduped by actual reporting span, because a
-                // date window can degenerate a fiscal group to a comparative
-                // re-report of an earlier period (see DedupeByReportingSpan).
-                var perPeriod = DedupeByReportingSpan(
-                        filtered
-                            .GroupBy(f => (f.FiscalYear, f.FiscalPeriod))
-                            // The full unfiltered history is the corroboration
-                            // context: a transition stub's neighbouring annual
-                            // windows can sit outside the caller's date window.
-                            .Select(g =>
-                                PickBestFact(g, conceptPriority, asOriginallyReported, facts)
-                            )
-                            .Where(f => f != null)
+                var perPeriod = (
+                    FinancialConceptAliases.IsInstant(concept)
+                        ? PickInstantRows(facts, conceptPriority, asOriginallyReported, formFilter)
+                        : PickFlowRows(facts, conceptPriority, asOriginallyReported, formFilter)
+                )
+                    .Where(f =>
+                        (fromBound == null || f.PeriodEnd >= fromBound.Value)
+                        && (toBound == null || f.PeriodEnd <= toBound.Value)
+                        && (periodFilter == null || f.FiscalPeriod == periodFilter.Value)
                     )
                     .OrderByDescending(f => f.PeriodEnd)
                     .ToList();
@@ -203,9 +180,9 @@ public class FinancialFactsTools
                 var shown = perPeriod.Take(Math.Clamp(maxResults, 1, MaxResultsCap)).ToList();
 
                 if (shown.Count == 0)
-                    return $"No '{concept}' data found for {stock.Presentation.Listing.Ticker} with the given filters.";
+                    return $"No '{concept}' data found for {EquityListingSymbol.Display(stock)} with the given filters.";
 
-                var splits = shown.Any(FinancialFactSplitAdjustment.IsPerShare)
+                var splits = shown.Any(f => SplitKind(f, conceptsById) != FactSplitKind.None)
                     ? await _stockSplitRepository
                         .GetEffectiveByStock(stock.Id, DateOnly.FromDateTime(DateTime.UtcNow))
                         .ToListAsync()
@@ -218,7 +195,8 @@ public class FinancialFactsTools
                     shown,
                     perPeriod.Count,
                     coverageNote,
-                    splits
+                    splits,
+                    conceptsById
                 );
             },
             "GetFinancialFact",
@@ -228,21 +206,44 @@ public class FinancialFactsTools
         );
     }
 
-    // A fromDate/toDate window can exclude a fiscal year's own period end while
-    // keeping a comparative re-report of an EARLIER period — a filing re-reports
-    // prior periods under its own fiscal identity, so that group degenerates to
-    // the comparative alone and its pick duplicates a period end another group
-    // already covers, under the wrong fiscal-year label (NVDA's FY2026 10-K
-    // re-reporting FY2025 EPS surfaced as a second "FY 2026" row when toDate
-    // excluded 2026-01-25). One row per actual reporting span: the smallest
-    // fiscal-year stamp is the period's own identity, because comparative
-    // re-filings always re-stamp the same span under the filing's LATER year
-    // (same rule as ReportedQuarterPromotion's anchor).
-    internal static List<FinancialFact> DedupeByReportingSpan(IEnumerable<FinancialFact> picked) =>
-        picked
-            .GroupBy(f => (f.PeriodStart, f.PeriodEnd, f.PeriodType))
-            .Select(g => g.OrderBy(f => f.FiscalYear).ThenBy(f => f.FiscalPeriod).First())
-            .ToList();
+    // A flow is one row per fiscal period. Reported discrete fourth quarters hide under fp=FY, so
+    // they are promoted first; the alias's full history is the transition-stub corroboration context.
+    // The picks are deduped by reporting span, since a bucket can hold only a comparative re-report.
+    private static List<FinancialFact> PickFlowRows(
+        List<FinancialFact> facts,
+        IReadOnlyDictionary<Guid, int> conceptPriority,
+        bool asOriginallyReported,
+        DocumentType formFilter
+    ) =>
+        FinancialFactSeriesShaper.DedupeByReportingSpan(
+            ReportedQuarterPromotion
+                .WithPromotedFourthQuarters(facts)
+                .Where(f => formFilter == null || f.Form == formFilter)
+                .GroupBy(f => (f.FiscalYear, f.FiscalPeriod))
+                .Select(g =>
+                    FinancialFactSeriesShaper.PickBestFact(
+                        g,
+                        conceptPriority,
+                        asOriginallyReported,
+                        facts
+                    )
+                )
+                .Where(f => f != null)
+        );
+
+    // A balance or share count is one row per as-of date, so a cover-page count and the quarter-end
+    // balance-sheet count both publish. The date and fiscal-period filters then apply to the rows.
+    private static List<FinancialFact> PickInstantRows(
+        List<FinancialFact> facts,
+        IReadOnlyDictionary<Guid, int> conceptPriority,
+        bool asOriginallyReported,
+        DocumentType formFilter
+    ) =>
+        FinancialFactSeriesShaper.PickPerDate(
+            facts.Where(f => formFilter == null || f.Form == formFilter),
+            conceptPriority,
+            asOriginallyReported
+        );
 
     [McpServerTool(
         Name = "CompareFinancialFact",
@@ -258,7 +259,10 @@ public class FinancialFactsTools
             + "different calendar months — check the Period End column."
     )]
     public Task<string> CompareFinancialFact(
-        [Description("Ticker symbols to compare (max 25).")] string[] tickers,
+        [Description(
+            "Ticker symbols to compare (max 25); a listing on another exchange is MIC:TICKER (XPAR:AIR)."
+        )]
+            string[] tickers,
         [Description(
             "Concept alias, e.g. 'revenue', 'net-income', 'eps-diluted'. Call with an "
                 + "unknown value to list supported aliases."
@@ -284,7 +288,7 @@ public class FinancialFactsTools
                 if (tickerError != null)
                     return tickerError;
 
-                var conceptPriority = await ResolveConceptPriority(conceptRefs);
+                var (conceptPriority, conceptsById) = await ResolveConcepts(conceptRefs);
                 if (conceptPriority.Count == 0)
                     return $"No '{concept}' data has been ingested.";
 
@@ -292,6 +296,27 @@ public class FinancialFactsTools
                 // then all matching facts in one go keyed by company.
                 var stocks = await _commonStockRepository.GetUsByTickers(requested).ToListAsync();
                 var stockByTicker = BuildComparisonStockMap(requested, stocks);
+                // A venue symbol, or a provider suffix the US directory does not know, names a
+                // listing outside the US; its issuer's facts compare like any other.
+                foreach (
+                    var ticker in requested.Where(ticker =>
+                        !stockByTicker.ContainsKey(ticker)
+                        && (
+                            ticker.Contains(EquityListingSymbol.DisplaySeparator)
+                            || ticker.Contains('.')
+                        )
+                    )
+                )
+                {
+                    var (venueStock, venue, _) = await _commonStockRepository.ResolveListing(
+                        ticker
+                    );
+                    if (venue == null)
+                        continue;
+                    stockByTicker.Add(ticker, venueStock);
+                    if (stocks.All(stock => stock.Id != venueStock.Id))
+                        stocks.Add(venueStock);
+                }
 
                 var stockIds = stocks.Select(s => s.Id).ToList();
                 // A Q4 request must also load the year's fp=FY rows: filers whose
@@ -335,13 +360,18 @@ public class FinancialFactsTools
                 // implicit row order).
                 var bestByStock = facts
                     .GroupBy(f => f.EquityIssuerId)
-                    .Select(g => (StockId: g.Key, Fact: PickBestFact(g, conceptPriority)))
+                    .Select(g =>
+                        (
+                            StockId: g.Key,
+                            Fact: FinancialFactSeriesShaper.PickBestFact(g, conceptPriority)
+                        )
+                    )
                     .Where(item => item.Fact != null)
                     .ToDictionary(item => item.StockId, item => item.Fact);
 
                 var (rows, skipped) = BuildComparisonRows(requested, stockByTicker, bestByStock);
                 var splitAdjustedStockIds = rows.Where(row =>
-                        FinancialFactSplitAdjustment.IsPerShare(row.Fact)
+                        SplitKind(row.Fact, conceptsById) != FactSplitKind.None
                     )
                     .Select(row => row.Fact.EquityIssuerId)
                     .Distinct()
@@ -370,7 +400,8 @@ public class FinancialFactsTools
                     stocks.ToDictionary(
                         stock => stock.Id,
                         stock => stock.Presentation.EquityListingId
-                    )
+                    ),
+                    conceptsById
                 );
             },
             "CompareFinancialFact",
@@ -403,12 +434,13 @@ public class FinancialFactsTools
         List<FinancialFact> perPeriod,
         int totalPeriods,
         string coverageNote,
-        IReadOnlyList<StockSplit> splits
+        IReadOnlyList<StockSplit> splits,
+        IReadOnlyDictionary<Guid, FinancialConceptAliases.ConceptRef> conceptsById
     )
     {
         var basis = asOriginallyReported ? "as originally reported" : "latest restated";
         var result = MarkdownTable.Start(
-            $"{concept} for {stock.Presentation.Listing.Ticker} ({FactMarkdown.Cell(stock.Name)}) — {basis}:",
+            $"{concept} for {EquityListingSymbol.Display(stock)} ({FactMarkdown.Cell(stock.Name)}) — {basis}:",
             "| Period Start | Period End | FY | Period | Value | Unit | Form | Filed | Accession |",
             "|--------------|------------|---:|--------|------:|------|------|-------|-----------|"
         );
@@ -418,15 +450,16 @@ public class FinancialFactsTools
             perPeriod,
             f =>
             {
-                var value = FinancialFactSplitAdjustment.Restate(
+                var restated = FactSplitBasis.Restate(
                     f,
+                    SplitKind(f, conceptsById),
                     splits,
-                    stock.Presentation.EquityListingId,
-                    out var adjusted,
-                    out var unresolved
+                    stock.Presentation.EquityListingId
                 );
+                var value = restated.Value;
+                var unresolved = restated.Unresolved;
                 unresolvedBasis |= unresolved;
-                splitAdjusted |= adjusted;
+                splitAdjusted |= restated.Adjusted;
                 return $"| {f.PeriodStart:yyyy-MM-dd} | {f.PeriodEnd:yyyy-MM-dd} | {f.FiscalYear} | "
                     + $"{f.FiscalPeriod.NameForHumans()} | "
                     + $"{FactMarkdown.Value(value, f.Unit)}{(unresolved ? " (as filed)" : "")} | "
@@ -521,9 +554,9 @@ public class FinancialFactsTools
             // The row stays traceable to the caller's input: a secondary-ticker
             // request shows that ticker, with the primary in parentheses.
             var label =
-                ticker == stock.Presentation.Listing.Ticker
-                    ? stock.Presentation.Listing.Ticker
-                    : $"{ticker} ({stock.Presentation.Listing.Ticker})";
+                ticker == EquityListingSymbol.Display(stock)
+                    ? EquityListingSymbol.Display(stock)
+                    : $"{ticker} ({EquityListingSymbol.Display(stock)})";
             rows.Add((label, stock.Name, best));
         }
         return (rows, skipped);
@@ -559,7 +592,13 @@ public class FinancialFactsTools
         var seenTickers = new HashSet<string>(StringComparer.Ordinal);
         foreach (var segment in segments)
         {
-            var normalizedTicker = TickerNormalizer.NormalizeListed(segment);
+            var normalizedTicker = EquityListingSymbol.TryParse(
+                segment,
+                out var venueCode,
+                out var venueTicker
+            )
+                ? EquityListingSymbol.Display(venueTicker, null, venueCode)
+                : TickerNormalizer.NormalizeListed(segment);
             if (normalizedTicker == null)
                 return (
                     [],
@@ -617,7 +656,8 @@ public class FinancialFactsTools
         List<(string Ticker, string Name, FinancialFact Fact)> rows,
         List<string> skipped,
         IReadOnlyDictionary<Guid, List<StockSplit>> splitsByStock,
-        IReadOnlyDictionary<Guid, Guid> listingIdsByStock
+        IReadOnlyDictionary<Guid, Guid> listingIdsByStock,
+        IReadOnlyDictionary<Guid, FinancialConceptAliases.ConceptRef> conceptsById
     )
     {
         var result = MarkdownTable.Start(
@@ -632,15 +672,16 @@ public class FinancialFactsTools
             r =>
             {
                 var splits = splitsByStock.GetValueOrDefault(r.Fact.EquityIssuerId) ?? [];
-                var value = FinancialFactSplitAdjustment.Restate(
+                var restated = FactSplitBasis.Restate(
                     r.Fact,
+                    SplitKind(r.Fact, conceptsById),
                     splits,
-                    listingIdsByStock[r.Fact.EquityIssuerId],
-                    out var adjusted,
-                    out var unresolved
+                    listingIdsByStock[r.Fact.EquityIssuerId]
                 );
+                var value = restated.Value;
+                var unresolved = restated.Unresolved;
                 unresolvedBasis |= unresolved;
-                splitAdjusted |= adjusted;
+                splitAdjusted |= restated.Adjusted;
                 return $"| {FactMarkdown.Cell(r.Ticker)} | {FactMarkdown.Cell(r.Name)} | "
                     + $"{FactMarkdown.Value(value, r.Fact.Unit)}{(unresolved ? " (as filed)" : "")} | "
                     + $"{FactMarkdown.Cell(r.Fact.Unit)} | "
@@ -673,106 +714,29 @@ public class FinancialFactsTools
                 );
         }
 
+        // Listings outside the US report in their own currency, so mixed units are not comparable as written.
+        var units = rows.Select(r => r.Fact.Unit)
+            .Where(unit => !string.IsNullOrWhiteSpace(unit))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (units.Count > 1)
+            result.AppendLine(
+                $"\n_Note: these rows are in different units ({FactMarkdown.Cell(string.Join(", ", units))}); "
+                    + "convert them to one currency before comparing values._"
+            );
+
         if (skipped.Count > 0)
             result.AppendLine($"\n_Skipped: {string.Join(", ", skipped)}._");
 
         return result.ToString();
     }
 
-    // AccessionNumber is the stable final tiebreak for same-day amendments
-    // (Postgres has no implicit row order). `asOriginallyReported` flips the
-    // filing-date / accession ordering to ascending so the earliest filing wins.
-    private static FinancialFact PickBestFact(
-        IEnumerable<FinancialFact> facts,
-        IReadOnlyDictionary<Guid, int> conceptPriority,
-        bool asOriginallyReported = false,
-        IReadOnlyCollection<FinancialFact> corroborationContext = null
-    )
-    {
-        var candidates = facts.ToList();
-
-        // Prefer the fact whose duration matches the fiscal period's granularity, so a
-        // quarter reads as the discrete three months and never the year-to-date total a
-        // 10-Q tags under the same fiscal Q2/Q3 (the financials tab handles this in
-        // FinancialStatementsHelper.PickCurrentlyReportedFact). Instants (balance sheet,
-        // zero span) always qualify. A corroborated fiscal-calendar transition stub
-        // remains a fallback; a duration above the annual ceiling is removed before it.
-        var fiscalPeriod = candidates[0].FiscalPeriod;
-        candidates = candidates
-            .Where(f =>
-                f.PeriodType != FactPeriodType.Duration
-                || f.PeriodEnd.DayNumber - f.PeriodStart.DayNumber
-                    is >= 0
-                        and <= FiscalPeriodSpanDays.MaxAnnualSpanDays
-            )
-            .ToList();
-        if (candidates.Count == 0)
-            return null;
-        var preferredSpan = candidates
-            .Where(f =>
-            {
-                if (f.PeriodType != FactPeriodType.Duration)
-                    return true;
-                var spanDays = f.PeriodEnd.DayNumber - f.PeriodStart.DayNumber;
-                return fiscalPeriod == SecFiscalPeriod.FullYear
-                    ? spanDays >= FiscalPeriodSpanDays.MinAnnualSpanDays
-                        && spanDays <= FiscalPeriodSpanDays.MaxAnnualSpanDays
-                    : spanDays <= FiscalPeriodSpanDays.MaxDiscreteQuarterDays;
-            })
-            .ToList();
-        if (preferredSpan.Count > 0)
-        {
-            // A period a duration fact already measures is never read off an instant in
-            // the same bucket: the instant is a declaration/record-date disclosure, and
-            // because it falls after the period end it wins the ordering below (a filer
-            // tagging a 2023-01-12 dividend payment as FY2022 published it as the FY2022
-            // dividend). Instant-only buckets — every balance-sheet concept — are
-            // untouched.
-            var durations = preferredSpan
-                .Where(f => f.PeriodType == FactPeriodType.Duration)
-                .ToList();
-            candidates = durations.Count > 0 ? durations : preferredSpan;
-        }
-        else if (fiscalPeriod == SecFiscalPeriod.FullYear)
-        {
-            // A FullYear bucket with no annual-span fact holds either a genuine
-            // fiscal-calendar transition stub or a misclassified sub-annual span (a
-            // year-to-date, a lone discrete quarter — FullYear is the enum's zero
-            // value, so unclassified periods land here too). Only a stub the
-            // surrounding annual windows corroborate on both sides may publish as
-            // the year; a caller with no corroboration context (the cross-company
-            // comparison, which loads a single fiscal slice — where a short stub
-            // would not be comparable anyway) fails closed instead.
-            candidates = candidates
-                .Where(f => AnnualTransitionStubs.IsCorroborated(f, corroborationContext))
-                .ToList();
-            if (candidates.Count == 0)
-                return null;
-        }
-        else
-        {
-            return null;
-        }
-
-        // Latest period end first: a filing re-reports comparative prior periods (the
-        // prior-year quarter, prior fiscal years, the prior year-end balance instant)
-        // under its own fiscal identity, and those tie the current figure on span and
-        // filed date — ignoring the period end surfaces a comparative column (#1546).
-        var byPeriod = candidates
-            .OrderByDescending(f => f.PeriodEnd)
-            .ThenBy(f => FinancialFactSourcePriority.Rank(f.Form))
-            .ThenBy(f => conceptPriority[f.FinancialConceptId]);
-        return asOriginallyReported
-            ? byPeriod.ThenBy(f => f.FiledDate).ThenBy(f => f.AccessionNumber).First()
-            : byPeriod
-                .ThenByDescending(f => f.FiledDate)
-                .ThenByDescending(f => f.AccessionNumber)
-                .First();
-    }
-
-    private async Task<Dictionary<Guid, int>> ResolveConceptPriority(
-        IReadOnlyList<FinancialConceptAliases.ConceptRef> conceptRefs
-    )
+    // The alias's ingested concepts: their pick priority, and the variant each was reported
+    // under, which decides how a split moves its values.
+    private async Task<(
+        Dictionary<Guid, int> Priority,
+        Dictionary<Guid, FinancialConceptAliases.ConceptRef> ConceptsById
+    )> ResolveConcepts(IReadOnlyList<FinancialConceptAliases.ConceptRef> conceptRefs)
     {
         var taxonomies = conceptRefs.Select(c => c.Taxonomy).Distinct().ToList();
         var tags = conceptRefs.Select(c => c.Tag).Distinct().ToList();
@@ -794,9 +758,18 @@ public class FinancialFactsTools
 
         // GetMatching is a taxonomy×tag cross product over a tiny alias tag set
         // (over-fetch is negligible here); narrow to the alias's exact pairs.
-        return rows.Where(r => priorityByPair.ContainsKey((r.Taxonomy, r.Tag)))
-            .ToDictionary(r => r.Id, r => priorityByPair[(r.Taxonomy, r.Tag)]);
+        var known = rows.Where(r => priorityByPair.ContainsKey((r.Taxonomy, r.Tag))).ToList();
+        return (
+            known.ToDictionary(r => r.Id, r => priorityByPair[(r.Taxonomy, r.Tag)]),
+            known.ToDictionary(r => r.Id, r => conceptRefs[priorityByPair[(r.Taxonomy, r.Tag)]])
+        );
     }
+
+    private static FactSplitKind SplitKind(
+        FinancialFact fact,
+        IReadOnlyDictionary<Guid, FinancialConceptAliases.ConceptRef> conceptsById
+    ) =>
+        FactSplitBasis.Classify(conceptsById.GetValueOrDefault(fact.FinancialConceptId), fact.Unit);
 
     // Accepts an absent bound (null/blank → no bound) but rejects a non-empty
     // value that is not an ISO yyyy-MM-dd date, so a typo can't silently widen

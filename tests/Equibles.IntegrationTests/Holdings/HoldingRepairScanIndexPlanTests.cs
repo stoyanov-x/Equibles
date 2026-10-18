@@ -3,6 +3,7 @@ using Equibles.CommonStocks.Data.Models;
 using Equibles.Data;
 using Equibles.Holdings.Data.Models;
 using Equibles.Holdings.HostedService.Services;
+using Equibles.Holdings.Repositories;
 using Equibles.IntegrationTests.Helpers;
 using FluentAssertions;
 using Microsoft.EntityFrameworkCore;
@@ -232,6 +233,56 @@ public class HoldingRepairScanIndexPlanTests(ParadeDbFixture fixture) : IAsyncLi
     // quarter book (grouped by the row grain), the holder's common-share total and the repricing
     // lane's pending-pair scan. Each must be served index-only by its covering index; a missing
     // include turns every row of a heavily held stock or a mega-filer into a heap fetch.
+    // The projection FundScoringManager.RunBacktest reads for every snapshot in a filer's window;
+    // every column must come from the holder index or each history row is a heap fetch.
+    [Fact]
+    public async Task FundScoringHistoryRead_IsServedIndexOnlyByTheHolderIndex()
+    {
+        var reportDate = new DateOnly(2024, 6, 30);
+        await SeedQuarter(reportDate, holders: 100, stocks: 100);
+        var capture = new CommandCapture();
+        await using var context = fixture.CreateDbContext(options =>
+            options.AddInterceptors(capture)
+        );
+        var holder = await context
+            .Set<InstitutionalHolder>()
+            .AsNoTracking()
+            .OrderBy(h => h.Cik)
+            .FirstAsync();
+        var relevant = new List<DateOnly>
+        {
+            reportDate,
+            reportDate.AddMonths(-3),
+            reportDate.AddMonths(-6),
+        };
+
+        var rows = await new InstitutionalHoldingRepository(context)
+            .Get13FHistoryByHolder(holder)
+            .Where(h => relevant.Contains(h.ReportDate))
+            .Select(h => new
+            {
+                h.ReportDate,
+                h.EquityIssuerId,
+                h.ListedTicker,
+                h.Shares,
+                h.Value,
+                h.OptionType,
+            })
+            .ToListAsync();
+        rows.Should().NotBeEmpty();
+
+        var read = capture
+            .Commands.Should()
+            .ContainSingle(c => c.Text.Contains("FROM \"InstitutionalHolding\""))
+            .Subject;
+        var plan = (await Explain([read])).Single();
+        plan.Should()
+            .Contain(
+                "Index Only Scan using \"IX_InstitutionalHolding_InstitutionalHolderId_ReportDate\"",
+                plan
+            );
+    }
+
     [Fact]
     public async Task RequestPathReads_AreServedIndexOnlyByTheirCoveringIndexes()
     {
@@ -509,11 +560,19 @@ public class HoldingRepairScanIndexPlanTests(ParadeDbFixture fixture) : IAsyncLi
             connection
         );
         await vacuum.ExecuteNonQueryAsync();
+        // The rebuild joins the issuer tables too; without fresh statistics their row estimates
+        // depend on whether autovacuum ran, which moved the chosen holdings index between runs.
+        await using var analyze = new NpgsqlCommand(
+            "ANALYZE \"EquityIssuer\", \"EquityIssuerPresentation\", \"EquityListing\";",
+            connection
+        );
+        await analyze.ExecuteNonQueryAsync();
     }
 
     // The same statement and the same typed parameters the scan sent, planned the way Npgsql
     // plans them (at Bind, with the values), with sequential and bitmap heap scans disabled so
-    // only an index the planner cannot use for the statement leaves it unused.
+    // only an index the planner cannot use for the statement leaves it unused. Parallel plans
+    // are off too, so a worker discount on the small seed cannot decide which index wins.
     private async Task<List<string>> Explain(IEnumerable<CapturedCommand> commands)
     {
         var plans = new List<string>();
@@ -521,7 +580,8 @@ public class HoldingRepairScanIndexPlanTests(ParadeDbFixture fixture) : IAsyncLi
         await connection.OpenAsync();
         await using (
             var seqScanOff = new NpgsqlCommand(
-                "SET enable_seqscan = off; SET enable_bitmapscan = off;",
+                "SET enable_seqscan = off; SET enable_bitmapscan = off; "
+                    + "SET max_parallel_workers_per_gather = 0;",
                 connection
             )
         )

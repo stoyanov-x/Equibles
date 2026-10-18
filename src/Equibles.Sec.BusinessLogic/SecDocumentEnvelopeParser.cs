@@ -1,6 +1,7 @@
 using System.Text;
 using AngleSharp.Dom;
 using AngleSharp.Html.Parser;
+using Equibles.Core.Documents;
 using Equibles.Sec.Data.Models;
 
 namespace Equibles.Sec.BusinessLogic;
@@ -15,6 +16,15 @@ public static class SecDocumentEnvelopeParser
     private const string DocumentEndTag = "</DOCUMENT>";
     private const string TextStartTag = "<TEXT>";
     private const string TextEndTag = "</TEXT>";
+
+    /// <summary>
+    /// The largest inline document set captured whole, matching the fact parser's envelope
+    /// ceiling; a larger set keeps only its primary so its cover still parses.
+    /// </summary>
+    public const long MaxInlineDocumentSetBytes = 50 * 1024 * 1024;
+
+    private static readonly string[] InlineDocumentExtensions = [".htm", ".html", ".xhtml"];
+    private const string FilingFeeExhibitType = "EX-FILING FEES";
 
     /// <summary>
     /// Some SEC filings (typically &lt;PAPER&gt; 6-K submissions and other digitized filings) are
@@ -44,12 +54,22 @@ public static class SecDocumentEnvelopeParser
         return false;
     }
 
+    /// <summary>Whether <paramref name="filename"/> names the submission's primary document, its first block.</summary>
+    public static bool IsPrimaryDocument(string envelope, string filename)
+    {
+        var primary = EnumerateDocumentBlocks(envelope).FirstOrDefault();
+        return primary != null
+            && TryExtractSgmlTagValue(primary, "FILENAME", out var primaryName)
+            && string.Equals(primaryName, filename, StringComparison.OrdinalIgnoreCase);
+    }
+
     /// <summary>
     /// Extracts the raw XBRL envelope from a full SEC submission (the <c>{accession}.txt</c>
-    /// file). Prefers the inline iXBRL primary document; when the primary carries no inline
-    /// XBRL it falls back to the standalone XBRL instance — the <c>&lt;DOCUMENT&gt;</c> whose
-    /// SGML <c>&lt;TYPE&gt;</c> ends in <c>.INS</c> (e.g. <c>EX-101.INS</c>). Reading the
-    /// envelope already fetched for ingest means no extra EDGAR round-trip.
+    /// file). Prefers the inline iXBRL document set, every document carrying inline markers
+    /// joined primary first; when no document carries inline XBRL it falls back to the
+    /// standalone XBRL instance — the <c>&lt;DOCUMENT&gt;</c> whose SGML <c>&lt;TYPE&gt;</c>
+    /// ends in <c>.INS</c> (e.g. <c>EX-101.INS</c>). Reading the envelope already fetched for
+    /// ingest means no extra EDGAR round-trip.
     /// </summary>
     /// <returns>True when an XBRL envelope was found; otherwise the filing carries no XBRL.</returns>
     public static bool TryExtractXbrlEnvelope(
@@ -67,8 +87,7 @@ public static class SecDocumentEnvelopeParser
         if (string.IsNullOrEmpty(envelope))
             return false;
 
-        string inlineFallbackFileName = null;
-        string inlineFallbackBody = null;
+        var inlineDocuments = new List<(string FileName, string Body, bool IsSetMember)>();
         string standaloneFileName = null;
         string standaloneBody = null;
 
@@ -77,41 +96,34 @@ public static class SecDocumentEnvelopeParser
             TryExtractSgmlTagValue(block, "FILENAME", out var blockFileName);
             TryExtractSgmlTagValue(block, "TYPE", out var blockType);
 
-            // Inline iXBRL is embedded in the primary document; prefer the named primary and
-            // return as soon as we confirm it actually carries inline markers.
+            // The filing-fee exhibit is fee metadata tagged in its own taxonomy, never the filing.
             if (
-                !string.IsNullOrEmpty(primaryDocumentFileName)
-                && string.Equals(
-                    blockFileName,
-                    primaryDocumentFileName,
-                    StringComparison.OrdinalIgnoreCase
-                )
-                && TryExtractTextBody(block, out var primaryBody)
-                && ContainsInlineXbrl(primaryBody)
+                SecSgmlEnvelope.TryGetTagLine(block, "TYPE", out var typeLine)
+                && typeLine.Equals(FilingFeeExhibitType, StringComparison.OrdinalIgnoreCase)
             )
-            {
-                type = XbrlType.InlineIxbrl;
-                sourceFileName = blockFileName;
-                content = primaryBody;
-                return true;
-            }
+                continue;
 
-            // Fallback inline: any block whose body carries inline markers, covering filings
-            // whose PrimaryDocument name is missing or doesn't match the envelope's FILENAME —
-            // without it those would be wrongly recorded as NotPresent (terminal). The cheap
-            // pre-check on the raw block avoids materializing bodies for non-XBRL exhibits.
+            // Every HTML block carrying inline markers belongs to the filing's one inline document
+            // set; a uuencoded image can spell "<ix:" by chance. The cheap pre-check on the raw
+            // block avoids materializing bodies for other exhibits.
             if (
-                inlineFallbackBody == null
-                && ContainsInlineXbrl(block)
-                && TryExtractTextBody(block, out var fallbackBody)
+                ContainsInlineXbrl(block)
+                && TryExtractTextBody(block, out var inlineBody)
+                && ContainsInlineXbrl(inlineBody)
             )
             {
-                inlineFallbackFileName = blockFileName;
-                inlineFallbackBody = fallbackBody;
+                inlineDocuments.Add(
+                    (
+                        blockFileName,
+                        inlineBody,
+                        IsPrimary(blockFileName, primaryDocumentFileName)
+                            || IsInlineDocumentFileName(blockFileName)
+                    )
+                );
             }
 
             // Older filings ship the instance as a separate EX-10x.INS document. Remember the
-            // first one in case neither the named primary nor any block carries inline XBRL.
+            // first one in case no block carries inline XBRL.
             if (
                 standaloneBody == null
                 && !string.IsNullOrEmpty(blockType)
@@ -124,11 +136,27 @@ public static class SecDocumentEnvelopeParser
             }
         }
 
-        if (inlineFallbackBody != null)
+        if (inlineDocuments.Count > 0)
         {
+            // The named primary names the capture; a filing whose PrimaryDocument is missing or
+            // doesn't match the envelope's FILENAME takes its first inline block instead of
+            // being wrongly recorded as NotPresent (terminal).
+            var members = inlineDocuments.Where(document => document.IsSetMember).ToList();
+            if (members.Count == 0)
+                members = [inlineDocuments[0]];
+            var primary = Math.Max(
+                members.FindIndex(document =>
+                    IsPrimary(document.FileName, primaryDocumentFileName)
+                ),
+                0
+            );
             type = XbrlType.InlineIxbrl;
-            sourceFileName = inlineFallbackFileName ?? string.Empty;
-            content = inlineFallbackBody;
+            sourceFileName = members[primary].FileName ?? string.Empty;
+            content = JoinDocumentSet(
+                members.Select(document => document.Body).ToList(),
+                primary,
+                MaxInlineDocumentSetBytes
+            );
             return true;
         }
 
@@ -141,6 +169,34 @@ public static class SecDocumentEnvelopeParser
         }
 
         return false;
+    }
+
+    private static bool IsPrimary(string fileName, string primaryDocumentFileName) =>
+        !string.IsNullOrEmpty(primaryDocumentFileName)
+        && string.Equals(fileName, primaryDocumentFileName, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsInlineDocumentFileName(string fileName) =>
+        !string.IsNullOrEmpty(fileName)
+        && InlineDocumentExtensions.Any(extension =>
+            fileName.EndsWith(extension, StringComparison.OrdinalIgnoreCase)
+        );
+
+    // A 40-F or 6-K often tags only its cover in the primary and its statements in an exhibit;
+    // the set is captured whole, primary first, so one parse reads every fact. Each document's
+    // empty XHTML elements are expanded first, since the joined roots are no longer one XML document.
+    internal static string JoinDocumentSet(List<string> bodies, int primary, long maxBytes)
+    {
+        if (bodies.Count == 1)
+            return bodies[0];
+
+        var ordered = bodies
+            .Select((body, index) => (body, index))
+            .OrderBy(entry => entry.index == primary ? 0 : 1)
+            .ThenBy(entry => entry.index)
+            .Select(entry => XhtmlCompatibility.ExpandEmptyElements(entry.body))
+            .ToList();
+        var bytes = ordered.Sum(body => (long)Encoding.UTF8.GetByteCount(body)) + ordered.Count - 1;
+        return bytes <= maxBytes ? string.Join('\n', ordered) : bodies[primary];
     }
 
     /// <summary>
@@ -344,8 +400,10 @@ public static class SecDocumentEnvelopeParser
         var docs = new List<AsFiledBlock>();
         foreach (var block in EnumerateDocumentBlocks(envelope))
         {
+            // The whole TYPE line: a multi-word form ("SC TO-T", "DEF 14A") read as its first
+            // word never resolves.
             if (
-                !TryExtractSgmlTagValue(block, "TYPE", out var blockType)
+                !SecSgmlEnvelope.TryGetTagLine(block, "TYPE", out var blockType)
                 || string.IsNullOrEmpty(blockType)
                 || !IsDisplayableDocumentType(blockType)
             )
@@ -374,11 +432,11 @@ public static class SecDocumentEnvelopeParser
         if (primary == null)
             return false;
 
-        // Periodic reports need their referenced images even when no HTML exhibit is attached.
-        var periodicPrimary = AsFiledHtmlDocumentTypes.Periodic.Contains(
-            DocumentType.FromDisplayName(primary.Type)
+        // A standalone form needs its page even when no HTML exhibit is attached.
+        var standalonePrimary = AsFiledHtmlDocumentTypes.Standalone.Contains(
+            RegisteredTypeOf(primary.Type)
         );
-        if (!periodicPrimary && (docs.Count < 2 || !docs.Exists(d => d.IsExhibit)))
+        if (!standalonePrimary && (docs.Count < 2 || !docs.Exists(d => d.IsExhibit)))
             return false;
 
         // A backfill may know only the accession; EDGAR puts the primary form before exhibits.
@@ -519,13 +577,10 @@ public static class SecDocumentEnvelopeParser
     // the markdown normalizer uses so the two representations cover the same documents.
     private static bool IsDisplayableDocumentType(string documentTypeLine)
     {
-        var tokens = documentTypeLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        for (var take = tokens.Length; take >= 1; take--)
-        {
-            if (DocumentType.FromDisplayName(string.Join(' ', tokens[..take])) != null)
-                return true;
-        }
+        if (RegisteredTypeOf(documentTypeLine) != null)
+            return true;
 
+        var tokens = documentTypeLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var documentType = tokens.Length > 0 ? tokens[0] : documentTypeLine;
         if (documentType.StartsWith("EX-", StringComparison.OrdinalIgnoreCase))
         {
@@ -535,6 +590,20 @@ public static class SecDocumentEnvelopeParser
         }
 
         return false;
+    }
+
+    // The registered type a TYPE line names: its longest leading run of tokens that is a display name.
+    private static DocumentType RegisteredTypeOf(string documentTypeLine)
+    {
+        var tokens = documentTypeLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        for (var take = tokens.Length; take >= 1; take--)
+        {
+            var type = DocumentType.FromDisplayName(string.Join(' ', tokens[..take]));
+            if (type != null)
+                return type;
+        }
+
+        return null;
     }
 
     private static bool IsHtmlFilename(string filename) =>

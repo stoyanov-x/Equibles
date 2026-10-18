@@ -548,6 +548,296 @@ public class SourceInstrumentSnapshotTests(ParadeDbFixture fixture) : ParadeDbMc
             .Be(other.DirectorySnapshotId.Value);
     }
 
+    // A venue reissues an ISIN under the same code, or states an ISIN another security holds: only that row is
+    // refused, its listing stays current, and the rest of the snapshot applies.
+    // A national agency's number embeds no issuer, and a different CUSIP issuer number is another company.
+    [Theory]
+    [InlineData("reissued-without-issuer-number")]
+    [InlineData("another-issuer-number")]
+    [InlineData("owned-elsewhere")]
+    [InlineData("same-issuer-number-owned-elsewhere")]
+    public async Task AnIsinConflictRefusesOnlyItsRowAndTheSnapshotStillApplies(string conflict)
+    {
+        await using var services = Services();
+        var factory = services.GetRequiredService<IServiceScopeFactory>();
+        var manager = new EquityDirectorySnapshotManager(factory);
+        var importer = new EquityDirectoryIdentityImporter(factory);
+        var recorded =
+            conflict == "reissued-without-issuer-number" ? "HK0000050093" : "KYG5924H1231";
+        var first = Listing();
+        first.Isin = recorded;
+        var other = Listing("share-b", "00002");
+        other.SourceIssuerIdentifier = "issuer-b";
+        other.SourceSecurityIdentifier = "security-b";
+        other.Isin =
+            conflict == "same-issuer-number-owned-elsewhere" ? "KYG5924H1561" : "KYG4052M1116";
+        first.DirectorySnapshotId = other.DirectorySnapshotId = await manager.Reconcile(
+            Snapshot(0, first, other)
+        );
+        var firstId = await importer.ImportListing(first);
+        await importer.ImportListing(other);
+
+        var changed = Listing();
+        changed.Isin = conflict switch
+        {
+            "reissued-without-issuer-number" => "HK0000050176",
+            "another-issuer-number" => "KYG4052M1520",
+            _ => other.Isin,
+        };
+        var added = Listing("share-c", "00003");
+        added.SourceIssuerIdentifier = "issuer-c";
+        added.SourceSecurityIdentifier = "security-c";
+        added.Isin = "KYG511391719";
+        var evidence = await DbContext.Set<EquityDirectorySourceRecord>().CountAsync();
+        var snapshotId = await manager.Reconcile(Snapshot(1, changed, other, added));
+        changed.DirectorySnapshotId = added.DirectorySnapshotId = snapshotId;
+
+        (await DbContext.Set<EquityDirectorySourceRecord>().CountAsync()).Should().Be(evidence + 1);
+        (await DbContext.Set<EquityDirectorySnapshotState>().SingleAsync())
+            .SourceRecordId.Should()
+            .Be(snapshotId);
+        var addedId = await importer.ImportListing(added);
+        await Assert.ThrowsAsync<InvalidDataException>(() => importer.ImportListing(changed));
+        DbContext.ChangeTracker.Clear();
+        var kept = await DbContext
+            .Set<EquityListing>()
+            .Include(row => row.Security)
+            .SingleAsync(row => row.Id == firstId);
+        kept.Active.Should().BeTrue();
+        kept.IsDirectoryListed.Should().BeTrue();
+        kept.Security.Isin.Should().Be(recorded);
+        (await DbContext.Set<EquityListing>().SingleAsync(row => row.Id == addedId))
+            .Active.Should()
+            .BeTrue();
+    }
+
+    // A share consolidation reissues the ISIN under the same CUSIP issuer number; the code keeps its security and listing.
+    [Fact]
+    public async Task ACusipIssuerNumberReissueMovesTheBoundSecurityToTheNewIsin()
+    {
+        await using var services = Services();
+        var factory = services.GetRequiredService<IServiceScopeFactory>();
+        var manager = new EquityDirectorySnapshotManager(factory);
+        var importer = new EquityDirectoryIdentityImporter(factory);
+        var first = Listing();
+        first.Isin = "KYG5924H1231";
+        first.DirectorySnapshotId = await manager.Reconcile(Snapshot(0, first));
+        var firstId = await importer.ImportListing(first);
+        var before = await DbContext
+            .Set<EquityListing>()
+            .Include(row => row.Security)
+            .AsNoTracking()
+            .SingleAsync(row => row.Id == firstId);
+
+        var reissued = Listing();
+        reissued.Isin = "KYG5924H1561";
+        reissued.DirectorySnapshotId = await manager.Reconcile(Snapshot(1, reissued));
+        var reissuedId = await importer.ImportListing(reissued);
+
+        DbContext.ChangeTracker.Clear();
+        reissuedId.Should().Be(firstId);
+        var after = await DbContext
+            .Set<EquityListing>()
+            .Include(row => row.Security)
+            .SingleAsync(row => row.Id == firstId);
+        after.Active.Should().BeTrue();
+        after.IsDirectoryListed.Should().BeTrue();
+        after.EquitySecurityId.Should().Be(before.EquitySecurityId);
+        after.Security.EquityIssuerId.Should().Be(before.Security.EquityIssuerId);
+        after.Security.Isin.Should().Be("KYG5924H1561");
+        (await DbContext.Set<EquitySecurity>().CountAsync()).Should().Be(1);
+        (await DbContext.Set<EquityIssuer>().CountAsync()).Should().Be(1);
+    }
+
+    // A row whose ISIN conflicts and whose listing is bound to another security is still an identifier conflict.
+    [Fact]
+    public async Task AnIsinConflictNeverMasksAnIdentifierConflict()
+    {
+        await using var services = Services();
+        var factory = services.GetRequiredService<IServiceScopeFactory>();
+        var manager = new EquityDirectorySnapshotManager(factory);
+        var importer = new EquityDirectoryIdentityImporter(factory);
+        var first = Listing();
+        first.Isin = "KYG5924H1231";
+        var other = Listing("share-b", "00002");
+        other.SourceIssuerIdentifier = "issuer-b";
+        other.SourceSecurityIdentifier = "security-b";
+        other.Isin = "KYG4052M1116";
+        first.DirectorySnapshotId = other.DirectorySnapshotId = await manager.Reconcile(
+            Snapshot(0, first, other)
+        );
+        var firstId = await importer.ImportListing(first);
+        await importer.ImportListing(other);
+        var changed = Listing();
+        changed.SourceSecurityIdentifier = "security-b";
+        changed.Isin = "KYG5924H1561";
+        var evidence = await DbContext.Set<EquityDirectorySourceRecord>().CountAsync();
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            manager.Reconcile(Snapshot(1, changed, other))
+        );
+
+        (await DbContext.Set<EquityDirectorySourceRecord>().CountAsync()).Should().Be(evidence);
+        (await DbContext.Set<EquityListing>().SingleAsync(row => row.Id == firstId))
+            .Active.Should()
+            .BeTrue();
+    }
+
+    // A reissue is an ordinary row, so a counter of the same security that left the directory is still withdrawn.
+    [Fact]
+    public async Task AReissuedSecurityStillLosesTheCounterTheDirectoryNoLongerStates()
+    {
+        await using var services = Services();
+        var factory = services.GetRequiredService<IServiceScopeFactory>();
+        var manager = new EquityDirectorySnapshotManager(factory);
+        var importer = new EquityDirectoryIdentityImporter(factory);
+        var first = Listing();
+        first.Isin = "KYG5924H1231";
+        var counter = Listing("counter", "80001", "CNY");
+        counter.Isin = first.Isin;
+        first.DirectorySnapshotId = counter.DirectorySnapshotId = await manager.Reconcile(
+            Snapshot(0, first, counter)
+        );
+        await importer.ImportListing(first);
+        var counterId = await importer.ImportListing(counter);
+
+        var reissued = Listing();
+        reissued.Isin = "KYG5924H1561";
+        reissued.DirectorySnapshotId = await manager.Reconcile(Snapshot(1, reissued));
+        await importer.ImportListing(reissued);
+
+        DbContext.ChangeTracker.Clear();
+        (await DbContext.Set<EquityListing>().SingleAsync(row => row.Id == counterId))
+            .IsDirectoryListed.Should()
+            .BeFalse();
+    }
+
+    private static EquityDirectoryListingInput Counter(string isin)
+    {
+        var counter = Listing("share-b", "02938");
+        counter.SourceIssuerIdentifier = "issuer-b";
+        counter.SourceSecurityIdentifier = "security-b";
+        counter.Isin = isin;
+        return counter;
+    }
+
+    // HKEX's temporary counter 02938 shares King International's CUSIP issuer number; a national number embeds none.
+    [Theory]
+    [InlineData("KYG5924H1561", "KYG5924H1728", true)]
+    [InlineData("KYG5924H1561", "KYG4052M1520", false)]
+    [InlineData("HK0000050093", "HK0000050176", false)]
+    public async Task ANewCodeSharingACusipIssuerNumberJoinsThatIssuer(
+        string companyIsin,
+        string counterIsin,
+        bool sameIssuer
+    )
+    {
+        await using var services = Services();
+        var factory = services.GetRequiredService<IServiceScopeFactory>();
+        var manager = new EquityDirectorySnapshotManager(factory);
+        var importer = new EquityDirectoryIdentityImporter(factory);
+        var company = Listing();
+        company.Isin = companyIsin;
+        var counter = Counter(counterIsin);
+        company.DirectorySnapshotId = counter.DirectorySnapshotId = await manager.Reconcile(
+            Snapshot(0, company, counter)
+        );
+        var companyId = await importer.ImportListing(company);
+        var counterId = await importer.ImportListing(counter);
+
+        DbContext.ChangeTracker.Clear();
+        var listings = await DbContext
+            .Set<EquityListing>()
+            .Include(row => row.Security)
+                .ThenInclude(row => row.Issuer)
+                    .ThenInclude(row => row.Presentation)
+            .ToDictionaryAsync(row => row.Id);
+        (listings[counterId].Security.EquityIssuerId == listings[companyId].Security.EquityIssuerId)
+            .Should()
+            .Be(sameIssuer);
+        listings[counterId].EquitySecurityId.Should().NotBe(listings[companyId].EquitySecurityId);
+        listings[companyId].Security.Issuer.Presentation.EquityListingId.Should().Be(companyId);
+        (await DbContext.Set<EquityIssuer>().CountAsync()).Should().Be(sameIssuer ? 1 : 2);
+    }
+
+    // A withdrawn temporary counter still split from its company neither joins nor blocks the company's next code.
+    [Fact]
+    public async Task AWithdrawnIssuerNumberSiblingNeverDecidesTheIssuer()
+    {
+        await using var services = Services();
+        var factory = services.GetRequiredService<IServiceScopeFactory>();
+        var manager = new EquityDirectorySnapshotManager(factory);
+        var importer = new EquityDirectoryIdentityImporter(factory);
+        var company = Listing();
+        company.Isin = "KYG5924H1561";
+        var rights = Listing("share-c", "02941");
+        rights.SourceIssuerIdentifier = "issuer-c";
+        rights.SourceSecurityIdentifier = "security-c";
+        rights.Isin = "KYG5924H1645";
+        company.DirectorySnapshotId = rights.DirectorySnapshotId = await manager.Reconcile(
+            Snapshot(0, company, rights)
+        );
+        var companyId = await importer.ImportListing(company);
+        var withdrawn = Equibles.TestSupport.EquityIssuerSeed.Create(
+            Ticker: "02938",
+            Name: "KING INTL INV",
+            Isin: "KYG5924H1728",
+            MarketCountryCode: "HK",
+            MarketIdentifierCode: "XHKG",
+            TradingCurrency: "HKD",
+            QuoteUnitMultiplier: 1m
+        );
+        withdrawn.Presentation.Listing.Active = false;
+        DbContext.Add(withdrawn);
+        await DbContext.SaveChangesAsync();
+
+        var rightsId = await importer.ImportListing(rights);
+
+        DbContext.ChangeTracker.Clear();
+        var issuers = await DbContext
+            .Set<EquityListing>()
+            .Where(row => row.Id == companyId || row.Id == rightsId)
+            .Select(row => row.Security.EquityIssuerId)
+            .Distinct()
+            .ToListAsync();
+        issuers.Should().ContainSingle().Which.Should().NotBe(withdrawn.Id);
+    }
+
+    // Two issuers already split across one issuer number are left for the merge queue rather than chosen between.
+    [Fact]
+    public async Task AnIssuerNumberAlreadySplitAcrossTwoIssuersRefusesTheNextCode()
+    {
+        await using var services = Services();
+        var factory = services.GetRequiredService<IServiceScopeFactory>();
+        var manager = new EquityDirectorySnapshotManager(factory);
+        var importer = new EquityDirectoryIdentityImporter(factory);
+        var company = Listing();
+        company.Isin = "KYG5924H1561";
+        var rights = Listing("share-c", "02941");
+        rights.SourceIssuerIdentifier = "issuer-c";
+        rights.SourceSecurityIdentifier = "security-c";
+        rights.Isin = "KYG5924H1645";
+        company.DirectorySnapshotId = rights.DirectorySnapshotId = await manager.Reconcile(
+            Snapshot(0, company, rights)
+        );
+        await importer.ImportListing(company);
+        DbContext.Add(
+            Equibles.TestSupport.EquityIssuerSeed.Create(
+                Ticker: "02938",
+                Name: "KING INTL INV",
+                Isin: "KYG5924H1728",
+                MarketCountryCode: "HK",
+                MarketIdentifierCode: "XHKG",
+                TradingCurrency: "HKD",
+                QuoteUnitMultiplier: 1m
+            )
+        );
+        await DbContext.SaveChangesAsync();
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => importer.ImportListing(rights));
+        (await DbContext.Set<EquityIssuer>().CountAsync()).Should().Be(2);
+    }
+
     [Fact]
     public async Task SharedListingRemainsActiveUntilBothDirectoryClaimsAreWithdrawn()
     {
@@ -651,8 +941,10 @@ public class SourceInstrumentSnapshotTests(ParadeDbFixture fixture) : ParadeDbMc
             .Be(1);
     }
 
+    // The new counter claims the bound security under another ISIN while the original row is absent: the counter is
+    // refused and the security's listing stays current, instead of the conflict halting the whole snapshot.
     [Fact]
-    public async Task NewCounterWithConflictingBoundSecurityIsinCannotCommitSnapshot()
+    public async Task NewCounterWithConflictingBoundSecurityIsinKeepsTheSecurityCurrent()
     {
         await using var services = Services();
         var factory = services.GetRequiredService<IServiceScopeFactory>();
@@ -664,12 +956,12 @@ public class SourceInstrumentSnapshotTests(ParadeDbFixture fixture) : ParadeDbMc
         var id = await importer.ImportListing(first);
         var counter = Listing("new-counter", "80001", "CNY");
         counter.Isin = "HK0002007356";
-        await Assert.ThrowsAsync<InvalidDataException>(() =>
-            manager.Reconcile(Snapshot(1, counter))
-        );
+        counter.DirectorySnapshotId = await manager.Reconcile(Snapshot(1, counter));
         (await DbContext.Set<EquityDirectorySnapshotState>().SingleAsync())
             .SourceRecordId.Should()
-            .Be(first.DirectorySnapshotId.Value);
+            .Be(counter.DirectorySnapshotId.Value);
+        await Assert.ThrowsAsync<InvalidDataException>(() => importer.ImportListing(counter));
+        DbContext.ChangeTracker.Clear();
         (await DbContext.Set<EquityListing>().SingleAsync(row => row.Id == id))
             .Active.Should()
             .BeTrue();

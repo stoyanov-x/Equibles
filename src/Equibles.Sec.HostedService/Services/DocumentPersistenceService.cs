@@ -87,6 +87,8 @@ public class DocumentPersistenceService : IDocumentPersistenceService
         // A document whose statements SEC never rendered says so here, so the capture lane that fetches
         // those renderings never queues it. The default leaves an EDGAR filing for that lane to examine.
         XbrlCaptureStatus reportedStatements = XbrlCaptureStatus.NotChecked,
+        DateTime? acceptedAt = null,
+        byte[] asFiledPdf = null,
         CancellationToken cancellationToken = default
     )
     {
@@ -107,6 +109,7 @@ public class DocumentPersistenceService : IDocumentPersistenceService
             ReportingForDate = reportingForDate,
             SourceUrl = sourceUrl,
             AccessionNumber = accessionNumber,
+            AcceptedAt = acceptedAt,
             Items = items,
             LineCount = lineCount,
             NormalizedContentVersion = Document.ContentBuilderVersion(documentType),
@@ -115,6 +118,19 @@ public class DocumentPersistenceService : IDocumentPersistenceService
 
         await ApplyXbrlCapture(document, xbrl ?? XbrlCaptureResult.NotChecked);
         await ApplyAsFiledHtmlCapture(document, asFiledHtml, cancellationToken);
+        if (asFiledPdf is { Length: > 0 })
+        {
+            // Already compressed; stored as filed so the reader can stream it with byte ranges.
+            var name = $"original-{accessionNumber ?? document.Id.ToString()}".TruncateToFit(
+                MaxFileNameLength
+            );
+            document.AsFiledPdfContent = await _fileManager.SaveInternalFile(
+                asFiledPdf,
+                name,
+                "pdf",
+                "application/pdf"
+            );
+        }
 
         _documentRepository.Add(document);
         await _documentRepository.SaveChanges();

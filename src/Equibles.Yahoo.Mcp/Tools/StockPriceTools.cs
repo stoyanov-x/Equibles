@@ -14,6 +14,7 @@ using Equibles.Errors.Data.Models;
 using Equibles.Mcp;
 using Equibles.Mcp.Helpers;
 using Equibles.Yahoo.Data.Models;
+using Equibles.Yahoo.Mcp.Contracts;
 using Equibles.Yahoo.Repositories;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -29,29 +30,40 @@ public class StockPriceTools
     // holidays and weekends, but a window starting weeks late is a young listing.
     private const int BaselineSlackDays = 14;
 
+    // The longest exchange closure a venue day change may span (Lunar New Year, Golden Week).
+    private const int VenueMaxSessionGapDays = 12;
+
     private readonly EquityDailyStockPriceRepository _priceRepository;
     private readonly EquityIssuerRepository _commonStockRepository;
     private readonly StockSplitRepository _stockSplitRepository;
     private readonly McpToolRunner _runner;
+
+    // Injected as a sequence so the dependency stays optional: a deployment that releases every
+    // stored bar to every caller registers nothing and resolves an empty one.
+    private readonly IDailyBarRelease _release;
 
     public StockPriceTools(
         EquityDailyStockPriceRepository priceRepository,
         EquityIssuerRepository commonStockRepository,
         StockSplitRepository stockSplitRepository,
         ErrorManager errorManager,
-        ILogger<StockPriceTools> logger
+        ILogger<StockPriceTools> logger,
+        IEnumerable<IDailyBarRelease> releases = null
     )
     {
         _priceRepository = priceRepository;
         _commonStockRepository = commonStockRepository;
         _stockSplitRepository = stockSplitRepository;
+        _release = releases?.FirstOrDefault();
         _runner = new McpToolRunner(logger, errorManager.AsMcpErrorReporter());
     }
 
     [McpServerTool(Name = "GetStockPrices", Title = "Daily Price History", ReadOnly = true)]
     [Description(
         "Get daily OHLCV (Open, High, Low, Close, Volume) price history for a stock. Useful for "
-            + "technical analysis, charting, and price trend analysis. Prices are in USD. An Adj "
+            + "technical analysis, charting, and price trend analysis. A US listing is quoted in "
+            + "USD; a listing on another exchange (MIC:TICKER) is quoted in its own trading "
+            + "currency, which the output names. An Adj "
             + "Close column shows the provider's split- and cash-dividend-adjusted close when it "
             + "differs from Close. Captured corporate-action changes trigger a full-history "
             + "refresh of the exact listed series, but the stored rows do not certify which split "
@@ -61,7 +73,8 @@ public class StockPriceTools
     )]
     public Task<string> GetStockPrices(
         [Description(
-            "Stock ticker symbol (e.g., AAPL, MSFT, TSLA). Class shares use a dash (BRK-B); the dot form (BRK.B) is also accepted."
+            "Stock ticker symbol (e.g., AAPL, MSFT, TSLA). Class shares use a dash (BRK-B); the dot form (BRK.B) is also accepted. "
+                + "A listing on another exchange is MIC:TICKER (XPAR:AIR, XLON:BP, XHKG:00005)."
         )]
             string ticker,
         [Description("Start date in YYYY-MM-DD format (defaults to 1 year ago)")]
@@ -79,7 +92,7 @@ public class StockPriceTools
         return _runner.Execute(
             async () =>
             {
-                var (stock, priceTicker, stockError) = await ResolveTicker(ticker);
+                var (listing, stockError) = await ResolveTicker(ticker);
                 if (stockError != null)
                     return stockError;
 
@@ -94,8 +107,9 @@ public class StockPriceTools
                     return rangeError;
 
                 maxResults = McpLimit.Clamp(maxResults);
+                var holdNote = ClampToRelease(await GetHold(), ref end);
 
-                var rangeQuery = _priceRepository.GetTradedByStock(stock, priceTicker, start, end);
+                var rangeQuery = Traded(listing, start, end);
                 var total = await rangeQuery.CountAsync();
 
                 var records = await rangeQuery
@@ -104,13 +118,16 @@ public class StockPriceTools
                     .ToListAsync();
 
                 if (records.Count == 0)
-                    return $"No price data found for {priceTicker} in the specified date range.";
+                    return WithHoldNote(
+                        $"No price data found for {listing.Symbol} in the specified date range.",
+                        holdNote
+                    );
 
                 // The provider-adjusted series is replaced in full after captured splits and cash
                 // dividends. A differing column is useful evidence, but the provider response does
                 // not certify one universal split basis across every raw window.
                 var hasAdjustment = records.Any(p => p.AdjustedClose != p.Close);
-                var listingTitle = ListingTitle(stock, priceTicker);
+                var listingTitle = ListingTitle(listing);
 
                 var result = hasAdjustment
                     ? StartTable(
@@ -141,7 +158,7 @@ public class StockPriceTools
                         : "_Adj Close equals Close on every row shown. Captured splits and cash dividends trigger a full-history refresh, but equality does not prove that a split-spanning window uses one basis._"
                 );
 
-                return result.ToString();
+                return WithHoldNote(result.ToString(), holdNote);
             },
             "GetStockPrices",
             $"ticker: {ticker}"
@@ -154,10 +171,12 @@ public class StockPriceTools
         ReadOnly = true
     )]
     [Description(
-        "Get each ticker's newest traded, settled daily close in USD, with one-session change, volume, and trailing 52-week closing range. Rows can have different dates while a session settles; use the Date column. Change is omitted when the immediately prior trading session is absent. Split-limited or partial 52-week ranges are marked in the response. This is settled history, not an intraday quote."
+        "Get each ticker's newest traded, settled daily close (USD for US listings; a MIC:TICKER listing on another exchange in its own trading currency, named in a note), with one-session change, volume, and trailing 52-week closing range. Rows can have different dates while a session settles; use the Date column. Change is omitted when the immediately prior trading session is absent; for a MIC:TICKER row it compares with the previous traded close, omitted when that close is more than 12 days older or a stored session in between shows no trades. Split-limited or partial 52-week ranges are marked in the response. This is settled history, not an intraday quote."
     )]
     public Task<string> GetLatestClosingPrices(
-        [Description("Ticker symbols (max 25). Class shares may use BRK-B or BRK.B.")]
+        [Description(
+            "Ticker symbols (max 25). Class shares may use BRK-B or BRK.B; a listing on another exchange is MIC:TICKER (XPAR:AIR)."
+        )]
             string[] tickers
     )
     {
@@ -175,13 +194,27 @@ public class StockPriceTools
 
                 var tickerList = new List<string>();
                 var seenTickers = new HashSet<string>(StringComparer.Ordinal);
+                // A dotted segment is looked up as typed, so a provider suffix (MC.PA) is not folded to MC-PA.
+                var dottedSpelling = new Dictionary<string, string>(StringComparer.Ordinal);
                 foreach (var segment in segments)
                 {
-                    var normalizedTicker = TickerNormalizer.NormalizeDashListed(segment);
+                    var normalizedTicker = EquityListingSymbol.TryParse(
+                        segment,
+                        out var venueCode,
+                        out var venueTicker
+                    )
+                        ? EquityListingSymbol.Display(venueTicker, null, venueCode)
+                        : TickerNormalizer.NormalizeDashListed(segment);
                     if (normalizedTicker == null)
                         return $"Invalid ticker '{segment}'. Use 1-32 ASCII letters, digits, dots, or dashes.";
                     if (seenTickers.Add(normalizedTicker))
+                    {
                         tickerList.Add(normalizedTicker);
+                        if (segment.Contains('.') && venueCode == null)
+                            dottedSpelling[normalizedTicker] = TickerNormalizer.NormalizeListed(
+                                segment
+                            );
+                    }
                 }
 
                 var result = StartTable(
@@ -207,12 +240,18 @@ public class StockPriceTools
                 // still settling for part of the batch, which earns its own footnote.
                 var rowDates = new HashSet<DateOnly>();
                 var latestByTicker = new Dictionary<string, LatestPriceSelection>();
+
+                // Quote unit of each venue row, named in a note because the table has no currency column.
+                var venueUnits = new Dictionary<string, string>(StringComparer.Ordinal);
                 var placeholderByTicker = new Dictionary<string, string>();
+                var hold = await GetHold();
 
                 foreach (var ticker in tickerList)
                 {
-                    var (stock, priceTicker, _) = await ResolveTicker(ticker);
-                    if (stock == null)
+                    var (listing, _) = await ResolveTicker(
+                        dottedSpelling.GetValueOrDefault(ticker) ?? ticker
+                    );
+                    if (listing == null)
                     {
                         placeholderByTicker[ticker] = "Not found";
                         continue;
@@ -220,8 +259,7 @@ public class StockPriceTools
 
                     // Newest two bars in one query: the latest row plus the prior close
                     // needed for the day-over-day change columns.
-                    var latestTwo = await _priceRepository
-                        .GetTradedByStock(stock, priceTicker)
+                    var latestTwo = await Released(Traded(listing), hold)
                         .OrderByDescending(p => p.Date)
                         .Take(2)
                         .ToListAsync();
@@ -232,8 +270,7 @@ public class StockPriceTools
                     }
 
                     latestByTicker[ticker] = new LatestPriceSelection(
-                        stock,
-                        priceTicker,
+                        listing,
                         latestTwo[0],
                         latestTwo.Count > 1 ? latestTwo[1] : null
                     );
@@ -245,7 +282,7 @@ public class StockPriceTools
                 if (latestByTicker.Count > 0)
                 {
                     var stockIds = latestByTicker
-                        .Values.Select(selection => selection.Stock.Id)
+                        .Values.Select(selection => selection.Listing.Stock.Id)
                         .Distinct()
                         .ToArray();
                     var earliestCutoff = latestByTicker.Values.Min(selection =>
@@ -262,6 +299,7 @@ public class StockPriceTools
                         .ToListAsync();
                 }
 
+                var splitsByIssuer = new IssuerSplitIndex(batchSplits);
                 foreach (var ticker in tickerList)
                 {
                     if (!latestByTicker.TryGetValue(ticker, out var selection))
@@ -270,8 +308,7 @@ public class StockPriceTools
                         continue;
                     }
 
-                    EquityIssuer stock = selection.Stock;
-                    var priceTicker = selection.PriceTicker;
+                    var listing = selection.Listing;
                     EquityDailyStockPrice price = selection.Price;
                     EquityDailyStockPrice previous = selection.Previous;
 
@@ -280,20 +317,41 @@ public class StockPriceTools
                     // provider refresh cannot certify the basis of raw rows, so a captured split
                     // inside the requested year moves the comparison start to that split date.
                     var cutoff = price.Date.AddDays(-365);
-                    var applicableSplits = PriceSeriesSplitScope.ForPriceComparison(
-                        batchSplits.Where(split => split.EquityIssuerId == stock.Id),
-                        priceTicker
-                    );
+                    var applicableSplits =
+                        listing.Venue == null
+                            ? PriceSeriesSplitScope.ForPriceComparison(
+                                splitsByIssuer.For(listing.Stock.Id),
+                                listing.PriceTicker
+                            )
+                            : PriceSeriesSplitScope.ForPriceComparison(
+                                splitsByIssuer.For(listing.Stock.Id),
+                                listing.Venue.Id
+                            );
+                    var rowSymbol = listing.Venue == null ? ticker : listing.Symbol;
+                    if (listing.Venue != null)
+                        venueUnits[rowSymbol] = QuoteUnit(listing.Venue);
                     var comparableWindow = ComparablePriceWindow.Resolve(
                         cutoff,
                         price.Date,
                         applicableSplits
                     );
-                    var previousClose = DayChangeBasis(
-                        price,
-                        previous,
-                        comparableWindow.SplitBoundaryDate
-                    );
+                    var venueSessionSkipped =
+                        listing.Venue != null
+                        && previous != null
+                        && (
+                            price.Date.DayNumber - previous.Date.DayNumber > VenueMaxSessionGapDays
+                            || await _priceRepository
+                                .GetByListing(listing.Venue.Id)
+                                .AnyAsync(p => p.Date > previous.Date && p.Date < price.Date)
+                        );
+                    var previousClose = venueSessionSkipped
+                        ? null
+                        : DayChangeBasis(
+                            price,
+                            previous,
+                            comparableWindow.SplitBoundaryDate,
+                            listing.Venue != null
+                        );
                     var changeCell = "—";
                     var changePctCell = "—";
                     if (previousClose != null)
@@ -306,16 +364,21 @@ public class StockPriceTools
                                 "+0.00;-0.00;0.00"
                             ) + "%";
                     }
-                    else if (previous != null && !IsPriorSession(price, previous))
+                    else if (
+                        previous != null
+                        && listing.Venue == null
+                        && !IsPriorSession(price, previous)
+                    )
                     {
                         // Only a skipped session earns the footnote. A prior row with a
                         // non-positive close or one before a split boundary is blanked too, and
                         // saying "no row for the session before" about either would be wrong.
                         gapped = true;
                     }
-                    var range = await _priceRepository
-                        .GetTradedByStock(stock, priceTicker)
-                        .Where(p => p.Date >= comparableWindow.Start && p.Close > 0)
+                    var range = await Traded(listing)
+                        .Where(p =>
+                            p.Date >= comparableWindow.Start && p.Date <= price.Date && p.Close > 0
+                        )
                         .GroupBy(p => 1)
                         .Select(g => new
                         {
@@ -344,7 +407,24 @@ public class StockPriceTools
 
                     rowDates.Add(price.Date);
                     result.AppendLine(
-                        $"| {ticker} | {price.Date:yyyy-MM-dd} | {McpFormat.Price(price.Close)} | {changeCell} | {changePctCell} | {McpFormat.WholeNumber(price.Volume)} | {cells.High} | {cells.Low} | {cells.OffHigh} | {cells.AboveLow} |"
+                        $"| {rowSymbol} | {price.Date:yyyy-MM-dd} | {McpFormat.Price(price.Close)} | {changeCell} | {changePctCell} | {McpFormat.WholeNumber(price.Volume)} | {cells.High} | {cells.Low} | {cells.OffHigh} | {cells.AboveLow} |"
+                    );
+                }
+
+                if (venueUnits.Count > 0)
+                {
+                    result.AppendLine();
+                    result.AppendLine(
+                        "Note: rows written MIC:TICKER are listings outside the US, quoted in their own "
+                            + "trading currency: "
+                            + string.Join(
+                                "; ",
+                                venueUnits.Select(unit => $"{unit.Key} in {unit.Value}")
+                            )
+                            + ". Their Change compares with the previous traded close, since each "
+                            + "exchange keeps its own holidays, and is omitted when that close is more "
+                            + "than 12 days older or a stored session in between shows no trades. Every "
+                            + "other row is in USD."
                     );
                 }
 
@@ -367,7 +447,8 @@ public class StockPriceTools
                     // would tell the caller a years-old close is a fresh artifact.
                     var newest = rowDates.Max();
                     var oneSessionSpread =
-                        rowDates.Min() >= UsMarketCalendar.PreviousTradingDay(newest);
+                        venueUnits.Count == 0
+                        && rowDates.Min() >= UsMarketCalendar.PreviousTradingDay(newest);
                     result.AppendLine();
                     result.AppendLine(
                         oneSessionSpread
@@ -404,7 +485,7 @@ public class StockPriceTools
                     );
                 }
 
-                return result.ToString();
+                return WithHoldNote(result.ToString(), hold?.Note);
             },
             "GetLatestClosingPrices",
             $"tickers: {string.Join(",", tickers ?? [])}"
@@ -428,7 +509,8 @@ public class StockPriceTools
     )]
     public Task<string> GetStochasticOscillator(
         [Description(
-            "Stock ticker symbol (e.g., AAPL, MSFT). Class shares use a dash (BRK-B); the dot form (BRK.B) is also accepted."
+            "Stock ticker symbol (e.g., AAPL, MSFT). Class shares use a dash (BRK-B); the dot form (BRK.B) is also accepted. "
+                + "A listing on another exchange is MIC:TICKER (XPAR:AIR)."
         )]
             string ticker,
         [Description("Start date in YYYY-MM-DD format (defaults to 6 months ago)")]
@@ -453,7 +535,7 @@ public class StockPriceTools
 
                 // %K needs kPeriod bars and %D another dPeriod - 1 %K values, so this many
                 // extra bars before startDate make the first in-range row fully computable.
-                var (stock, priceTicker, records, renderFrom, error) =
+                var (listing, records, renderFrom, holdNote, error) =
                     await LoadAscendingPriceWindow(
                         ticker,
                         startDate,
@@ -473,7 +555,7 @@ public class StockPriceTools
                 );
 
                 return RenderNewestFirst(
-                    $"Stochastic Oscillator (%K={kPeriod}, %D={dPeriod}) for {ListingTitle(stock, priceTicker)}:",
+                    $"Stochastic Oscillator (%K={kPeriod}, %D={dPeriod}) for {ListingTitle(listing)}:",
                     "| Date | Close | %K | %D |",
                     "|------|-------|----|----|",
                     records.Count,
@@ -485,7 +567,8 @@ public class StockPriceTools
                         var dCell = McpFormat.OrDash(d[i], "F2");
                         return $"| {DateAndCloseCells(records[i])} | {kCell} | {dCell} |";
                     },
-                    "_'—' marks rows with too little prior price history to fill the lookback window._"
+                    "_'—' marks rows with too little prior price history to fill the lookback window._",
+                    holdNote
                 );
             },
             "GetStochasticOscillator",
@@ -503,12 +586,14 @@ public class StockPriceTools
             + "the True Range (max of high-low, |high-prev_close|, |low-prev_close|) and "
             + "smoothed recursively. Higher ATR means wider daily moves; commonly used "
             + "for position sizing and stop placement. ATR is denominated in the stock's "
-            + "price units (USD). The smoothing is warmed up on price history fetched before "
+            + "price units (USD for a US listing, the listing's own quote unit otherwise). The "
+            + "smoothing is warmed up on price history fetched before "
             + "startDate, so values do not depend on the requested range's left edge."
     )]
     public Task<string> GetAverageTrueRange(
         [Description(
-            "Stock ticker symbol (e.g., AAPL, MSFT). Class shares use a dash (BRK-B); the dot form (BRK.B) is also accepted."
+            "Stock ticker symbol (e.g., AAPL, MSFT). Class shares use a dash (BRK-B); the dot form (BRK.B) is also accepted. "
+                + "A listing on another exchange is MIC:TICKER (XPAR:AIR)."
         )]
             string ticker,
         [Description("Start date in YYYY-MM-DD format (defaults to 6 months ago)")]
@@ -533,7 +618,7 @@ public class StockPriceTools
                 // Wilder smoothing is recursive, so the seed's influence decays rather than
                 // ends: two extra periods of pre-range bars push the seed far enough back
                 // that in-range values no longer depend on where the caller put startDate.
-                var (stock, priceTicker, records, renderFrom, error) =
+                var (listing, records, renderFrom, holdNote, error) =
                     await LoadAscendingPriceWindow(
                         ticker,
                         startDate,
@@ -547,7 +632,7 @@ public class StockPriceTools
                 var atr = TechnicalIndicatorService.ComputeAtr(highs, lows, closes, period);
 
                 return RenderNewestFirst(
-                    $"Average True Range (period={period}) for {ListingTitle(stock, priceTicker)}:",
+                    $"Average True Range (period={period}) for {ListingTitle(listing)}:",
                     "| Date | Close | ATR |",
                     "|------|-------|-----|",
                     records.Count,
@@ -558,7 +643,8 @@ public class StockPriceTools
                         var atrCell = McpFormat.OrDash(atr[i], "F4");
                         return $"| {DateAndCloseCells(records[i])} | {atrCell} |";
                     },
-                    "_ATR is in the stock's price units (USD). '—' marks rows with too little prior price history to fill the smoothing window._"
+                    "_ATR is in the stock's price units (USD for a US listing, otherwise the unit named in the title). '—' marks rows with too little prior price history to fill the smoothing window._",
+                    holdNote
                 );
             },
             "GetAverageTrueRange",
@@ -577,7 +663,8 @@ public class StockPriceTools
     )]
     public Task<string> GetOnBalanceVolume(
         [Description(
-            "Stock ticker symbol (e.g., AAPL, MSFT). Class shares use a dash (BRK-B); the dot form (BRK.B) is also accepted."
+            "Stock ticker symbol (e.g., AAPL, MSFT). Class shares use a dash (BRK-B); the dot form (BRK.B) is also accepted. "
+                + "A listing on another exchange is MIC:TICKER (XPAR:AIR)."
         )]
             string ticker,
         [Description("Start date in YYYY-MM-DD format (defaults to 6 months ago)")]
@@ -597,7 +684,7 @@ public class StockPriceTools
 
                 // No warm-up: OBV is a running sum with no lookback window, and the tool
                 // contract deliberately anchors it at 0 on the range's first bar.
-                var (stock, priceTicker, records, _, error) = await LoadAscendingPriceWindow(
+                var (listing, records, _, holdNote, error) = await LoadAscendingPriceWindow(
                     ticker,
                     startDate,
                     endDate,
@@ -611,7 +698,7 @@ public class StockPriceTools
                 var obv = TechnicalIndicatorService.ComputeObv(closes, volumes);
 
                 return RenderNewestFirst(
-                    $"On-Balance Volume for {ListingTitle(stock, priceTicker)}:",
+                    $"On-Balance Volume for {ListingTitle(listing)}:",
                     "| Date | Close | Volume | OBV |",
                     "|------|-------|--------|-----|",
                     records.Count,
@@ -619,7 +706,8 @@ public class StockPriceTools
                     maxResults,
                     i =>
                         $"| {DateAndCloseCells(records[i])} | {McpFormat.WholeNumber(records[i].Volume)} | {McpFormat.WholeNumber(obv[i])} |",
-                    $"_OBV is anchored at 0 on {records[0].Date:yyyy-MM-dd} (the first bar of the requested range); absolute values shift with startDate, so compare slopes, not levels._"
+                    $"_OBV is anchored at 0 on {records[0].Date:yyyy-MM-dd} (the first bar of the requested range); absolute values shift with startDate, so compare slopes, not levels._",
+                    holdNote
                 );
             },
             "GetOnBalanceVolume",
@@ -639,7 +727,8 @@ public class StockPriceTools
     )]
     public Task<string> GetBollingerBands(
         [Description(
-            "Stock ticker symbol (e.g., AAPL, MSFT). Class shares use a dash (BRK-B); the dot form (BRK.B) is also accepted."
+            "Stock ticker symbol (e.g., AAPL, MSFT). Class shares use a dash (BRK-B); the dot form (BRK.B) is also accepted. "
+                + "A listing on another exchange is MIC:TICKER (XPAR:AIR)."
         )]
             string ticker,
         [Description("Start date in YYYY-MM-DD format (defaults to 6 months ago)")]
@@ -667,7 +756,7 @@ public class StockPriceTools
 
                 // The SMA window is exactly period bars, so period - 1 extra bars before
                 // startDate make the first in-range row fully computable.
-                var (stock, priceTicker, records, renderFrom, error) =
+                var (listing, records, renderFrom, holdNote, error) =
                     await LoadAscendingPriceWindow(
                         ticker,
                         startDate,
@@ -685,7 +774,7 @@ public class StockPriceTools
                 );
 
                 return RenderNewestFirst(
-                    $"Bollinger Bands (period={period}, stdDev={McpFormat.Invariant(stdDev, "0.#")}) for {ListingTitle(stock, priceTicker)}:",
+                    $"Bollinger Bands (period={period}, stdDev={McpFormat.Invariant(stdDev, "0.#")}) for {ListingTitle(listing)}:",
                     "| Date | Close | Lower | Middle | Upper | %B | Bandwidth |",
                     "|------|-------|-------|--------|-------|----|-----------|",
                     records.Count,
@@ -700,7 +789,8 @@ public class StockPriceTools
                         var bandwidth = Bandwidth(middle[i], upper[i], lower[i]);
                         return $"| {DateAndCloseCells(records[i])} | {lowerCell} | {middleCell} | {upperCell} | {McpFormat.OrDash(percentB, "F2")} | {McpFormat.OrDash(bandwidth, "F4")} |";
                     },
-                    "_'—' marks rows with too little prior price history to fill the moving-average window._"
+                    "_'—' marks rows with too little prior price history to fill the moving-average window._",
+                    holdNote
                 );
             },
             "GetBollingerBands",
@@ -727,48 +817,87 @@ public class StockPriceTools
 
     // CommonStock.Name describes the primary SEC listing. Secondary symbols can identify a
     // different share class or fund series, and no authoritative per-listing name is stored.
-    private static string ListingTitle(EquityIssuer stock, string priceTicker) =>
-        string.Equals(
-            stock.Presentation.Listing.Ticker,
-            priceTicker,
+    // A venue listing names its own issuer and the unit its prices are quoted in.
+    private static string ListingTitle(PricedListing listing) =>
+        listing.Venue != null
+            ? $"{listing.Symbol} ({listing.Stock.Name}), quoted in {QuoteUnit(listing.Venue)}"
+        : string.Equals(
+            listing.Stock.Presentation.Listing.Ticker,
+            listing.PriceTicker,
             StringComparison.OrdinalIgnoreCase
         )
-            ? $"{priceTicker} ({stock.Name})"
-            : priceTicker;
+            ? $"{listing.PriceTicker} ({listing.Stock.Name})"
+        : listing.PriceTicker;
 
-    // Resolves a ticker to its filer and exact stored listing symbol, additionally accepting
-    // the dot class-share notation (BRK.B) for the dash form the price data stores (BRK-B).
-    // This is a mechanical format conversion between two spellings of the same symbol, not a
-    // heuristic. The returned PriceTicker is load-bearing: price queries use it so a secondary
-    // listing can never fall through to the filer's primary bars.
-    private async Task<(EquityIssuer Stock, string PriceTicker, string Error)> ResolveTicker(
-        string ticker
-    )
+    // Stored venue prices stay in the unit the exchange quotes, so London reads in pence as it trades.
+    private static string QuoteUnit(EquityListing venue) =>
+        venue.TradingCurrency == null ? "the listing's local currency"
+        : venue.QuoteUnitMultiplier is null or 1m ? venue.TradingCurrency
+        : venue.TradingCurrency == "GBP" && venue.QuoteUnitMultiplier == 0.01m
+            ? "GBX (pence; 100 GBX = 1 GBP)"
+        : $"units of {McpFormat.Invariant(venue.QuoteUnitMultiplier.Value, "0.######")} {venue.TradingCurrency}";
+
+    private IQueryable<EquityDailyStockPrice> Traded(PricedListing listing) =>
+        listing.Venue == null
+            ? _priceRepository.GetTradedByStock(listing.Stock, listing.PriceTicker)
+            : _priceRepository.GetTradedByListing(listing.Venue.Id);
+
+    private IQueryable<EquityDailyStockPrice> Traded(
+        PricedListing listing,
+        DateOnly start,
+        DateOnly end
+    ) => Traded(listing).Where(p => p.Date >= start && p.Date <= end);
+
+    // Resolves a ticker to its exact listing, folding BRK.B to the stored BRK-B, so a secondary listing
+    // never falls through to the filer's primary bars; MIC:TICKER, or MC.PA after a US miss, names a venue.
+    private async Task<(PricedListing Listing, string Error)> ResolveTicker(string ticker)
     {
-        var resolved = await ResolvePricedSpelling(ticker);
-        if (resolved.Stock == null && ticker != null && ticker.Contains('.'))
+        if (!EquityListingSymbol.TryParse(ticker, out _, out _))
         {
-            var dashed = await ResolvePricedSpelling(ticker.Replace('.', '-'));
-            if (dashed.Stock != null)
-                return dashed;
+            var resolved = await ResolvePricedSpelling(ticker);
+            if (resolved.Stock == null && ticker != null && ticker.Contains('.'))
+            {
+                var dashed = await ResolvePricedSpelling(ticker.Replace('.', '-'));
+                if (dashed.Stock != null)
+                    resolved = dashed;
+            }
+            if (resolved.Stock != null || ticker == null || !ticker.Contains('.'))
+                return resolved.Stock == null
+                    ? (null, resolved.Error)
+                    : (new PricedListing(resolved.Stock, resolved.PriceTicker, null), null);
+
+            var suffixed = await _commonStockRepository.ResolveSuffixAfterUsMiss(
+                ticker,
+                resolved.UsError
+            );
+            return suffixed.Venue == null
+                ? (null, resolved.Error)
+                : (new PricedListing(suffixed.Stock, suffixed.Venue.Ticker, suffixed.Venue), null);
         }
-        return resolved;
+
+        var (stock, venue, error) = await _commonStockRepository.ResolveListing(ticker);
+        return venue == null
+            ? (null, error)
+            : (new PricedListing(stock, venue.Ticker, venue), null);
     }
 
+    // UsError is the issuer lookup's own error, null when a US issuer owns the spelling, so a suffix never
+    // answers for a ticker a US issuer holds.
     private async Task<(
         EquityIssuer Stock,
         string PriceTicker,
-        string Error
+        string Error,
+        string UsError
     )> ResolvePricedSpelling(string lookupTicker)
     {
         var (stock, error) = await _commonStockRepository.ResolveByTicker(lookupTicker);
         if (stock == null)
-            return (null, null, error);
+            return (null, null, error, error);
 
         var priceTicker = SecondaryTickerPolicy.ResolveListedTicker(stock, lookupTicker);
         return priceTicker == null
-            ? (null, null, $"Stock '{lookupTicker}' not found.")
-            : (stock, priceTicker, null);
+            ? (null, null, $"Stock '{lookupTicker}' not found.", null)
+            : (stock, priceTicker, null, null);
     }
 
     // Strict argument parsing shared by the date-ranged price tools: a non-empty date must
@@ -823,16 +952,16 @@ public class StockPriceTools
     }
 
     private async Task<(
-        EquityIssuer Stock,
-        string PriceTicker,
+        PricedListing Listing,
         List<EquityDailyStockPrice> Records,
         int RenderFrom,
+        string HoldNote,
         string Error
     )> LoadAscendingPriceWindow(string ticker, string startDate, string endDate, int warmupBars)
     {
-        var (stock, priceTicker, stockError) = await ResolveTicker(ticker);
+        var (listing, stockError) = await ResolveTicker(ticker);
         if (stockError != null)
-            return (null, null, null, 0, stockError);
+            return (null, null, 0, null, stockError);
 
         var rangeError = ParseRangeStrict(
             startDate,
@@ -842,20 +971,21 @@ public class StockPriceTools
             out var end
         );
         if (rangeError != null)
-            return (stock, priceTicker, null, 0, rangeError);
+            return (listing, null, 0, null, rangeError);
 
-        var records = await _priceRepository
-            .GetTradedByStock(stock, priceTicker, start, end)
-            .OrderBy(p => p.Date)
-            .ToListAsync();
+        var holdNote = ClampToRelease(await GetHold(), ref end);
+        var records = await Traded(listing, start, end).OrderBy(p => p.Date).ToListAsync();
 
         if (records.Count == 0)
             return (
-                stock,
-                priceTicker,
+                listing,
                 null,
                 0,
-                $"No price data found for {priceTicker} in the specified date range."
+                holdNote,
+                WithHoldNote(
+                    $"No price data found for {listing.Symbol} in the specified date range.",
+                    holdNote
+                )
             );
 
         // Warm-up look-back: indicators with a lookback window are computed over extra
@@ -864,8 +994,7 @@ public class StockPriceTools
         var renderFrom = 0;
         if (warmupBars > 0)
         {
-            var warmup = await _priceRepository
-                .GetTradedByStock(stock, priceTicker)
+            var warmup = await Traded(listing)
                 .Where(p => p.Date < start)
                 .OrderByDescending(p => p.Date)
                 .Take(warmupBars)
@@ -878,8 +1007,32 @@ public class StockPriceTools
             }
         }
 
-        return (stock, priceTicker, records, renderFrom, null);
+        return (listing, records, renderFrom, holdNote, null);
     }
+
+    // The session withheld from the current caller, or null when every stored bar is released.
+    private Task<DailyBarHold> GetHold() =>
+        _release?.GetHold() ?? Task.FromResult<DailyBarHold>(null);
+
+    private static IQueryable<EquityDailyStockPrice> Released(
+        IQueryable<EquityDailyStockPrice> bars,
+        DailyBarHold hold
+    ) => hold == null ? bars : bars.Where(p => p.Date < hold.Session);
+
+    // Ends a range before the withheld session and returns the note the caller is owed, or
+    // null when the range never reached that session.
+    private static string ClampToRelease(DailyBarHold hold, ref DateOnly end)
+    {
+        if (hold == null || end < hold.Session)
+            return null;
+        end = hold.Session.AddDays(-1);
+        return hold.Note;
+    }
+
+    private static string WithHoldNote(string output, string holdNote) =>
+        holdNote == null
+            ? output
+            : $"{output.TrimEnd()}{Environment.NewLine}{Environment.NewLine}{holdNote}{Environment.NewLine}";
 
     // Thin forwarder to the shared helper so the load-bearing title/blank/header/separator
     // sequence lives in one documented place; kept as a named method so existing
@@ -899,7 +1052,8 @@ public class StockPriceTools
         int renderFrom,
         int maxResults,
         Func<int, string> formatRow,
-        string footnote = null
+        string footnote = null,
+        string holdNote = null
     )
     {
         var result = StartTable(title, columnsRow, separatorRow);
@@ -928,7 +1082,7 @@ public class StockPriceTools
             result.AppendLine(footnote);
         }
 
-        return result.ToString();
+        return WithHoldNote(result.ToString(), holdNote);
     }
 
     private static void AppendNewestFirstRows(
@@ -960,12 +1114,14 @@ public class StockPriceTools
     // So the basis is chosen by DATE, never by position: only the row dated the trading day
     // immediately before the latest one qualifies. Otherwise there is no day change to state,
     // and an absent percentage is honest where a wrong one is not.
+    // A venue keeps its own holiday calendar, which the US one cannot judge, so its basis is the previous stored close.
     private static decimal? DayChangeBasis(
         EquityDailyStockPrice latest,
         EquityDailyStockPrice previous,
-        DateOnly? splitBoundaryDate
+        DateOnly? splitBoundaryDate,
+        bool venue
     ) =>
-        IsPriorSession(latest, previous)
+        (venue ? previous != null && previous.Date < latest.Date : IsPriorSession(latest, previous))
         && previous.Close > 0
         && (splitBoundaryDate == null || previous.Date >= splitBoundaryDate)
             ? previous.Close
@@ -1033,11 +1189,16 @@ public class StockPriceTools
     }
 
     private sealed record LatestPriceSelection(
-        EquityIssuer Stock,
-        string PriceTicker,
+        PricedListing Listing,
         EquityDailyStockPrice Price,
         EquityDailyStockPrice Previous
     );
+
+    // The exact series a price tool reads: a US filer's listed symbol, or one venue listing.
+    private sealed record PricedListing(EquityIssuer Stock, string PriceTicker, EquityListing Venue)
+    {
+        public string Symbol => Venue == null ? PriceTicker : EquityListingSymbol.Display(Venue);
+    }
 
     // Placeholder row for a ticker with no price to show (unknown symbol or no data),
     // keeping the em-dash columns identical across the per-ticker fallback branches.
