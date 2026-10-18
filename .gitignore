@@ -37,3 +37,10 @@ node_modules/
 *.local
 appsettings.*.json
 !appsettings.json
+
+## Local scratch: migration runbooks, exported secrets, dump manifests.
+## Everything here may contain live credentials -- never commit it.
+tmp/
+
+## Scripts pycache
+/scripts/__pycache__/
