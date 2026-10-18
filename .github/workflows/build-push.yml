@@ -1,11 +1,26 @@
 name: Build & push GHCR images
 
-# Builds the three source-built services (web/mcp/worker) once on a GitHub
-# runner and pushes them to ghcr.io/stoyanov-x, so Coolify only pulls prebuilt
-# images instead of compiling on the small-disk server. hydrate_deploy.py
-# rewrites the compose to reference these images when EQUIBLES_USE_GHCR=1.
+# Builds the three source-built services (web/mcp/worker) once on GitHub
+# runners and pushes them to ghcr.io/stoyanov-x, so Coolify only pulls prebuilt
+# images instead of compiling on the server. hydrate_deploy.py rewrites the
+# compose to reference these images when EQUIBLES_USE_GHCR=1.
 #
 # Public packages (public fork) -> free storage, no download charge.
+#
+# MULTI-ARCH (2026-10-18): every image is published for linux/amd64 AND
+# linux/arm64 under the SAME tag, so `:main` resolves correctly on the x86
+# Hetzner Coolify host and on the arm64 Raspberry Pi. Nothing changes for
+# Coolify: it still pulls `ghcr.io/stoyanov-x/equibles-<svc>:main`.
+#
+# Why native runners instead of `platforms: linux/amd64,linux/arm64` + QEMU:
+# this fork is public, so GitHub's arm64 hosted runner (`ubuntu-24.04-arm`) is
+# free. `dotnet publish` plus the Playwright Firefox download under QEMU takes
+# tens of minutes per service and is the classic place a build times out.
+#
+# Assembly uses the pattern documented by docker/build-push-action: each
+# (service, platform) job pushes BY DIGEST (no tag) and uploads the digest; a
+# merge job creates the tagged manifest list with `imagetools create`. That way
+# one platform can never overwrite the other's tag.
 
 on:
   push:
@@ -37,28 +52,53 @@ concurrency:
   group: build-push
   cancel-in-progress: false
 
+env:
+  IMAGE_PREFIX: ghcr.io/stoyanov-x
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.image }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
+      # Explicit include list on purpose: service -> Dockerfile is not a
+      # mechanical mapping, and a silent mis-map would publish the wrong image
+      # under a tag Coolify pulls.
       matrix:
         include:
           - service: web
             dockerfile: src/Equibles.Web/Dockerfile
-            image: ghcr.io/stoyanov-x/equibles-web
+            image: equibles-web
+            platform: amd64
+            runner: ubuntu-24.04
+          - service: web
+            dockerfile: src/Equibles.Web/Dockerfile
+            image: equibles-web
+            platform: arm64
+            runner: ubuntu-24.04-arm
           - service: mcp
             dockerfile: src/Equibles.Mcp.Server/Dockerfile
-            image: ghcr.io/stoyanov-x/equibles-mcp
+            image: equibles-mcp
+            platform: amd64
+            runner: ubuntu-24.04
+          - service: mcp
+            dockerfile: src/Equibles.Mcp.Server/Dockerfile
+            image: equibles-mcp
+            platform: arm64
+            runner: ubuntu-24.04-arm
           - service: worker
             dockerfile: src/Equibles.Worker.Host/Dockerfile
-            image: ghcr.io/stoyanov-x/equibles-worker
+            image: equibles-worker
+            platform: amd64
+            runner: ubuntu-24.04
+          - service: worker
+            dockerfile: src/Equibles.Worker.Host/Dockerfile
+            image: equibles-worker
+            platform: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -70,14 +110,119 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push
+      - name: Build & push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          push: true
-          tags: |
-            ${{ matrix.image }}:main
-            ${{ matrix.image }}:${{ github.sha }}
-          cache-from: type=gha,scope=equibles-${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=equibles-${{ matrix.service }}
+          platforms: linux/${{ matrix.platform }}
+          # push-by-digest: no tag is created here. The merge job owns tags, so
+          # the two platforms cannot race each other into `:main`.
+          outputs: >-
+            type=image,name=${{ env.IMAGE_PREFIX }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=equibles-${{ matrix.service }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=equibles-${{ matrix.service }}-${{ matrix.platform }}
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          if [ -z "$digest" ]; then
+            echo "::error::build produced no digest for ${{ matrix.image }} (${{ matrix.platform }})"
+            exit 1
+          fi
+          # The digest hex is the whole filename; the merge job re-adds sha256:.
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.platform }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: publish ${{ matrix.image }}:main
+    needs: build
+    # Run even if one platform failed, so a broken arm64 leg cannot freeze the
+    # amd64 images Coolify is running on. This job then fails loudly while
+    # still publishing whatever it has (see the completeness check below).
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: equibles-web
+          - image: equibles-mcp
+          - image: equibles-worker
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-${{ matrix.image }}-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list
+        id: merge
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          image='${{ env.IMAGE_PREFIX }}/${{ matrix.image }}'
+          shopt -s nullglob
+          refs=()
+          for f in *; do refs+=("${image}@sha256:${f}"); done
+          count="${#refs[@]}"
+          echo "platform digests found: ${count}"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no platform digests for ${image} -- nothing to publish"
+            exit 1
+          fi
+          docker buildx imagetools create \
+            -t "${image}:main" \
+            -t "${image}:${{ github.sha }}" \
+            "${refs[@]}"
+          if [ "$count" -ne 2 ]; then
+            echo "::warning::only ${count} platform(s) built for ${image}; the published :main is NOT multi-arch"
+            echo "incomplete=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify manifest platforms
+        if: ${{ always() && steps.merge.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          image='${{ env.IMAGE_PREFIX }}/${{ matrix.image }}'
+          docker buildx imagetools inspect "${image}:main" --format '{{json .Manifest}}' >/tmp/manifest.json
+          python3 - <<'PY'
+          import json
+
+          with open("/tmp/manifest.json") as fh:
+              manifest = json.load(fh)
+          archs = sorted(
+              {m["platform"]["architecture"] for m in manifest.get("manifests", [])}
+          )
+          print(f"published platforms: {archs}")
+          missing = {"amd64", "arm64"} - set(archs)
+          if missing:
+              raise SystemExit(f"MISSING platform(s) in :main -> {sorted(missing)}")
+          PY
+
+      - name: Fail if a platform is missing
+        if: ${{ steps.merge.outputs.incomplete == 'true' }}
+        run: |
+          echo "::error::multi-arch manifest incomplete -- see the warning above"
+          exit 1
