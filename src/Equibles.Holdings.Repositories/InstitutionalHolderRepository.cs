@@ -412,6 +412,85 @@ public class InstitutionalHolderRepository : BaseRepository<InstitutionalHolder>
             .Set<InstitutionalHolderProfile>()
             .Where(profile => profile.InstitutionalHolderId == holder.Id);
 
+    // The holder's measured quarters, one row per closed quarter the intelligence drain computed.
+    public IQueryable<HolderQuarterlyMetrics> GetQuarterlyMetrics(InstitutionalHolder holder) =>
+        DbContext
+            .Set<HolderQuarterlyMetrics>()
+            .Where(metrics => metrics.InstitutionalHolderId == holder.Id);
+
+    // The listed holders' profiles; a holder not yet profiled has none.
+    public IQueryable<InstitutionalHolderProfile> GetProfiles(
+        IReadOnlyCollection<Guid> holderIds
+    ) =>
+        DbContext
+            .Set<InstitutionalHolderProfile>()
+            .Where(profile => holderIds.Contains(profile.InstitutionalHolderId));
+
+    // The listed holders' measurements in the listed quarters.
+    public IQueryable<HolderQuarterlyMetrics> GetQuarterlyMetrics(
+        IReadOnlyCollection<Guid> holderIds,
+        IReadOnlyCollection<DateOnly> reportDates
+    ) =>
+        DbContext
+            .Set<HolderQuarterlyMetrics>()
+            .Where(metrics =>
+                reportDates.Contains(metrics.ReportDate)
+                && holderIds.Contains(metrics.InstitutionalHolderId)
+            );
+
+    // The closed quarters the intelligence drain has computed at least once.
+    public IQueryable<HolderIntelligenceQuarterState> GetComputedIntelligenceQuarters() =>
+        DbContext.Set<HolderIntelligenceQuarterState>().Where(state => state.ComputedAt != null);
+
+    // Every filer's measurements in one quarter.
+    public IQueryable<HolderQuarterlyMetrics> GetQuarterlyMetrics(DateOnly reportDate) =>
+        DbContext.Set<HolderQuarterlyMetrics>().Where(metrics => metrics.ReportDate == reportDate);
+
+    // The profiles of the filers measured in one quarter, joined on the server.
+    public IQueryable<InstitutionalHolderProfile> GetProfilesMeasuredIn(DateOnly reportDate) =>
+        DbContext
+            .Set<InstitutionalHolderProfile>()
+            .Where(profile =>
+                DbContext
+                    .Set<HolderQuarterlyMetrics>()
+                    .Any(metrics =>
+                        metrics.ReportDate == reportDate
+                        && metrics.InstitutionalHolderId == profile.InstitutionalHolderId
+                    )
+            );
+
+    // Every filer's per-sector buying and selling in one quarter.
+    public IQueryable<HolderQuarterlySectorFlow> GetSectorFlows(DateOnly reportDate) =>
+        DbContext.Set<HolderQuarterlySectorFlow>().Where(flow => flow.ReportDate == reportDate);
+
+    // The newest measured quarter on or before the date, null when none is measured yet.
+    public Task<DateOnly?> GetLatestMetricsReportDate(
+        DateOnly onOrBefore,
+        CancellationToken cancellationToken = default
+    ) =>
+        DbContext
+            .Set<HolderQuarterlyMetrics>()
+            .Where(metrics => metrics.ReportDate <= onOrBefore)
+            .MaxAsync(metrics => (DateOnly?)metrics.ReportDate, cancellationToken);
+
+    // Each listed holder's style band in one measured quarter; a holder not measured is absent.
+    public Task<Dictionary<Guid, HolderStyleBand>> GetStyleBands(
+        IReadOnlyCollection<Guid> holderIds,
+        DateOnly reportDate,
+        CancellationToken cancellationToken = default
+    ) =>
+        DbContext
+            .Set<HolderQuarterlyMetrics>()
+            .Where(metrics =>
+                metrics.ReportDate == reportDate
+                && holderIds.Contains(metrics.InstitutionalHolderId)
+            )
+            .ToDictionaryAsync(
+                metrics => metrics.InstitutionalHolderId,
+                metrics => metrics.StyleBand,
+                cancellationToken
+            );
+
     // The holder's current successions, as predecessor or successor.
     public IQueryable<HolderSuccession> GetSuccessions(InstitutionalHolder holder) =>
         DbContext

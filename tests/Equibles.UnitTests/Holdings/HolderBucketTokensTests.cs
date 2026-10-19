@@ -1,4 +1,5 @@
 using Equibles.Holdings.BusinessLogic;
+using Equibles.Holdings.BusinessLogic.Intelligence.Models;
 using Equibles.Holdings.Data.Models;
 
 namespace Equibles.UnitTests.Holdings;
@@ -79,5 +80,99 @@ public class HolderBucketTokensTests
     {
         HolderBucketTokens.ParseEntityTypes((string[])null).Types.Should().BeNull();
         HolderBucketTokens.ParseEntityTypes(new string[0]).Types.Should().BeNull();
+    }
+
+    [Fact]
+    public void ParseStyles_ReadsTokensInAnyCaseAcrossElements()
+    {
+        var (styles, error) = HolderBucketTokens.ParseStyles(["IDX, conc", null, "unk"]);
+
+        error.Should().BeNull();
+        styles
+            .Should()
+            .BeEquivalentTo([
+                HolderStyleBand.IndexLike,
+                HolderStyleBand.Concentrated,
+                HolderStyleBand.Unknown,
+            ]);
+    }
+
+    [Fact]
+    public void ParseStyles_UnknownToken_NamesTheAcceptedTokens()
+    {
+        var (styles, error) = HolderBucketTokens.ParseStyles(["conc", "growth"]);
+
+        styles.Should().BeNull();
+        error
+            .Should()
+            .Be("Unknown style 'growth'. Use one or more of: idx, sys, conc, divact, unk.");
+    }
+
+    [Fact]
+    public void ParseStyles_BlankMeansNoFilter()
+    {
+        HolderBucketTokens.ParseStyles(null).Should().Be((null, null));
+        HolderBucketTokens.ParseStyles([" ", ","]).Should().Be((null, null));
+    }
+
+    [Fact]
+    public void EveryStyleBand_HasOneTokenThatParsesBack()
+    {
+        foreach (var style in Enum.GetValues<HolderStyleBand>())
+            HolderBucketTokens
+                .ParseStyles([HolderBucketTokens.StyleToken(style)])
+                .Styles.Should()
+                .Equal(style);
+    }
+
+    [Fact]
+    public void StyleLabel_ShowsADashForAHolderNotYetMeasured()
+    {
+        HolderBucketTokens.StyleLabel(null).Should().Be("—");
+        HolderBucketTokens
+            .StyleLabel(HolderStyleBand.DiversifiedActive)
+            .Should()
+            .Be("Diversified active");
+        HolderBucketTokens
+            .Describe(
+                new HashSet<HolderStyleBand> { HolderStyleBand.Unknown, HolderStyleBand.IndexLike }
+            )
+            .Should()
+            .Be("idx, unk");
+    }
+
+    [Fact]
+    public void EveryMixDimension_HasOneTokenThatParsesBackCaseInsensitively()
+    {
+        foreach (var dimension in Enum.GetValues<HolderMixDimension>())
+            HolderBucketTokens
+                .ParseMixDimension($" {HolderBucketTokens.Token(dimension).ToUpperInvariant()} ")
+                .Should()
+                .Be((dimension, null));
+        HolderBucketTokens.ParseMixDimension(" ").Should().Be((null, null));
+        HolderBucketTokens
+            .ParseMixDimension("sector")
+            .Error.Should()
+            .Be(
+                "Unknown dimension 'sector'. Use one of: type, style, turnover, horizon, aum, client, pf, country."
+            );
+    }
+
+    [Theory]
+    [InlineData(null, HolderFlowGrouping.None)]
+    [InlineData(" ", HolderFlowGrouping.None)]
+    [InlineData("none", HolderFlowGrouping.None)]
+    [InlineData(" Sector ", HolderFlowGrouping.Sector)]
+    public void ParseFlowGrouping_ReadsTokensInAnyCase(string token, HolderFlowGrouping expected)
+    {
+        HolderBucketTokens.ParseFlowGrouping(token).Should().Be((expected, null));
+    }
+
+    [Fact]
+    public void ParseFlowGrouping_UnknownToken_NamesTheAcceptedTokens()
+    {
+        var (_, error) = HolderBucketTokens.ParseFlowGrouping("industry");
+
+        error.Should().Be("Unknown groupBy 'industry'. Use one of: none, sector.");
     }
 }

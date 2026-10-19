@@ -1,15 +1,16 @@
+using Equibles.Holdings.BusinessLogic.Intelligence.Models;
 using Equibles.Holdings.Data.Models;
 
 namespace Equibles.Holdings.BusinessLogic;
 
 /// <summary>
-/// The short URL and tool-argument tokens for holder entity types, with the compact labels tables
-/// print. Every surface parses holder-type filters here, so an unknown token is refused the same
-/// way everywhere.
+/// The short URL and tool-argument tokens for holder entity types and style bands, with the
+/// compact labels tables print. Every surface parses these filters here, so an unknown token is
+/// refused the same way everywhere.
 /// </summary>
 public static class HolderBucketTokens
 {
-    private static readonly (string Token, HolderEntityType Type, string Label)[] EntityTypes =
+    private static readonly (string Token, HolderEntityType Value, string Label)[] EntityTypes =
     [
         ("adv", HolderEntityType.RegisteredAdviser, "Registered adviser"),
         ("era", HolderEntityType.ExemptReportingAdviser, "Exempt adviser"),
@@ -23,22 +24,113 @@ public static class HolderBucketTokens
         ("unk", HolderEntityType.Unknown, "Unknown"),
     ];
 
-    public static string EntityTypeTokenList =>
-        string.Join(", ", EntityTypes.Select(entry => entry.Token));
+    private static readonly (string Token, HolderStyleBand Value, string Label)[] StyleBands =
+    [
+        ("idx", HolderStyleBand.IndexLike, "Index-like"),
+        ("sys", HolderStyleBand.SystematicLike, "Systematic-like"),
+        ("conc", HolderStyleBand.Concentrated, "Concentrated"),
+        ("divact", HolderStyleBand.DiversifiedActive, "Diversified active"),
+        ("unk", HolderStyleBand.Unknown, "Unknown"),
+    ];
+
+    private static readonly (
+        string Token,
+        HolderMixDimension Value,
+        string Label
+    )[] MixDimensions =
+    [
+        ("type", HolderMixDimension.EntityType, "Holder type"),
+        ("style", HolderMixDimension.Style, "Style"),
+        ("turnover", HolderMixDimension.Turnover, "Turnover"),
+        ("horizon", HolderMixDimension.Horizon, "Holding horizon"),
+        ("aum", HolderMixDimension.BookSize, "13F book size"),
+        ("client", HolderMixDimension.ClientBase, "Client base"),
+        ("pf", HolderMixDimension.PrivateFunds, "Private funds"),
+        ("country", HolderMixDimension.Location, "Location"),
+    ];
+
+    public static string EntityTypeTokenList => TokenList(EntityTypes);
+
+    public static string MixDimensionTokenList => TokenList(MixDimensions);
+
+    public static string Token(HolderMixDimension dimension) =>
+        MixDimensions.Single(entry => entry.Value == dimension).Token;
+
+    public static string Label(HolderMixDimension dimension) =>
+        MixDimensions.Single(entry => entry.Value == dimension).Label;
+
+    /// <summary>
+    /// Parses one holder-mix dimension token, case-insensitively. Blank input means the default
+    /// (null dimension); an unknown token returns an error naming the accepted tokens.
+    /// </summary>
+    public static (HolderMixDimension? Dimension, string Error) ParseMixDimension(string token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+            return (null, null);
+        var match = MixDimensions.FirstOrDefault(entry =>
+            string.Equals(entry.Token, token.Trim(), StringComparison.OrdinalIgnoreCase)
+        );
+        return match.Token == null
+            ? (null, $"Unknown dimension '{token.Trim()}'. Use one of: {MixDimensionTokenList}.")
+            : (match.Value, null);
+    }
+
+    private static readonly (
+        string Token,
+        HolderFlowGrouping Value,
+        string Label
+    )[] FlowGroupings =
+    [
+        ("none", HolderFlowGrouping.None, "No split"),
+        ("sector", HolderFlowGrouping.Sector, "By sector"),
+    ];
+
+    public static string FlowGroupingTokenList => TokenList(FlowGroupings);
+
+    public static string Token(HolderFlowGrouping grouping) =>
+        FlowGroupings.Single(entry => entry.Value == grouping).Token;
+
+    /// <summary>
+    /// Parses a holder-flow grouping token, case-insensitively. Blank input means no split; an
+    /// unknown token returns an error naming the accepted tokens.
+    /// </summary>
+    public static (HolderFlowGrouping Grouping, string Error) ParseFlowGrouping(string token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+            return (HolderFlowGrouping.None, null);
+        var match = FlowGroupings.FirstOrDefault(entry =>
+            string.Equals(entry.Token, token.Trim(), StringComparison.OrdinalIgnoreCase)
+        );
+        return match.Token == null
+            ? (
+                HolderFlowGrouping.None,
+                $"Unknown groupBy '{token.Trim()}'. Use one of: {FlowGroupingTokenList}."
+            )
+            : (match.Value, null);
+    }
+
+    public static string StyleTokenList => TokenList(StyleBands);
 
     public static string Token(HolderEntityType type) =>
-        EntityTypes.Single(entry => entry.Type == type).Token;
+        EntityTypes.Single(entry => entry.Value == type).Token;
+
+    public static string StyleToken(HolderStyleBand style) =>
+        StyleBands.Single(entry => entry.Value == style).Token;
 
     // The selected types' tokens in the accepted-token order, for echoing a filter back.
     public static string Describe(IReadOnlySet<HolderEntityType> types) =>
-        string.Join(
-            ", ",
-            EntityTypes.Where(entry => types.Contains(entry.Type)).Select(entry => entry.Token)
-        );
+        Describe(EntityTypes, types);
+
+    public static string Describe(IReadOnlySet<HolderStyleBand> styles) =>
+        Describe(StyleBands, styles);
 
     // A holder not yet profiled prints a dash; Unknown means its records decide no type.
     public static string Label(HolderEntityType? type) =>
-        type == null ? "—" : EntityTypes.Single(entry => entry.Type == type).Label;
+        type == null ? "—" : EntityTypes.Single(entry => entry.Value == type).Label;
+
+    // A holder not yet measured prints a dash; Unknown means its book is too small or unvalued to band.
+    public static string StyleLabel(HolderStyleBand? style) =>
+        style == null ? "—" : StyleBands.Single(entry => entry.Value == style).Label;
 
     /// <summary>
     /// Parses comma-separated entity type tokens, case-insensitively. Blank input means no filter
@@ -54,11 +146,34 @@ public static class HolderBucketTokens
     /// </summary>
     public static (IReadOnlySet<HolderEntityType> Types, string Error) ParseEntityTypes(
         IEnumerable<string> tokens
+    ) => Parse(EntityTypes, tokens, "holder type");
+
+    /// <summary>Parses style band tokens the way <see cref="ParseEntityTypes(IEnumerable{string})"/> does.</summary>
+    public static (IReadOnlySet<HolderStyleBand> Styles, string Error) ParseStyles(
+        IEnumerable<string> tokens
+    ) => Parse(StyleBands, tokens, "style");
+
+    private static string TokenList<T>((string Token, T Value, string Label)[] table) =>
+        string.Join(", ", table.Select(entry => entry.Token));
+
+    private static string Describe<T>(
+        (string Token, T Value, string Label)[] table,
+        IReadOnlySet<T> selected
+    ) =>
+        string.Join(
+            ", ",
+            table.Where(entry => selected.Contains(entry.Value)).Select(entry => entry.Token)
+        );
+
+    private static (IReadOnlySet<T> Values, string Error) Parse<T>(
+        (string Token, T Value, string Label)[] table,
+        IEnumerable<string> tokens,
+        string kind
     )
     {
         if (tokens == null)
             return (null, null);
-        var types = new HashSet<HolderEntityType>();
+        var values = new HashSet<T>();
         foreach (
             var token in tokens
                 .Where(element => element != null)
@@ -70,16 +185,13 @@ public static class HolderBucketTokens
                 )
         )
         {
-            var match = EntityTypes.FirstOrDefault(entry =>
+            var match = table.FirstOrDefault(entry =>
                 string.Equals(entry.Token, token, StringComparison.OrdinalIgnoreCase)
             );
             if (match.Token == null)
-                return (
-                    null,
-                    $"Unknown holder type '{token}'. Use one or more of: {EntityTypeTokenList}."
-                );
-            types.Add(match.Type);
+                return (null, $"Unknown {kind} '{token}'. Use one or more of: {TokenList(table)}.");
+            values.Add(match.Value);
         }
-        return (types.Count == 0 ? null : types, null);
+        return (values.Count == 0 ? null : values, null);
     }
 }
