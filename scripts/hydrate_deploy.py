@@ -32,6 +32,8 @@ Meridian-only changes applied here (NOT in any upstream file):
      the box is IO-bound (0 % idle, 41 % iowait), so more CPU buys nothing.
      web/mcp/cloakbrowser remain unbounded - see the comment at the change, that is a
      deferred decision, not an oversight.
+  5. `Command Timeout=300` appended to every connection string. The Npgsql default
+     is 30 s and `/status` runs 13 unbounded COUNT(*) queries (upstream #4779).
 """
 from __future__ import annotations
 
@@ -181,6 +183,26 @@ def main() -> int:
     for svc, limits in SERVICE_LIMITS.items():
         if svc in services:
             services[svc].update(limits)
+
+    # Meridian-only change #5: raise the Npgsql command timeout (default 30 s).
+    # `/status` issues 13 unbounded COUNT(*) queries, one per table (upstream
+    # daniel3303/Equibles#4779). Measured on the Pi under backup load on
+    # 2026-10-19: `Document` (315k rows) 14.0 s, `FailToDeliver` (1.18M) 14.6 s -
+    # roughly 10x degraded - so the 3rd or 4th count exceeds 30 s and the whole
+    # page returns the error page. `ConnectionStrings__DefaultConnection` here has
+    # no Command Timeout, and Npgsql has no environment variable for it, so the
+    # only place to set it is the connection string itself. Applies to web/mcp/
+    # worker alike, which also stops the worker's spurious
+    # "Timeout during reading attempt" rows.
+    CONN_TIMEOUT = ";Command Timeout=" + os.environ.get("EQUIBLES_COMMAND_TIMEOUT", "300")
+    for svc in services.values():
+        env = svc.get("environment") if isinstance(svc, dict) else None
+        if not isinstance(env, dict):
+            continue
+        for key, value in list(env.items()):
+            if key.startswith("ConnectionStrings__") and isinstance(value, str):
+                if "command timeout" not in value.lower():
+                    env[key] = value.rstrip(";") + CONN_TIMEOUT
 
     with open(OUT, "w") as fh:
         yaml.safe_dump(merged, fh, sort_keys=False, default_flow_style=False, width=1000)

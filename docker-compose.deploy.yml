@@ -36,7 +36,7 @@ services:
       Embedding__ModelName: ${Embedding__ModelName:-qwen3-embedding:0.6b}
       Embedding__ApiKey: ${Embedding__ApiKey:-}
       Embedding__BatchSize: ${Embedding__BatchSize:-10}
-      ConnectionStrings__DefaultConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
+      ConnectionStrings__DefaultConnection: Host=db;Database=equibles;Username=postgres;Password=postgres;Command Timeout=300
       McpApiKey: ${MCP_API_KEY:-}
       MinimumLogLevel: ${MINIMUM_LOG_LEVEL:-Warning}
       Worker__MinSyncDate: ${Worker__MinSyncDate:-}
@@ -55,8 +55,8 @@ services:
       Embedding__ModelName: ${Embedding__ModelName:-qwen3-embedding:0.6b}
       Embedding__ApiKey: ${Embedding__ApiKey:-}
       Embedding__BatchSize: ${Embedding__BatchSize:-10}
-      ConnectionStrings__DefaultConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
-      ConnectionStrings__TransportConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
+      ConnectionStrings__DefaultConnection: Host=db;Database=equibles;Username=postgres;Password=postgres;Command Timeout=300
+      ConnectionStrings__TransportConnection: Host=db;Database=equibles;Username=postgres;Password=postgres;Command Timeout=300
       MassTransit__RunMigration: 'true'
       Auth__Username: ${AUTH_USERNAME:-}
       Auth__Password: ${AUTH_PASSWORD:-}
@@ -95,8 +95,8 @@ services:
       Embedding__ModelName: ${Embedding__ModelName:-qwen3-embedding:0.6b}
       Embedding__ApiKey: ${Embedding__ApiKey:-}
       Embedding__BatchSize: ${Embedding__BatchSize:-10}
-      ConnectionStrings__DefaultConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
-      ConnectionStrings__TransportConnection: Host=db;Database=equibles;Username=postgres;Password=postgres
+      ConnectionStrings__DefaultConnection: Host=db;Database=equibles;Username=postgres;Password=postgres;Command Timeout=300
+      ConnectionStrings__TransportConnection: Host=db;Database=equibles;Username=postgres;Password=postgres;Command Timeout=300
       MassTransit__RunMigration: 'true'
       Sec__ContactEmail: ${SEC_CONTACT_EMAIL}
       MinimumLogLevel: ${MINIMUM_LOG_LEVEL:-Warning}
