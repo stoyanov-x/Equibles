@@ -25,10 +25,13 @@ Meridian-only changes applied here (NOT in any upstream file):
      (that page reads configuration, not container state).
   3. cloakbrowser pinned to a multi-arch digest (upstream pins a single-image
      manifest, which forces amd64 and dies on the arm64 Pi).
-  4. the worker's mem_limit raised to 1280m (and cpus to 1.0). Its managed heap is
-     90 % of the cgroup limit read at STARTUP, so a 1024m cap pinned the GC near
-     921 MB and left it thrashing. web/mcp/cloakbrowser remain unbounded - see the
-     comment at the change, that is a deferred decision, not an oversight.
+  4. limits raised for a dedicated 4-core host: worker mem_limit 1280m / cpus 2.5,
+     db cpus 1.25. The worker's managed heap is 90 % of the cgroup limit read at
+     STARTUP, so a 1024m cap pinned the GC near 921 MB and left it thrashing; and
+     both worker and db were measurably throttled at their old shares. Beyond this,
+     the box is IO-bound (0 % idle, 41 % iowait), so more CPU buys nothing.
+     web/mcp/cloakbrowser remain unbounded - see the comment at the change, that is a
+     deferred decision, not an oversight.
 """
 from __future__ import annotations
 
@@ -154,8 +157,16 @@ def main() -> int:
     #            sets DOTNET_GCHeapHardLimitPercent=0x5A (90 %), so the managed heap
     #            is 90 % of the cgroup limit read AT STARTUP: under a 1024m cap the
     #            heap tops out near 921 MB and the GC spends its time fighting the
-    #            cap. 1280m lifts it to ~1152 MB. 1.0 cpu (of 4 cores) halves the
-    #            throttling; the db keeps its 0.75.
+    #            cap. 1280m lifts it to ~1152 MB.
+    #   cpu       the Pi has 4 cores and is dedicated to this stack. Raised to db
+    #             1.25 + worker 2.5 (3.75 declared). Both were genuinely throttled
+    #             before: the worker at 97-107 % of a 1.0 share, the db at 78 % of
+    #             its old 0.75. After the raise (measured 2026-10-19) the worker
+    #             uses 1.72 of 2.5 and its throttling fell from 5.7 to 1.8 periods/s,
+    #             and the box shows 0 % idle with 41 % IOWAIT - i.e. the remaining
+    #             ceiling is NOT what limits anything, the single USB spindle is.
+    #             Do not raise these further expecting throughput: the cores would
+    #             sit unused while the disk queue grows.
     #   db       1876 MiB peak / 2048 - deliberately NOT changed: 954 MB of that is
     #            shared_buffers and the rest is page cache, which the kernel
     #            reclaims on demand, so reaching the ceiling is not an OOM risk.
@@ -164,7 +175,8 @@ def main() -> int:
     #            - but bounding them was deferred on 2026-10-19 and is NOT done here.
     #            When it is, cap each a few multiples above its peak, not at it.
     SERVICE_LIMITS = {
-        "worker": {"mem_limit": "1280m", "cpus": "1.0"},
+        "db": {"mem_limit": "2048m", "cpus": "1.25"},
+        "worker": {"mem_limit": "1280m", "cpus": "2.5"},
     }
     for svc, limits in SERVICE_LIMITS.items():
         if svc in services:
