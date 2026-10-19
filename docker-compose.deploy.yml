@@ -83,8 +83,8 @@ services:
     restart: unless-stopped
     image: ghcr.io/stoyanov-x/equibles-web:main
   worker:
-    cpus: '0.5'
-    mem_limit: 1024m
+    cpus: '1.0'
+    mem_limit: 1280m
     env_file:
     - path: .env
       required: false

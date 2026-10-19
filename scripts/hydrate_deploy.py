@@ -23,6 +23,12 @@ Meridian-only changes applied here (NOT in any upstream file):
      and Coolify's nightly docker cleanup then deleted it outright -- the whole
      scraper fleet vanished while /status still reported "7/8 workers active"
      (that page reads configuration, not container state).
+  3. cloakbrowser pinned to a multi-arch digest (upstream pins a single-image
+     manifest, which forces amd64 and dies on the arm64 Pi).
+  4. the worker's mem_limit raised to 1280m (and cpus to 1.0). Its managed heap is
+     90 % of the cgroup limit read at STARTUP, so a 1024m cap pinned the GC near
+     921 MB and left it thrashing. web/mcp/cloakbrowser remain unbounded - see the
+     comment at the change, that is a deferred decision, not an oversight.
 """
 from __future__ import annotations
 
@@ -140,6 +146,29 @@ def main() -> int:
         services["cloakbrowser"]["image"] = (
             "cloakhq/cloakbrowser:0.3.31@sha256:440907001735f4e2764e614e1b40c40bc0317d34b83c0315897dea443cbe5fcc"
         )
+
+    # Meridian-only change #4: give the worker the headroom it measurably needs.
+    # Measured on 2026-10-19, ~4 h into load, from the container's own cgroup:
+    #   worker   1024 MiB peak / 1024 limit - EXACTLY at the cap, 657 throttled CPU
+    #            periods, 828 MB RSS, kernel compaction 33 % of the time. The image
+    #            sets DOTNET_GCHeapHardLimitPercent=0x5A (90 %), so the managed heap
+    #            is 90 % of the cgroup limit read AT STARTUP: under a 1024m cap the
+    #            heap tops out near 921 MB and the GC spends its time fighting the
+    #            cap. 1280m lifts it to ~1152 MB. 1.0 cpu (of 4 cores) halves the
+    #            throttling; the db keeps its 0.75.
+    #   db       1876 MiB peak / 2048 - deliberately NOT changed: 954 MB of that is
+    #            shared_buffers and the rest is page cache, which the kernel
+    #            reclaims on demand, so reaching the ceiling is not an OOM risk.
+    #   web/mcp/cloakbrowser are still UNBOUNDED (measured peaks 247/46/82 MiB). That
+    #            is a real hazard - a spike there can OOM-kill Postgres or the worker
+    #            - but bounding them was deferred on 2026-10-19 and is NOT done here.
+    #            When it is, cap each a few multiples above its peak, not at it.
+    SERVICE_LIMITS = {
+        "worker": {"mem_limit": "1280m", "cpus": "1.0"},
+    }
+    for svc, limits in SERVICE_LIMITS.items():
+        if svc in services:
+            services[svc].update(limits)
 
     with open(OUT, "w") as fh:
         yaml.safe_dump(merged, fh, sort_keys=False, default_flow_style=False, width=1000)
