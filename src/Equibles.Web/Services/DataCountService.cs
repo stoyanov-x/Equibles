@@ -1,3 +1,4 @@
+using System.Data;
 using Equibles.Cboe.Repositories;
 using Equibles.Cftc.Repositories;
 using Equibles.CommonStocks.Repositories;
@@ -77,6 +78,61 @@ public class DataCountService
 
     public Task<int> GetCboeVixDailyCount() => CountAll(_cboeVixDailyRepository);
 
-    private static Task<int> CountAll<T>(BaseRepository<T> repository)
-        where T : class => repository.GetAll().CountAsync();
+    // ==== MERIDIAN PATCH #6 -- if this file conflicts during an upstream sync,
+    // ==== keep THIS body. Rationale below; upstream issue daniel3303/Equibles#4779.
+    //
+    // Upstream counts rows with COUNT(*) once per table, thirteen times, on every
+    // single /status request. On a real dataset two of those tables reach 20M and
+    // 44M rows, and measured here on 2026-10-20 a COUNT(*) on each did not finish
+    // within 240 s - so the page could never render, whatever client timeout was
+    // configured. Even the cheap tables took 14 s each while the disk was busy.
+    //
+    // These numbers are status-page decoration; nobody acts on the last digit.
+    // Reading the planner's estimate from pg_class.reltuples turns thirteen table
+    // scans into one catalogue lookup that costs microseconds and is immune to
+    // load - which matters most precisely when the box is unhealthy, i.e. when
+    // someone opens the status page.
+    private async Task<int> CountAll<T>(BaseRepository<T> repository)
+        where T : class
+    {
+        var entityType = repository.Context.Model.FindEntityType(typeof(T));
+        var table = entityType?.GetTableName();
+        if (table is null)
+            return await repository.GetAll().CountAsync();
+
+        var schema = entityType!.GetSchema() ?? "public";
+        var connection = repository.Context.Database.GetDbConnection();
+        var opened = connection.State != ConnectionState.Open;
+        if (opened)
+            await connection.OpenAsync();
+        try
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText =
+                "SELECT reltuples::bigint FROM pg_class c "
+                + "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                + "WHERE c.relname = @table AND n.nspname = @schema";
+            var pTable = cmd.CreateParameter();
+            pTable.ParameterName = "@table";
+            pTable.Value = table;
+            cmd.Parameters.Add(pTable);
+            var pSchema = cmd.CreateParameter();
+            pSchema.ParameterName = "@schema";
+            pSchema.Value = schema;
+            cmd.Parameters.Add(pSchema);
+
+            if (await cmd.ExecuteScalarAsync() is long estimate && estimate >= 0)
+                return (int)Math.Min(estimate, int.MaxValue);
+        }
+        finally
+        {
+            if (opened)
+                await connection.CloseAsync();
+        }
+
+        // reltuples < 0 means never analyzed. Report the real number then, rather
+        // than a wrong zero - this is rare (autovacuum analyzes after the first
+        // insert batch) so it does not reintroduce the slow path in practice.
+        return await repository.GetAll().CountAsync();
+    }
 }

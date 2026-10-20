@@ -1,0 +1,70 @@
+name: Notify on failed workflow
+
+# A failed fork job is how a MERIDIAN patch silently stops being applied: the
+# weekly upstream sync conflicts, the hydrate job cannot regenerate the compose,
+# or an image build breaks - and nobody notices until the deployed stack is a
+# week stale. Actions does not email by default, and nobody watches the tab.
+#
+# So: any failure in the three workflows that carry our patches opens (or
+# comments on) a GitHub issue. One mechanism for all of them - deliberately not
+# pasted into each workflow, so there is no chance of the copies drifting.
+
+on:
+  workflow_run:
+    workflows:
+      - "Sync upstream into fork"
+      - "Hydrate deploy compose"
+      - "Build & push GHCR images"
+    types: [completed]
+
+permissions:
+  issues: write
+  actions: read
+
+jobs:
+  report:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open or update an issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          WF="${{ github.event.workflow_run.name }}"
+          RUN="${{ github.event.workflow_run.html_url }}"
+          WHEN="$(date -u +%Y-%m-%dT%H:%MZ)"
+          TITLE="Workflow failed: $WF"
+
+          BODY=$(cat <<EOF
+          **$WF** failed at $WHEN.
+
+          Run: $RUN
+
+          What this usually means, and what to check:
+
+          - **Sync upstream into fork** - upstream edited a file that carries a
+            MERIDIAN patch. Keep the MERIDIAN blocks and resolve by hand:
+            \`scripts/hydrate_deploy.py\` (changes #1..#6),
+            \`src/Equibles.Web/Services/DataCountService.cs\` (CountAll reads
+            \`pg_class.reltuples\` instead of \`COUNT(*)\`), or
+            \`src/Equibles.Data/BaseRepository.cs\` (\`Context\` accessor).
+          - **Hydrate deploy compose** - \`docker-compose.deploy.yml\` no longer
+            regenerates from the three upstream files. The deployed stack keeps
+            working but silently misses compose changes.
+          - **Build & push GHCR images** - the C# patch above does not compile.
+            Coolify will keep pulling the last good image, so prod is fine but
+            the change never lands.
+
+          Nothing is broken in production by a failure here; the danger is that it
+          stays unnoticed.
+          EOF
+          )
+
+          EXISTING=$(gh issue list --state open --search "\"$TITLE\" in:title" \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi
