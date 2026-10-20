@@ -26,6 +26,7 @@ services:
       retries: 5
       start_period: 30s
     restart: unless-stopped
+    stop_grace_period: 300s
   mcp:
     ports:
     - ${EQUIBLES_MCP_EXPOSE_PORT:-8081}:8080

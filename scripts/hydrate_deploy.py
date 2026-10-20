@@ -34,6 +34,14 @@ Meridian-only changes applied here (NOT in any upstream file):
      deferred decision, not an oversight.
   5. `Command Timeout=300` appended to every connection string. The Npgsql default
      is 30 s and `/status` runs 13 unbounded COUNT(*) queries (upstream #4779).
+  6. `stop_grace_period: 300s` on db. Docker's default grace is 10 s, and the
+     image's StopSignal is SIGINT (fast shutdown) - which does not mean fast: it
+     still has to roll back open transactions and checkpoint a dirty buffer pool.
+     Measured 2026-10-20: with 28 active sessions (one transaction 35 minutes old)
+     the 10 s expired mid-rollback, the postmaster was SIGKILLed, and the next
+     start spent ~2.5 minutes in crash recovery replaying 1.4 GB of WAL at
+     ~14 MB/s while 13,008 connections were refused. A slow clean shutdown costs
+     a scheduled restart minutes; an unclean one costs an outage plus a redo.
 """
 from __future__ import annotations
 
@@ -183,6 +191,14 @@ def main() -> int:
     for svc, limits in SERVICE_LIMITS.items():
         if svc in services:
             services[svc].update(limits)
+
+    # Meridian-only change #6: give Postgres time to stop cleanly. Independent of
+    # the resource limits above - it is the one setting that decides whether a
+    # restart is an inconvenience or a crash-recovery outage (see the docstring).
+    # Deliberately not applied to web/mcp/worker: a web request is disposable and
+    # a 10 s grace is right for it; the database is not.
+    if "db" in services:
+        services["db"]["stop_grace_period"] = "300s"
 
     # Meridian-only change #5: raise the Npgsql command timeout (default 30 s).
     # `/status` issues 13 unbounded COUNT(*) queries, one per table (upstream
