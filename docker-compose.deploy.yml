@@ -21,10 +21,10 @@ services:
       test:
       - CMD-SHELL
       - pg_isready -h localhost -U postgres -d equibles
-      interval: 5s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 300s
     restart: unless-stopped
     stop_grace_period: 300s
   mcp:

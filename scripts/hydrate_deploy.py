@@ -42,6 +42,10 @@ Meridian-only changes applied here (NOT in any upstream file):
      start spent ~2.5 minutes in crash recovery replaying 1.4 GB of WAL at
      ~14 MB/s while 13,008 connections were refused. A slow clean shutdown costs
      a scheduled restart minutes; an unclean one costs an outage plus a redo.
+  7. db healthcheck start_period 300s / interval 10s / timeout 10s / retries 12.
+     Upstream tolerates ~55s of unhealthy, which a 2-minute crash recovery blows
+     straight past - and because web/mcp/worker wait on `service_healthy`, that
+     turns a recovering database into a failed deployment and a Bad Gateway.
 """
 from __future__ import annotations
 
@@ -199,6 +203,22 @@ def main() -> int:
     # a 10 s grace is right for it; the database is not.
     if "db" in services:
         services["db"]["stop_grace_period"] = "300s"
+
+    # Meridian-only change #7: let the db healthcheck survive a crash recovery.
+    # Measured 2026-10-20: after an unclean stop the replacement container spent
+    # ~2 minutes in redo plus the end-of-recovery checkpoint, and pg_isready failed
+    # throughout. Upstream's start_period 30s with 5 retries (~55s of tolerance)
+    # declared it unhealthy, so `depends_on: condition: service_healthy` never
+    # started web/mcp/worker, Coolify marked the deployment failed, and the site
+    # returned Bad Gateway. That turned a recoverable delay into a dead deploy.
+    # A slower first health check costs nothing; a premature unhealthy costs an
+    # outage.
+    if "db" in services and isinstance(services["db"].get("healthcheck"), dict):
+        hc = services["db"]["healthcheck"]
+        hc["start_period"] = "300s"
+        hc["interval"] = "10s"
+        hc["timeout"] = "10s"
+        hc["retries"] = 12
 
     # Meridian-only change #5: raise the Npgsql command timeout (default 30 s).
     # `/status` issues 13 unbounded COUNT(*) queries, one per table (upstream
