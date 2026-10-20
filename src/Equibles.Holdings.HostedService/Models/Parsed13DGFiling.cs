@@ -4,8 +4,8 @@ namespace Equibles.Holdings.HostedService.Models;
 
 /// <summary>
 /// A single Schedule 13D/13G (or 13D/A / 13G/A) submission parsed from its raw
-/// EDGAR <c>primary_doc.xml</c>. Schedule 13D and 13G became machine-readable
-/// XML on 2024-12-18, so only filings from that date forward can be parsed; the
+/// EDGAR <c>primary_doc.xml</c>. Schedule 13D and 13G could be filed as XML from
+/// 2023-12-18 (mandatory from 2024-12-18), so only those filings can be parsed; the
 /// two forms share a namespace family but use different element names, which the
 /// parser reconciles. This is the beneficial-ownership equivalent of one 13F
 /// filing and is projected into the same import pipeline by the realtime path.
@@ -30,7 +30,19 @@ public class Parsed13DGFiling
     public DateOnly DateOfEvent { get; set; }
 
     public string IssuerCik { get; set; }
+
+    /// <summary>The CUSIP as filed; stored with the details even when it resolves to nothing.</summary>
     public string IssuerCusip { get; set; }
+
+    /// <summary>
+    /// The CUSIP the holdings row carries: the filed CUSIP, or the subject company's only listed
+    /// common security's CUSIP when the filed one resolves to nothing. Null until resolved, when
+    /// the filed CUSIP is used.
+    /// </summary>
+    public string PositionCusip { get; set; }
+
+    /// <summary>The text reader's version for a pre-XML filing; null for an XML filing.</summary>
+    public int? TextParserVersion { get; set; }
     public string IssuerName { get; set; }
     public string SecuritiesClassTitle { get; set; }
 

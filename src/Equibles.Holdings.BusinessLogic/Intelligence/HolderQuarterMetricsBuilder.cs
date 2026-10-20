@@ -1,4 +1,5 @@
 using Equibles.CorporateActions.Data;
+using Equibles.Holdings.BusinessLogic.Intelligence.Benchmarks;
 using Equibles.Holdings.BusinessLogic.Intelligence.Models;
 using Equibles.Holdings.Data.Models;
 
@@ -33,9 +34,18 @@ public static class HolderQuarterMetricsBuilder
             unresolved
         );
         var concentration = HolderConcentrationCalculator.Measure(current);
-        var activeShare = ActiveShareCalculator.ActiveShare(
-            HolderConcentrationCalculator.IssuerValues(current),
-            input.AggregateBenchmark
+        var issuerValues = HolderConcentrationCalculator.IssuerValues(current);
+        var benchmarks = MeasureBenchmarks(input, issuerValues);
+        // Benchmarks arrive in catalog order, so a tie keeps the published index. A benchmark too
+        // little of which resolved to issuers is reported but never decides the band.
+        var eligible = benchmarks
+            .Where(row => row.Benchmark.Coverage >= input.MinimumBenchmarkCoverage)
+            .ToList();
+        (HolderBenchmark Benchmark, ActiveShareMeasurement Measurement)? closest =
+            eligible.Count == 0 ? null : eligible.MinBy(row => row.Measurement.ActiveShare);
+        var sectorActiveShare = ActiveShareCalculator.ActiveShare(
+            HolderSectorWeights.Of(issuerValues, input.IssuerSectors),
+            input.AggregateSectorWeights
         );
 
         var bit = HolderTenureCalculator.Set(0, quarter);
@@ -52,6 +62,7 @@ public static class HolderQuarterMetricsBuilder
             );
         var toSet = new List<HolderSecurityKey>();
         var tenures = new List<(decimal Value, HolderTenure Tenure)>();
+        var tenureBySecurity = new Dictionary<HolderSecurityKey, HolderTenure>(held.Count);
         foreach (var (security, value) in held)
         {
             var mask = input.Presence.GetValueOrDefault(security);
@@ -67,7 +78,10 @@ public static class HolderQuarterMetricsBuilder
                 ) is
                 { } run
             )
+            {
                 tenures.Add((value, run));
+                tenureBySecurity[security] = run;
+            }
         }
         var toClear = input
             .Presence.Where(pair => (pair.Value & bit) != 0 && !held.ContainsKey(pair.Key))
@@ -84,7 +98,7 @@ public static class HolderQuarterMetricsBuilder
             {
                 EquityAum = trades.EquityAum,
                 StockCount = concentration.StockCount,
-                ClosestActiveShare = activeShare,
+                ClosestActiveShare = closest?.Measurement.ActiveShare,
                 TrailingAnnualTurnover = trailing,
                 TopTenWeight = concentration.TopTenWeight,
                 EffectivePositions = concentration.EffectivePositions,
@@ -116,7 +130,19 @@ public static class HolderQuarterMetricsBuilder
             EffectivePositions = concentration.EffectivePositions,
             ValueWeightedTenureQuarters = tenure.ValueWeightedQuarters,
             CensoredValueShare = tenure.CensoredValueShare,
-            AggregateActiveShare = activeShare,
+            AggregateActiveShare = benchmarks
+                .Where(row => row.Benchmark.Key == HolderBenchmarkCatalog.Aggregate)
+                .Select(row => (decimal?)row.Measurement.ActiveShare)
+                .FirstOrDefault(),
+            ClosestBenchmark = closest?.Benchmark.Key,
+            ClosestBenchmarkName = HolderBenchmarkCatalog.Name(closest?.Benchmark.Key),
+            ClosestBenchmarkAsOf = closest?.Benchmark.AsOf,
+            ClosestActiveShare = closest?.Measurement.ActiveShare,
+            SectorActiveShare = sectorActiveShare,
+            ComparedHolderId =
+                input.Previous == null
+                    ? null
+                    : input.ComparedHolderId ?? input.InstitutionalHolderId,
             IndexSeriesNetAssets = input.IndexSeriesNetAssets,
             AdvisedSeriesNetAssets = input.AdvisedSeriesNetAssets,
             AdvisedSeriesAsOf = input.AdvisedSeriesAsOf,
@@ -140,7 +166,50 @@ public static class HolderQuarterMetricsBuilder
             input.IssuerSectors,
             input.ExchangeTradedSecurities
         );
-        return new HolderQuarterResult(metrics, toSet, toClear, sectorFlows);
+        var benchmarkRows = benchmarks
+            .Select(row => new HolderQuarterlyBenchmarkActiveShare
+            {
+                InstitutionalHolderId = input.InstitutionalHolderId,
+                ReportDate = input.ReportDate,
+                BenchmarkKey = row.Benchmark.Key,
+                BenchmarkAsOf = row.Benchmark.AsOf,
+                ActiveShare = row.Measurement.ActiveShare,
+                Overlap = row.Measurement.Overlap,
+                Coverage = Math.Clamp(row.Benchmark.Coverage, 0, 1),
+            })
+            .ToList();
+        var costSlots = HolderCostBasisCalculator.Advance(
+            current,
+            previous,
+            input.PreviousCostSlots,
+            input.PreviousShareFactors,
+            unresolved,
+            input.AveragePrices
+        );
+        var book = new HolderQuarterBook
+        {
+            Current = current,
+            Previous = previous,
+            UnresolvedBasis = unresolved,
+            Tenures = tenureBySecurity,
+            CostSlots = costSlots,
+            SecurityTrades = trades.SecurityTrades,
+        };
+        return new HolderQuarterResult(metrics, toSet, toClear, sectorFlows, benchmarkRows, book);
+    }
+
+    // Every benchmark the book can be measured against; an empty book measures none. One pass
+    // over the book's issuers per benchmark, so a benchmark's size never multiplies the work.
+    private static List<(
+        HolderBenchmark Benchmark,
+        ActiveShareMeasurement Measurement
+    )> MeasureBenchmarks(HolderQuarterInput input, IReadOnlyDictionary<Guid, decimal> issuerValues)
+    {
+        var measured = new List<(HolderBenchmark, ActiveShareMeasurement)>();
+        foreach (var benchmark in input.Benchmarks)
+            if (ActiveShareCalculator.Measure(issuerValues, benchmark.Weights) is { } measurement)
+                measured.Add((benchmark, measurement));
+        return measured;
     }
 
     // Common shares only: put/call and principal legs never count as the filer's equity book.
@@ -151,7 +220,8 @@ public static class HolderQuarterMetricsBuilder
             .Select(row => new HolderEquityPosition(
                 row.Security,
                 row.Shares,
-                row.ValueMissing ? null : row.Value
+                row.ValueMissing ? null : row.Value,
+                row.FiledValue
             ))
             .ToList();
 

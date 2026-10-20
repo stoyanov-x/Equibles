@@ -39,8 +39,29 @@ public class HolderBucketTokensTests
         error
             .Should()
             .Be(
-                "Unknown holder type 'hedge'. Use one or more of: adv, era, ia, bank, ins, bd, fund, plan, nonus, unk."
+                "Unknown holder type 'hedge'. Use one or more of: adv, era, ia, bank, ins, bd, fund, plan, nonus, hc, unk."
             );
+    }
+
+    [Fact]
+    public void ParseEntityTypes_HoldingCompanyToken_ReadsInAnyCase()
+    {
+        var (types, error) = HolderBucketTokens.ParseEntityTypes(["HC", "bank"]);
+
+        error.Should().BeNull();
+        types.Should().BeEquivalentTo([HolderEntityType.HoldingCompany, HolderEntityType.Bank]);
+        HolderBucketTokens.Label(HolderEntityType.HoldingCompany).Should().Be("Holding company");
+        HolderBucketTokens
+            .Describe(
+                new HashSet<HolderEntityType>
+                {
+                    HolderEntityType.Unknown,
+                    HolderEntityType.HoldingCompany,
+                    HolderEntityType.NonUsInstitution,
+                }
+            )
+            .Should()
+            .Be("nonus, hc, unk");
     }
 
     [Fact]
@@ -174,5 +195,31 @@ public class HolderBucketTokensTests
         var (_, error) = HolderBucketTokens.ParseFlowGrouping("industry");
 
         error.Should().Be("Unknown groupBy 'industry'. Use one of: none, sector.");
+    }
+
+    [Theory]
+    [InlineData("fundtype")]
+    [InlineData(" FundType ")]
+    public void ParseHolderMixDimension_FundTypeIsNo13FDimension(string token)
+    {
+        HolderBucketTokens.ParseHolderMixDimension(token).Should().Be((null, true, null));
+    }
+
+    [Fact]
+    public void ParseHolderMixDimension_ReadsThe13FDimensionsAndNamesFundTypeOnError()
+    {
+        HolderBucketTokens
+            .ParseHolderMixDimension("style")
+            .Should()
+            .Be((HolderMixDimension.Style, false, null));
+        HolderBucketTokens.ParseHolderMixDimension(null).Should().Be((null, false, null));
+        HolderBucketTokens
+            .ParseHolderMixDimension("sector")
+            .Error.Should()
+            .Be(
+                "Unknown dimension 'sector'. Use one of: type, style, turnover, horizon, aum, client, pf, country, fundtype."
+            );
+        // Flows split 13F filers only, so their parser still refuses the fund-type token.
+        HolderBucketTokens.ParseMixDimension("fundtype").Error.Should().NotBeNull();
     }
 }

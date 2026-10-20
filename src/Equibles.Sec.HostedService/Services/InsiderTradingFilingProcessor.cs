@@ -1248,6 +1248,9 @@ public class InsiderTradingFilingProcessor : IFilingProcessor
         marker.AcquiredDisposed = default;
         marker.SharesOwnedAfter = 0;
         marker.OwnershipNature = default;
+        marker.NatureOfOwnership = null;
+        marker.OwnershipNatureFootnoteIds = [];
+        marker.BalanceFootnoteIds = [];
         marker.SecurityTitle = null;
         marker.SecurityKind = InsiderSecurityKind.Unknown;
         marker.IsAmendment = isAmendment;

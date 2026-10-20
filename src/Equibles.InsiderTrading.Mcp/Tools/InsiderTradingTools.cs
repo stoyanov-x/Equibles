@@ -15,6 +15,7 @@ using Equibles.Errors.Data.Models;
 using Equibles.InsiderTrading.Data.Extensions;
 using Equibles.InsiderTrading.Data.Models;
 using Equibles.InsiderTrading.Repositories;
+using Equibles.InsiderTrading.Repositories.Models;
 using Equibles.Mcp;
 using Equibles.Mcp.Helpers;
 using Microsoft.EntityFrameworkCore;
@@ -291,7 +292,7 @@ public class InsiderTradingTools
         ReadOnly = true
     )]
     [Description(
-        "Get a summary of insider ownership for a stock, ranked by total shares held. Shares come from each insider's most recent SEC Form 3/4/5 filing: the filing's closing balance per security and ownership bucket (actual shares only — options and other derivative holdings are excluded), summed into Direct and Indirect columns and restated onto today's split basis, so they can differ from the raw figures in older filings. Indirect can understate an insider holding through several vehicles, because a filing reports one balance per vehicle and only the last is kept. Former insiders may linger with stale dates or zero shares. Returns at most maxResults insiders (default 30). Use this to understand the insider ownership structure of a company; use GetInsiderTransactions for the underlying trades."
+        "Get a summary of insider ownership for a stock, ranked by total shares held. Shares come from each insider's most recent SEC Form 3/4/5 filing: the filing's closing balance per security, held directly or through each indirect vehicle the filing names (a trust, partnership or LLC, told apart by its stated nature of ownership and by which balance each trade continues), actual shares only (options and other derivative holdings are excluded), summed into Direct and Indirect columns and restated onto today's split basis, so they can differ from the raw figures in older filings. A vehicle the newest filing does not list is not counted. Former insiders may linger with stale dates or zero shares. Returns at most maxResults insiders (default 30). Use this to understand the insider ownership structure of a company; use GetInsiderTransactions for the underlying trades."
     )]
     public Task<string> GetInsiderOwnership(
         [Description("Company ticker symbol (e.g., AAPL, MSFT)")] string ticker,
@@ -315,49 +316,8 @@ public class InsiderTradingTools
 
                 maxResults = McpLimit.Clamp(maxResults);
 
-                // An ownership summary's Shares Owned must come from the non-derivative
-                // (actual shares) table — an options/derivative row is a different balance,
-                // and the pre-v6 "no securities owned" sentinels (SecurityKind Unknown) are
-                // zero positions by construction.
-                var byStock = _transactionRepository
-                    .GetByIssuerId((stock).Id)
-                    .Where(t => t.SecurityKind == InsiderSecurityKind.NonDerivative);
-
-                // Every row of each insider's NEWEST filing — not just its last line. A
-                // filing reports one closing balance PER OWNERSHIP BUCKET (security title ×
-                // direct or indirect), so the last line alone is only the final bucket's
-                // balance and understates every insider who also holds under another class
-                // or vehicle — the old single-row read published whichever bucket happened
-                // to sit on the filing's last line. Materialize them ALL before ranking:
-                // each row sits on its own split basis, and cutting on the raw counts would
-                // under-rank insiders whose last filing predates a large split. The Id
-                // clause keeps rows without an accession number reachable (they degrade to
-                // the old single-row read); the accession clause is correlated per insider,
-                // so a joint filing cannot leak another owner's rows in.
-                var currentByStock = byStock.OrderCurrentPositionFirst();
-                var latestTransactions = await _transactionRepository
-                    .GetByIssuerIdWithOwner((stock).Id)
-                    .Where(t => t.SecurityKind == InsiderSecurityKind.NonDerivative)
-                    .Where(t =>
-                        t.Id
-                            == currentByStock
-                                .Where(t2 => t2.InsiderOwnerId == t.InsiderOwnerId)
-                                .Select(t2 => t2.Id)
-                                .First()
-                        || (
-                            t.AccessionNumber != null
-                            && t.AccessionNumber
-                                == currentByStock
-                                    .Where(t2 => t2.InsiderOwnerId == t.InsiderOwnerId)
-                                    .Select(t2 => t2.AccessionNumber)
-                                    .First()
-                        )
-                    )
-                    .ToListAsync();
-
-                // Restate every balance onto today's basis, then rank and cut on the
-                // adjusted total so the ordering — and the top-N cut itself — compares
-                // like with like.
+                // Each insider's newest filing, restated onto today's basis, then ranked and cut
+                // on the adjusted total so the ordering and the top-N cut compare like with like.
                 var splits = await _stockSplitRepository
                     .GetEffectiveByStock(stock.Id, DateOnly.FromDateTime(DateTime.UtcNow))
                     .ToListAsync();
@@ -366,10 +326,9 @@ public class InsiderTradingTools
                     stock.Presentation.Listing.Ticker,
                     stock.Presentation.Listing.Ticker
                 );
-                var positions = latestTransactions
-                    .GroupBy(t => t.InsiderOwnerId)
-                    .Select(group => BuildOwnershipPosition([.. group], splits))
-                    .ToList();
+                var positions = await new InsiderOwnershipPositionCalculator(
+                    _transactionRepository
+                ).GetCurrentPositions(stock, splits);
                 offset = McpLimit.ClampOffset(offset);
                 // Adjusted holdings tie constantly (zero-share former insiders), so the
                 // ordering ends on stable keys — an offset over a partial order would
@@ -393,7 +352,7 @@ public class InsiderTradingTools
                 );
                 sb.AppendLine($"Showing {ranked.Count} insiders with most recent data");
                 sb.AppendLine(
-                    "_Each row is as-of that insider's most recent filing: the filing's closing balance per security and ownership bucket (actual shares only), summed into Direct and Indirect and restated onto today's split basis. A filing reports one balance per indirect vehicle and keeps no vehicle identity, so Indirect can understate an insider holding through several vehicles. Former insiders may linger with stale dates or zero shares._"
+                    "_Each row is as-of that insider's most recent filing: the filing's closing balance per security, held directly or through each indirect vehicle it names (actual shares only), summed into Direct and Indirect and restated onto today's split basis. A vehicle the newest filing does not list is not counted. Former insiders may linger with stale dates or zero shares._"
                 );
                 sb.AppendLine();
                 sb.AppendLine(
@@ -429,50 +388,6 @@ public class InsiderTradingTools
             "GetInsiderOwnership",
             $"ticker: {ticker}, offset: {offset}"
         );
-    }
-
-    private sealed record InsiderOwnershipPosition(
-        InsiderTransaction Anchor,
-        long DirectShares,
-        long IndirectShares
-    );
-
-    // One insider's current position from their newest filing's rows. A multi-row filing lists
-    // intermediate balances per bucket, so only each (security title, direct/indirect) bucket's
-    // LAST row — filing order, mirroring OrderCurrentPositionFirst — is that bucket's closing
-    // balance; those are restated onto today's split basis and summed per nature. The anchor is
-    // the filing's overall last row (the row the tool previously showed alone).
-    private static InsiderOwnershipPosition BuildOwnershipPosition(
-        List<InsiderTransaction> rows,
-        List<StockSplit> splits
-    )
-    {
-        var ordered = rows.OrderByDescending(t => t.TransactionDate)
-            .ThenByDescending(t => t.FilingDate)
-            .ThenByDescending(t => t.AccessionNumber, StringComparer.Ordinal)
-            .ThenByDescending(t => t.TransactionOrder)
-            .ThenByDescending(t => t.Id)
-            .ToList();
-
-        long direct = 0;
-        long indirect = 0;
-        foreach (
-            var bucket in ordered.GroupBy(t => (Title: t.SecurityTitle ?? "", t.OwnershipNature))
-        )
-        {
-            var closing = bucket.First();
-            var adjusted = SplitAdjustment.AdjustShareCount(
-                closing.SharesOwnedAfter,
-                closing.TransactionDate,
-                splits
-            );
-            if (bucket.Key.OwnershipNature == OwnershipNature.Direct)
-                direct += adjusted;
-            else
-                indirect += adjusted;
-        }
-
-        return new InsiderOwnershipPosition(ordered[0], direct, indirect);
     }
 
     [McpServerTool(
@@ -740,19 +655,7 @@ public class InsiderTradingTools
         );
     }
 
-    private static string GetRole(InsiderOwner owner)
-    {
-        var roles = new List<string>();
-        if (owner.IsDirector)
-            roles.Add("Director");
-        if (owner.IsOfficer)
-            roles.Add(
-                string.IsNullOrWhiteSpace(owner.OfficerTitle) ? "Officer" : owner.OfficerTitle
-            );
-        if (owner.IsTenPercentOwner)
-            roles.Add("10% Owner");
-        return roles.Count > 0 ? string.Join(", ", roles) : "Insider";
-    }
+    private static string GetRole(InsiderOwner owner) => InsiderRoleLabel.Of(owner);
 
     // Thin forwarder so existing reflection-based normalization tests still find the method.
     private Task<(EquityIssuer Stock, string Error)> ResolveStockByTicker(string ticker) =>

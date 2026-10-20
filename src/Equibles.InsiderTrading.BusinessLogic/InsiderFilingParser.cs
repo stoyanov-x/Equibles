@@ -300,6 +300,21 @@ public static class InsiderFilingParser
         return string.IsNullOrEmpty(cik) ? null : cik.TrimStart('0');
     }
 
+    /// <summary>
+    /// The trading symbol an ownership filing states for <paramref name="issuerCik"/>, or null
+    /// when the document is not that issuer's (a filing in a reporting owner's feed) or states none.
+    /// </summary>
+    public static string GetIssuerTradingSymbol(string submissionText, string issuerCik)
+    {
+        var root = TryGetOwnershipRoot(submissionText);
+        var expectedCik = issuerCik?.Trim().TrimStart('0');
+        if (root == null || string.IsNullOrEmpty(expectedCik) || GetIssuerCik(root) != expectedCik)
+            return null;
+
+        var symbol = root.Element("issuer")?.Element("issuerTradingSymbol")?.Value?.Trim();
+        return string.IsNullOrEmpty(symbol) ? null : symbol;
+    }
+
     internal static InsiderTransaction ParseTransaction(
         XElement txElement,
         InsiderOwner owner,
@@ -357,6 +372,9 @@ public static class InsiderFilingParser
                 adCode == "D" ? AcquiredDisposed.Disposed : AcquiredDisposed.Acquired,
             SharesOwnedAfter = ParseLong(sharesAfterStr),
             OwnershipNature = ParseOwnershipNature(txElement),
+            NatureOfOwnership = ParseNatureOfOwnership(txElement),
+            OwnershipNatureFootnoteIds = ParseOwnershipNatureFootnoteIds(txElement),
+            BalanceFootnoteIds = ParseBalanceFootnoteIds(txElement),
             SecurityTitle = securityTitle,
             AccessionNumber = filing.AccessionNumber,
             IsAmendment = isAmendment,
@@ -399,6 +417,9 @@ public static class InsiderFilingParser
             AcquiredDisposed = AcquiredDisposed.Acquired,
             SharesOwnedAfter = ParseLong(sharesStr),
             OwnershipNature = ParseOwnershipNature(holdingElement),
+            NatureOfOwnership = ParseNatureOfOwnership(holdingElement),
+            OwnershipNatureFootnoteIds = ParseOwnershipNatureFootnoteIds(holdingElement),
+            BalanceFootnoteIds = ParseBalanceFootnoteIds(holdingElement),
             SecurityTitle = securityTitle,
             AccessionNumber = filing.AccessionNumber,
             IsAmendment = isAmendment,
@@ -464,6 +485,44 @@ public static class InsiderFilingParser
             ?.Trim();
         return value == "I" ? OwnershipNature.Indirect : OwnershipNature.Direct;
     }
+
+    internal const int NatureOfOwnershipMaxLength = 256;
+
+    // The filed natureOfOwnership text with whitespace runs collapsed; null when absent or blank.
+    internal static string ParseNatureOfOwnership(XElement element)
+    {
+        var value = GetWrappedValue(element, "ownershipNature", "natureOfOwnership");
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+        var collapsed = string.Join(
+            ' ',
+            value.Split((char[])null, StringSplitOptions.RemoveEmptyEntries)
+        );
+        return collapsed.Length <= NatureOfOwnershipMaxLength
+            ? collapsed
+            : collapsed[..NatureOfOwnershipMaxLength];
+    }
+
+    // Footnote ids anywhere in the row's ownershipNature block: filers attach the footnote that
+    // names a vehicle to natureOfOwnership or to directOrIndirectOwnership.
+    internal static List<string> ParseOwnershipNatureFootnoteIds(XElement element) =>
+        FootnoteIds(element.Element("ownershipNature"));
+
+    // Footnote ids on the balance the row reports. Some filers name the vehicle there (Nelnet's
+    // trusts and GRATs); others explain the balance, such as shares bought under an ESPP.
+    internal static List<string> ParseBalanceFootnoteIds(XElement element) =>
+        FootnoteIds(
+            element.Element("postTransactionAmounts")?.Element("sharesOwnedFollowingTransaction")
+        );
+
+    private static List<string> FootnoteIds(XElement element) =>
+        element
+            ?.Descendants("footnoteId")
+            .Select(reference => reference.Attribute("id")?.Value?.Trim())
+            .Where(id => !string.IsNullOrEmpty(id))
+            .Distinct()
+            .ToList()
+        ?? [];
 
     // SEC ownership XML wraps each field in <field><value>...</value></field>,
     // sometimes nested under a grouping element (transactionAmounts, etc.).

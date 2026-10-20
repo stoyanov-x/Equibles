@@ -11,7 +11,7 @@ namespace Equibles.Holdings.HostedService.Services;
 
 /// <summary>
 /// Parses the raw <c>primary_doc.xml</c> of a single Schedule 13D or 13G filing
-/// (beneficial-ownership reports, machine-readable XML since 2024-12-18).
+/// (beneficial-ownership reports, machine-readable XML since 2023-12-18).
 ///
 /// The two forms share a namespace family but differ in element names — 13D uses
 /// <c>dateOfEvent</c>, <c>issuerCUSIP</c>, repeated <c>reportingPersonInfo</c>
@@ -82,6 +82,8 @@ public class Filing13DGXmlParser
             filing.ReportingPersons.Add(ParseReportingPerson(person));
 
         filing.RuleDesignations = Values(root, "designateRulePursuantThisScheduleFiled");
+        // Item 3's checked categories. Its otherTypeOfPersonFiling is the free-text "type of
+        // institution" line, never a code, even when a filer writes one there.
         filing.FilingPersonTypeCodes = Codes(Descendants(root, "typeOfPersonFiling"));
 
         return filing;

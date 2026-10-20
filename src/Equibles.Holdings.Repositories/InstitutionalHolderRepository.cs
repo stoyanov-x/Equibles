@@ -3,6 +3,7 @@ using Equibles.Data;
 using Equibles.Holdings.Data.Models;
 using Equibles.Holdings.Repositories.Extensions;
 using Equibles.Holdings.Repositories.Models;
+using Equibles.Sec.Data.Models;
 using Microsoft.EntityFrameworkCore;
 
 namespace Equibles.Holdings.Repositories;
@@ -412,11 +413,29 @@ public class InstitutionalHolderRepository : BaseRepository<InstitutionalHolder>
             .Set<InstitutionalHolderProfile>()
             .Where(profile => profile.InstitutionalHolderId == holder.Id);
 
+    // The Form ADV history a profile's adviser CRD links to, for point-in-time client bases.
+    public IQueryable<FormAdvAdviserVersion> GetAdviserVersions() =>
+        DbContext.Set<FormAdvAdviserVersion>();
+
+    public IQueryable<FormAdvPrivateFundFiling> GetPrivateFundFilings() =>
+        DbContext.Set<FormAdvPrivateFundFiling>();
+
+    public IQueryable<FormAdvRosterImport> GetAdviserRosters() =>
+        DbContext.Set<FormAdvRosterImport>();
+
     // The holder's measured quarters, one row per closed quarter the intelligence drain computed.
     public IQueryable<HolderQuarterlyMetrics> GetQuarterlyMetrics(InstitutionalHolder holder) =>
         DbContext
             .Set<HolderQuarterlyMetrics>()
             .Where(metrics => metrics.InstitutionalHolderId == holder.Id);
+
+    // The holder's active share against each benchmark, one row per benchmark per measured quarter.
+    public IQueryable<HolderQuarterlyBenchmarkActiveShare> GetQuarterlyBenchmarkActiveShares(
+        InstitutionalHolder holder
+    ) =>
+        DbContext
+            .Set<HolderQuarterlyBenchmarkActiveShare>()
+            .Where(row => row.InstitutionalHolderId == holder.Id);
 
     // The listed holders' profiles; a holder not yet profiled has none.
     public IQueryable<InstitutionalHolderProfile> GetProfiles(
@@ -500,6 +519,50 @@ public class InstitutionalHolderRepository : BaseRepository<InstitutionalHolder>
                 || succession.SuccessorHolderId == holder.Id
             )
             .StillSucceeded(DbContext);
+
+    // The current successions of these predecessors.
+    public IQueryable<HolderSuccession> GetSuccessionsOf(
+        IReadOnlyCollection<Guid> predecessorIds
+    ) =>
+        DbContext
+            .Set<HolderSuccession>()
+            .Where(succession => predecessorIds.Contains(succession.PredecessorHolderId))
+            .StillSucceeded(DbContext);
+
+    /// <summary>When the stored parent rollups were last replaced; null before the first refresh.</summary>
+    public Task<DateTime?> GetRollupsComputedAt(CancellationToken cancellationToken = default) =>
+        DbContext
+            .Set<HolderRollup>()
+            .Select(rollup => (DateTime?)rollup.ComputedAt)
+            .MaxAsync(cancellationToken);
+
+    /// <summary>The stored parent rollups of these canonical CIKs.</summary>
+    public IQueryable<HolderRollup> GetRollups(IReadOnlyCollection<string> canonicalCiks) =>
+        DbContext.Set<HolderRollup>().Where(rollup => canonicalCiks.Contains(rollup.Cik));
+
+    /// <summary>
+    /// The confirmed link evidence naming this canonical CIK as parent, of these kinds, for these
+    /// quarters.
+    /// </summary>
+    public IQueryable<HolderLinkEvidence> GetConfirmedLinkEvidenceByParent(
+        string canonicalParentCik,
+        IReadOnlyCollection<HolderLinkKind> kinds,
+        IReadOnlyCollection<DateOnly> reportDates
+    ) =>
+        DbContext
+            .Set<HolderLinkEvidence>()
+            .Where(evidence =>
+                evidence.ParentCik == canonicalParentCik
+                && evidence.Confirmed
+                && kinds.Contains(evidence.Kind)
+                && evidence.ReportDate != null
+                && reportDates.Contains(evidence.ReportDate.Value)
+            );
+
+    /// <summary>The stored 13F filer links of these fund series.</summary>
+    public IQueryable<FundSeriesHolderLink> GetFundSeriesLinks(
+        IReadOnlyCollection<string> seriesIds
+    ) => DbContext.Set<FundSeriesHolderLink>().Where(link => seriesIds.Contains(link.SeriesId));
 
     private async Task<List<InstitutionalHolderSearchMatch>> RankWithStats(
         IQueryable<InstitutionalHolder> source,
@@ -750,12 +813,6 @@ public class InstitutionalHolderRepository : BaseRepository<InstitutionalHolder>
             .Where(h => h.StateOrCountry != null && h.StateOrCountry != "")
             .Select(h => h.StateOrCountry)
             .Distinct();
-    }
-
-    public IQueryable<InstitutionalHolder> GetUnclassified()
-    {
-        return GetAll()
-            .Where(h => h.Classification == FundClassification.Unknown && h.Name != null);
     }
 }
 

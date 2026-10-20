@@ -1,3 +1,5 @@
+using Equibles.Holdings.BusinessLogic.Intelligence.Benchmarks;
+
 namespace Equibles.Holdings.BusinessLogic.Intelligence.Models;
 
 /// <summary>Everything one filer's metrics for one quarter are computed from.</summary>
@@ -7,7 +9,10 @@ public sealed record HolderQuarterInput
     public DateOnly ReportDate { get; init; }
     public IReadOnlyList<HolderIntelligenceRow> Current { get; init; } = [];
 
-    /// <summary>The quarter before's rows, or null when the filer filed no 13F then.</summary>
+    /// <summary>
+    /// The quarter before's rows, or null when neither the filer nor a predecessor it alone
+    /// continues filed a 13F then.
+    /// </summary>
     public IReadOnlyList<HolderIntelligenceRow> Previous { get; init; }
 
     /// <summary>
@@ -24,6 +29,13 @@ public sealed record HolderQuarterInput
     public IReadOnlyDictionary<HolderSecurityKey, decimal> AveragePrices { get; init; } =
         new Dictionary<HolderSecurityKey, decimal>();
 
+    /// <summary>
+    /// The compared filer's cost slots at the quarter before, per security held then; a security
+    /// missing here while held then has no carried estimate.
+    /// </summary>
+    public IReadOnlyDictionary<HolderSecurityKey, HolderCostSlot> PreviousCostSlots { get; init; } =
+        new Dictionary<HolderSecurityKey, HolderCostSlot>();
+
     /// <summary>The filer's stored presence masks, per security.</summary>
     public IReadOnlyDictionary<HolderSecurityKey, long> Presence { get; init; } =
         new Dictionary<HolderSecurityKey, long>();
@@ -34,9 +46,30 @@ public sealed record HolderQuarterInput
     /// <summary>The bit of the corpus's first complete quarter, where tenure is censored.</summary>
     public int FirstCoveredQuarter { get; init; }
 
-    /// <summary>Every 13F filer's combined common-share value per issuer this quarter.</summary>
-    public IReadOnlyDictionary<Guid, decimal> AggregateBenchmark { get; init; } =
+    /// <summary>
+    /// The quarter's chosen benchmark per catalog key (<see cref="HolderBenchmarkSelection"/>),
+    /// the combined 13F book under <see cref="HolderBenchmarkCatalog.Aggregate"/> among them.
+    /// </summary>
+    public IReadOnlyList<HolderBenchmark> Benchmarks { get; init; } = [];
+
+    /// <summary>
+    /// A benchmark resolved below this share of its weight is still measured and stored, but never
+    /// becomes the closest benchmark the index-like band reads.
+    /// </summary>
+    public decimal MinimumBenchmarkCoverage { get; init; } = HolderBenchmark.DefaultMinimumCoverage;
+
+    /// <summary>
+    /// The combined 13F book's value per sector (<see cref="HolderSectorWeights"/>), the benchmark
+    /// of sector active share; empty leaves it unmeasured.
+    /// </summary>
+    public IReadOnlyDictionary<Guid, decimal> AggregateSectorWeights { get; init; } =
         new Dictionary<Guid, decimal>();
+
+    /// <summary>
+    /// The filer whose rows <see cref="Previous"/> holds: this filer, or the predecessor it alone
+    /// continues; null when <see cref="Previous"/> is null.
+    /// </summary>
+    public Guid? ComparedHolderId { get; init; }
 
     /// <summary>The three quarters before's stored turnover, oldest first; null where unknown.</summary>
     public IReadOnlyList<decimal?> PriorTurnovers { get; init; } = [null, null, null];
