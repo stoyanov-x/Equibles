@@ -38,6 +38,8 @@ public class YahooCatalogPriceQueueTests
         {
             [current.EquityListingId] = new(2026, 9, 29),
             [recent.EquityListingId] = new(2026, 9, 29),
+            [failed.EquityListingId] = new(2026, 8, 3),
+            [retry.EquityListingId] = new(2026, 8, 3),
         };
         YahooCatalogPriceQueue
             .Order([failed, retry, untouched, recent, current], dates, Now)
@@ -50,17 +52,58 @@ public class YahooCatalogPriceQueueTests
             .And.Contain(recent);
     }
 
+    [Fact]
+    public void SymbolsYahooNeverPricedRetryDailyAndLeaveBackfillToANewVenue()
+    {
+        // Yahoo served nothing for these London symbols two hours ago; Toronto was just admitted.
+        var unpriced = Enumerable
+            .Range(0, 50)
+            .Select(index =>
+                Target("DEAD" + index) with
+                {
+                    MarketCountryCode = "GB",
+                    MarketIdentifierCode = "XLON",
+                    YahooPriceSyncAttemptedAt = Now.AddHours(-2),
+                }
+            )
+            .ToArray();
+        var admitted = Enumerable
+            .Range(0, 50)
+            .Select(index =>
+                Target("NEW" + index) with
+                {
+                    MarketCountryCode = "CA",
+                    MarketIdentifierCode = "XTSE",
+                }
+            )
+            .ToArray();
+        var dormant = Target("DORMANT") with { YahooPriceSyncAttemptedAt = Now.AddHours(-2) };
+        var dates = new Dictionary<Guid, DateOnly?> { [dormant.EquityListingId] = new(2026, 8, 3) };
+        var targets = unpriced.Concat(admitted).Append(dormant).ToArray();
+
+        YahooCatalogPriceQueue
+            .Order(targets, dates, Now)
+            .Should()
+            .BeEquivalentTo(admitted.Append(dormant));
+        YahooCatalogPriceQueue
+            .Order(targets, dates, Now.AddHours(21))
+            .Should()
+            .NotContain(unpriced);
+        YahooCatalogPriceQueue.Order(targets, dates, Now.AddHours(22)).Should().Contain(unpriced);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
     public void LargeVenueCannotFillTheBatchBeforeOtherMarkets(bool hasRecentPrices)
     {
+        // Every listing was last asked before its market's newest settled session closed.
         var large = Enumerable
             .Range(0, 1000)
             .Select(index =>
                 Target("LARGE" + index) with
                 {
-                    YahooPriceSyncAttemptedAt = Now.AddHours(-4),
+                    YahooPriceSyncAttemptedAt = Now.AddHours(-28),
                 }
             )
             .ToArray();
@@ -68,18 +111,18 @@ public class YahooCatalogPriceQueueTests
         {
             MarketCountryCode = "DK",
             MarketIdentifierCode = "XCSE",
-            YahooPriceSyncAttemptedAt = Now.AddHours(-2),
+            YahooPriceSyncAttemptedAt = Now.AddHours(-26),
         };
         var other = Target("OTHER") with
         {
             MarketCountryCode = "PL",
             MarketIdentifierCode = "XWAR",
-            YahooPriceSyncAttemptedAt = Now.AddHours(-3),
+            YahooPriceSyncAttemptedAt = Now.AddHours(-27),
         };
         var targets = large.Append(smaller).Append(other).ToArray();
         var dates = targets.ToDictionary(
             target => target.EquityListingId,
-            _ => hasRecentPrices ? (DateOnly?)new(2026, 9, 29) : null
+            _ => hasRecentPrices ? (DateOnly?)new(2026, 9, 28) : null
         );
         var ordered = YahooCatalogPriceQueue.Order(targets, dates, Now);
 
@@ -116,6 +159,126 @@ public class YahooCatalogPriceQueueTests
             .ToArray();
         YahooCatalogPriceQueue.Order(targets, dates, Now).Should().Equal(newer, other);
     }
+
+    [Fact]
+    public void RetriedThinNamesCannotHoldBackAnotherMarketsUnaskedSession()
+    {
+        // Hong Kong's 2026-09-30 session settled at 08:40 UTC and nobody has asked for it yet.
+        var hongKong = Enumerable
+            .Range(0, 300)
+            .Select(index =>
+                VenueTarget((index + 1).ToString("D5"), "HK", "XHKG") with
+                {
+                    YahooPriceSyncAttemptedAt = Now.AddHours(-16),
+                }
+            )
+            .ToArray();
+        // Paris thin names still lack the 2026-09-29 close after being asked for it this morning.
+        var parisRetries = Enumerable
+            .Range(0, 40)
+            .Select(index =>
+                VenueTarget("FR" + index, "FR", "XPAR") with
+                {
+                    YahooPriceSyncAttemptedAt = Now.AddMinutes(-30),
+                }
+            )
+            .ToArray();
+        var targets = parisRetries.Concat(hongKong).ToArray();
+        var dates = targets.ToDictionary(
+            target => target.EquityListingId,
+            target => hongKong.Contains(target) ? (DateOnly?)new(2026, 9, 29) : new(2026, 9, 28)
+        );
+
+        var hongKongIds = hongKong.Select(target => target.EquityListingId).ToHashSet();
+
+        var ordered = YahooCatalogPriceQueue.Order(targets, dates, Now);
+
+        ordered.Should().HaveCount(targets.Length);
+        ordered
+            .Take(hongKong.Length)
+            .Should()
+            .OnlyContain(target => hongKongIds.Contains(target.EquityListingId));
+    }
+
+    [Fact]
+    public void AWeekendGapLeavesTheSeriesCurrent()
+    {
+        var saturday = new DateTime(2026, 10, 3, 18, 0, 0, DateTimeKind.Utc);
+        // FRIDAY holds Friday's close; THURSDAY was re-asked for it this afternoon and still lacks it.
+        var friday = VenueTarget("FRIDAY", "GB", "XLON") with
+        {
+            YahooPriceSyncAttemptedAt = saturday.AddDays(-1).AddHours(-1),
+        };
+        var thursday = friday with
+        {
+            EquityListingId = Guid.NewGuid(),
+            Ticker = "THURSDAY",
+            YahooPriceSyncAttemptedAt = saturday.AddHours(-2),
+        };
+        var dates = new Dictionary<Guid, DateOnly?>
+        {
+            [friday.EquityListingId] = new(2026, 10, 2),
+            [thursday.EquityListingId] = new(2026, 10, 1),
+        };
+
+        YahooCatalogPriceQueue
+            .Order([friday, thursday], dates, saturday)
+            .Should()
+            .Equal(thursday, friday);
+    }
+
+    [Fact]
+    public void AVenueCoveredListingDueItsIntervalFetchPrecedesRetries()
+    {
+        // Euronext bars keep both Paris listings current through 2026-09-29.
+        var due = VenueTarget("DUE", "FR", "XPAR") with
+        {
+            YahooPriceSyncAttemptedAt = Now.AddHours(-25),
+        };
+        var fetched = VenueTarget("FETCHED", "FR", "XPAR") with
+        {
+            YahooPriceSyncAttemptedAt = Now.AddHours(-1),
+        };
+        var neverFetched = VenueTarget("FIRST", "FR", "XPAR");
+        // A London thin name already re-asked for the 2026-09-29 close this morning.
+        var retry = VenueTarget("THIN", "GB", "XLON") with
+        {
+            YahooPriceSyncAttemptedAt = Now.AddMinutes(-30),
+        };
+        var dates = new Dictionary<Guid, DateOnly?>
+        {
+            [due.EquityListingId] = new(2026, 9, 29),
+            [fetched.EquityListingId] = new(2026, 9, 29),
+            [neverFetched.EquityListingId] = new(2026, 9, 29),
+            [retry.EquityListingId] = new(2026, 9, 28),
+        };
+        var covered = new HashSet<Guid>
+        {
+            due.EquityListingId,
+            fetched.EquityListingId,
+            neverFetched.EquityListingId,
+        };
+
+        var ordered = YahooCatalogPriceQueue.Order(
+            [retry, fetched, due, neverFetched],
+            dates,
+            Now,
+            covered,
+            TimeSpan.FromHours(24)
+        );
+
+        ordered.Take(2).Should().BeEquivalentTo([neverFetched, due]);
+        ordered.Skip(2).Should().Equal(retry, fetched);
+    }
+
+    // A security id makes the target a catalog listing, so the venue's own clock settles its sessions.
+    private static PriceSeriesTarget VenueTarget(string ticker, string country, string mic) =>
+        Target(ticker) with
+        {
+            MarketCountryCode = country,
+            MarketIdentifierCode = mic,
+            EquitySecurityId = Guid.NewGuid(),
+        };
 
     private static PriceSeriesTarget Target(string ticker) =>
         new(

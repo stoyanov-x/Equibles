@@ -145,6 +145,46 @@ public class GleifIdentityClient
         }
     }
 
+    // The legal entity and every ISIN GLEIF relates to it, such as Toyota Motor's ordinary share and its bonds. An
+    // entity GLEIF relates no ISIN to has none; above the enumeration bound only the reported total is recorded.
+    public virtual async Task<GleifIssuerIdentity> GetIsinsForLei(
+        string lei,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var result = await GetIssuerForLei(lei, cancellationToken);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromMinutes(2));
+        try
+        {
+            using var json = JsonDocument.Parse(result.ResponseBodies[0]);
+            var root = json.RootElement;
+            var relationships = root.GetProperty("data").GetProperty("relationships");
+            var path = $"/api/v1/lei-records/{lei}/isins";
+            // GLEIF leaves the relationship out of the record of an entity it relates no ISIN to; its securities
+            // page is read all the same, so "none" is what GLEIF states rather than what a missing link implies.
+            var next = WithPageSize(
+                relationships.TryGetProperty("isins", out var isins)
+                    ? ValidateRelatedUrl(Text(isins.GetProperty("links"), "related"), path)
+                    : new Uri(Origin, path)
+            );
+            var publishDate = Text(
+                root.GetProperty("meta").GetProperty("goldenCopy"),
+                "publishDate"
+            );
+            await ReadRelatedIsins(result, next, path, publishDate, timeout.Token);
+        }
+        catch (Exception exception)
+            when (exception is KeyNotFoundException or InvalidOperationException or JsonException)
+        {
+            throw new InvalidDataException(
+                "GLEIF related securities response has an invalid structure.",
+                exception
+            );
+        }
+        return result;
+    }
+
     private async Task ReadRelatedIsins(
         GleifIssuerIdentity result,
         Uri next,
@@ -178,6 +218,17 @@ public class GleifIdentityClient
             )
                 throw new InvalidDataException("GLEIF identity changed during pagination.");
             var rows = Records(root);
+            // Only an entity looked up by LEI can relate no ISIN; an ISIN lookup always relates the requested one.
+            if (
+                page == 0
+                && total == 0
+                && rows.GetArrayLength() == 0
+                && result.RequestedIsin == null
+            )
+            {
+                result.ResponseBodies.Add(body);
+                return;
+            }
             if (rows.GetArrayLength() == 0)
                 throw new InvalidDataException("GLEIF returned an incomplete securities page.");
             var isins = new List<string>();
@@ -209,7 +260,8 @@ public class GleifIdentityClient
                         MaxRelatedIsins,
                         result.RequestedIsin
                     );
-                    result.RelatedIsins.Add(result.RequestedIsin);
+                    if (result.RequestedIsin != null)
+                        result.RelatedIsins.Add(result.RequestedIsin);
                     return;
                 }
             }
