@@ -139,4 +139,40 @@ public class StandaloneXbrlParserStreamingTests
         facts.Should().NotBeEmpty();
         facts.Should().Contain(f => f.Tag == "Y" && f.Value == 5m);
     }
+
+    [Fact]
+    public void Parse_RootIsNotAnXbrlInstance_ReturnsEmpty()
+    {
+        // Guards the root check on both passes: a non-xbrli:xbrl document must be
+        // rejected without walking it.
+        new StandaloneXbrlParser()
+            .Parse("<html><body><p>x</p></body></html>")
+            .Should()
+            .BeEmpty();
+    }
+
+    [Fact]
+    public void Parse_NilAndUnresolvableFacts_AreRejectedButGoodOnesSurvive()
+    {
+        // Every reject that happens BEFORE the content read: nil, unknown
+        // contextRef, unknown unitRef. These are the paths the caller steps over
+        // with Skip(), so they are also where an off-by-one in advancement would
+        // show up as a missing "Good" fact.
+        var xml =
+            $"<xbrli:xbrl xmlns:xbrli=\"{XbrliNs}\" xmlns:a=\"{UsGaapNs}\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+            + "<xbrli:context id=\"c\"><xbrli:entity><xbrli:identifier scheme=\"s\">1</xbrli:identifier></xbrli:entity>"
+            + "<xbrli:period><xbrli:instant>2024-01-01</xbrli:instant></xbrli:period></xbrli:context>"
+            + "<xbrli:unit id=\"u\"><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unit>"
+            + "<a:Nil contextRef=\"c\" unitRef=\"u\" xsi:nil=\"true\">5</a:Nil>"
+            + "<a:MissingCtx contextRef=\"nope\" unitRef=\"u\">6</a:MissingCtx>"
+            + "<a:MissingUnit contextRef=\"c\" unitRef=\"nope\">7</a:MissingUnit>"
+            + "<a:Good contextRef=\"c\" unitRef=\"u\">8</a:Good>"
+            + "</xbrli:xbrl>";
+
+        var facts = new StandaloneXbrlParser().Parse(xml);
+
+        facts.Should().ContainSingle();
+        facts[0].Tag.Should().Be("Good");
+        facts[0].Value.Should().Be(8m);
+    }
 }
