@@ -53,23 +53,51 @@ public class YahooStockPriceProvider : IStockPriceProvider
             // One window query per date: the primary series for every requested stock, plus
             // the exact secondary series requested. The precise (stock, listing) pairing is
             // re-applied in memory — the small overfetch beats a per-pair query.
-            var prices = await _dbContext
-                .Set<EquityDailyStockPrice>()
-                .Where(p => p.Listing.MarketCountryCode == "US")
-                .Where(p =>
-                    p.Listing.Presentation != null
+            // Resolve the candidate listings FIRST, then filter prices by listing id.
+            //
+            // WHY: the original query filtered prices with
+            //     stockIds.Contains(p.Listing.Security.EquityIssuerId)
+            // but the issuer sits two joins away (Price -> Listing -> Security), so the
+            // predicate is not sargable. The planner could not push it into the
+            // (EquityListingId, Date) index and had to take the whole 7-day slice of
+            // EquityDailyStockPrice - roughly 15.7k listings x 7 days per call - then join
+            // every row to reach the issuer. Measured in production: 4,445 calls at 43.4 s
+            // mean, 53.5 hours of database time in total.
+            //
+            // EquityListing is only ~15.7k rows, so materialising the id set costs one small
+            // index-backed query, and the price scan then becomes
+            //     "EquityListingId" = ANY(...)  AND  "Date" BETWEEN ...
+            // which IX_EquityDailyStockPrice_EquityListingId_Date can serve directly.
+            //
+            // The predicates are unchanged, only relocated: every one of them depends solely
+            // on the listing, so evaluating them over EquityListing yields the same set of
+            // rows as evaluating them per price row.
+            var candidateListingIds = await _dbContext
+                .Set<EquityListing>()
+                .Where(l => l.MarketCountryCode == "US")
+                .Where(l =>
+                    l.Presentation != null
                     || !_dbContext
                         .Set<EquityListing>()
                         .Any(other =>
-                            other.Id != p.EquityListingId
+                            other.Id != l.Id
                             && other.MarketCountryCode == "US"
-                            && other.Ticker == p.Listing.Ticker
-                            && other.Security.EquityIssuerId == p.Listing.Security.EquityIssuerId
+                            && other.Ticker == l.Ticker
+                            && other.Security.EquityIssuerId == l.Security.EquityIssuerId
                         )
                 )
+                .Where(l => stockIds.Contains(l.Security.EquityIssuerId))
+                .Select(l => l.Id)
+                .ToListAsync(cancellationToken);
+
+            if (candidateListingIds.Count == 0)
+                continue;
+
+            var prices = await _dbContext
+                .Set<EquityDailyStockPrice>()
+                .Where(p => candidateListingIds.Contains(p.EquityListingId))
                 .Where(p =>
-                    stockIds.Contains(p.Listing.Security.EquityIssuerId)
-                    && (p.Listing.Presentation != null || secondaryTickers.Contains(p.SourceTicker))
+                    (p.Listing.Presentation != null || secondaryTickers.Contains(p.SourceTicker))
                     && p.Date >= minDate
                     && p.Date <= date
                     && p.Volume > 0
