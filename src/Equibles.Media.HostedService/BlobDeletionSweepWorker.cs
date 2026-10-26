@@ -3,6 +3,7 @@ using Equibles.Media.BusinessLogic.Configuration;
 using Equibles.Media.BusinessLogic.Storage;
 using Equibles.Media.Data.Models;
 using Equibles.Media.HostedService.Configuration;
+using Equibles.Media.HostedService.Models;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -18,24 +19,30 @@ namespace Equibles.Media.HostedService;
 /// staged, reversible pipeline instead:
 ///
 ///   1. Queue — deletes mark the blob in PendingBlobDeletion (same transaction as the row).
-///   2. Sweep (daily) — for marks past the grace window, re-check every registered
+///   2. Sweep (every start and daily) — for marks past the grace window, re-check every registered
 ///      reference checker; unreferenced blobs are RENAMED into a mirrored .trash tree
 ///      (atomic and reversible — a racing identical write now writes fresh bytes), then
 ///      references are re-checked and the blob restored if a row appeared in the gap.
 ///   3. Purge — trash older than the retention window is deleted permanently after one
 ///      final reference check (restore instead if a row reappeared).
 ///   4. Reconciliation (rolling) — cascades and direct repository deletes never hit the
-///      queue, so each daily run also diffs one seventh of the shard space against the
-///      database and trashes unreferenced blobs; the whole store is covered weekly.
+///      queue, so each run also diffs one seventh of the shard space against the database
+///      and trashes unreferenced blobs; seven completed runs cover the whole store. Only an
+///      unreferenced file's timestamp is read: on a busy spinning disk each read costs a seek,
+///      and reading every file's made a slice take days instead of hours.
 ///
-/// Only files named as a 64-hex digest inside the store root are ever touched; temp files
-/// and anything else are ignored. Runs only when the store and the sweep are enabled.
+/// Progress is saved in the store root (<see cref="BlobSweepStateStore"/>): a worker restart
+/// inside the interval starts no new run, and an interrupted run resumes after the last folder
+/// it finished, since a walk of the whole store on a spinning disk outlasts the gap between
+/// deploys. Only files named as a 64-hex digest inside the store root are ever touched; temp
+/// files and anything else are ignored. Runs only when the store and the sweep are enabled.
 /// </summary>
 public class BlobDeletionSweepWorker : BackgroundService
 {
     private static readonly Regex HexName = new("^[0-9a-f]{64}$", RegexOptions.Compiled);
     private const string TrashDirectoryName = ".trash";
     private const int ReconciliationQueryChunkSize = 2000;
+    private const int ReconciliationSlots = 7;
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly FileStorageOptions _storageOptions;
@@ -45,6 +52,8 @@ public class BlobDeletionSweepWorker : BackgroundService
     // Virtual seams so tests can collapse the waits.
     protected virtual TimeSpan StartupDelay => TimeSpan.FromMinutes(10);
     protected virtual TimeSpan TickInterval => TimeSpan.FromHours(24);
+    protected virtual TimeSpan FailureRetryDelay => TimeSpan.FromHours(1);
+    protected virtual TimeSpan CheckpointInterval => TimeSpan.FromSeconds(30);
 
     // A misconfigured tiny grace (e.g. 0) would let the sweep race blobs whose rows are
     // still inside an uncommitted write window, causing hours-long read outages until the
@@ -89,28 +98,81 @@ public class BlobDeletionSweepWorker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            var delay = TickInterval;
             try
             {
-                await SweepOnce(stoppingToken);
+                var root = ExistingStoreRoot();
+                if (root != null)
+                {
+                    var due = NextRunDelay(
+                        new BlobSweepStateStore(root, _logger).Load(),
+                        DateTime.UtcNow
+                    );
+                    if (due > TimeSpan.Zero)
+                    {
+                        delay = due;
+                    }
+                    else
+                    {
+                        await SweepOnce(stoppingToken);
+                    }
+                }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 return;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Blob deletion sweep failed; will retry on next interval");
+                _logger.LogError(
+                    ex,
+                    "Blob deletion sweep failed; the next attempt resumes its saved progress"
+                );
+                delay = FailureRetryDelay;
             }
 
             try
             {
-                await Task.Delay(TickInterval, stoppingToken);
+                await Task.Delay(delay, stoppingToken);
             }
             catch (OperationCanceledException)
             {
                 return;
             }
         }
+    }
+
+    /// <summary>
+    /// Zero while a run is unfinished or none ever completed, otherwise what is left of the
+    /// interval since the last completion; never more than one interval, so a clock that
+    /// moved back cannot park the sweep.
+    /// </summary>
+    internal TimeSpan NextRunDelay(BlobSweepState state, DateTime now)
+    {
+        if (state.Run != null || state.LastCompletedAt is not { } completedAt)
+        {
+            return TimeSpan.Zero;
+        }
+
+        var remaining = completedAt + TickInterval - now;
+        if (remaining <= TimeSpan.Zero)
+        {
+            return TimeSpan.Zero;
+        }
+
+        return remaining < TickInterval ? remaining : TickInterval;
+    }
+
+    private string ExistingStoreRoot()
+    {
+        var root = _storageOptions.RootPath;
+        if (!string.IsNullOrEmpty(root) && Directory.Exists(root))
+        {
+            return root;
+        }
+
+        _logger.LogWarning("Blob store root {Root} is missing; skipping sweep.", root);
+        return null;
     }
 
     internal async Task<(int Trashed, int Purged, int Restored)> SweepOnce(
@@ -128,22 +190,83 @@ public class BlobDeletionSweepWorker : BackgroundService
             );
         }
 
-        var root = _storageOptions.RootPath;
-        if (string.IsNullOrEmpty(root) || !Directory.Exists(root))
+        var root = ExistingStoreRoot();
+        if (root == null)
         {
-            _logger.LogWarning("Blob store root {Root} is missing; skipping sweep.", root);
             return (0, 0, 0);
         }
 
         var now = DateTime.UtcNow;
+
+        // The queue is a quick database pass, so it runs on every start rather than waiting
+        // behind a walk that keeps failing.
         var trashed = await SweepQueue(dbContext, checkers, root, now, cancellationToken);
-        var (purged, restored) = await PurgeTrash(checkers, root, now, cancellationToken);
+
+        var stateStore = new BlobSweepStateStore(root, _logger);
+        var state = stateStore.Load();
+        if (state.Run == null)
+        {
+            state.Run = new BlobSweepRun
+            {
+                StartedAt = now,
+                Slot = state.LastSlot is { } lastSlot
+                    ? (lastSlot + 1) % ReconciliationSlots
+                    : (int)now.DayOfWeek,
+                Phase = BlobSweepPhase.Purge,
+            };
+            _logger.LogInformation(
+                "Blob sweep starting a run on reconciliation slot {Slot}",
+                state.Run.Slot
+            );
+        }
+        else
+        {
+            _logger.LogInformation(
+                "Blob sweep resuming the run started {StartedAt:o} at {Phase} after {Position}",
+                state.Run.StartedAt,
+                state.Run.Phase,
+                state.Run.Position ?? "(start)"
+            );
+        }
+
+        var progress = new BlobSweepProgress(stateStore, state, CheckpointInterval);
+        progress.Save();
 
         var reconciled = 0;
-        if (_sweepOptions.ReconciliationEnabled)
+        var purged = 0;
+        var restored = 0;
+        try
         {
-            reconciled = await ReconcileShards(checkers, root, now, cancellationToken);
+            if (progress.Run.Phase == BlobSweepPhase.Purge)
+            {
+                (purged, restored) = await PurgeTrash(
+                    checkers,
+                    root,
+                    now,
+                    progress,
+                    cancellationToken
+                );
+                progress.StartPhase(BlobSweepPhase.Reconcile);
+            }
+
+            if (_sweepOptions.ReconciliationEnabled)
+            {
+                reconciled = await ReconcileShards(
+                    checkers,
+                    root,
+                    now,
+                    progress,
+                    cancellationToken
+                );
+            }
         }
+        catch
+        {
+            TrySave(progress);
+            throw;
+        }
+
+        progress.Complete();
 
         _logger.LogInformation(
             "Blob sweep done: {Trashed} queued blob(s) trashed, {Reconciled} reconciled "
@@ -154,6 +277,18 @@ public class BlobDeletionSweepWorker : BackgroundService
             restored
         );
         return (trashed + reconciled, purged, restored);
+    }
+
+    private void TrySave(BlobSweepProgress progress)
+    {
+        try
+        {
+            progress.Save();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "Could not save the blob sweep's progress");
+        }
     }
 
     // Phase 1+2: process queued deletions past the grace window.
@@ -219,6 +354,7 @@ public class BlobDeletionSweepWorker : BackgroundService
         IReadOnlyList<IBlobReferenceChecker> checkers,
         string root,
         DateTime now,
+        BlobSweepProgress progress,
         CancellationToken cancellationToken
     )
     {
@@ -231,35 +367,54 @@ public class BlobDeletionSweepWorker : BackgroundService
         var purged = 0;
         var restored = 0;
         var cutoff = now.AddHours(-_sweepOptions.TrashRetentionHours);
-        foreach (
-            var trashPath in Directory.EnumerateFiles(trashRoot, "*", SearchOption.AllDirectories)
-        )
-        {
-            cancellationToken.ThrowIfCancellationRequested();
+        await SortedDirectoryWalk.Walk(
+            trashRoot,
+            progress.Run.Position,
+            _ => true,
+            async (directory, folder) =>
+            {
+                foreach (var trashPath in Directory.EnumerateFiles(directory))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
 
-            var name = Path.GetFileName(trashPath);
-            if (!HexName.IsMatch(name) || System.IO.File.GetLastWriteTimeUtc(trashPath) >= cutoff)
-            {
-                continue;
-            }
+                    var name = Path.GetFileName(trashPath);
+                    if (
+                        !HexName.IsMatch(name)
+                        || System.IO.File.GetLastWriteTimeUtc(trashPath) >= cutoff
+                    )
+                    {
+                        continue;
+                    }
 
-            if (
-                await IsReferencedByAny(
-                    checkers,
-                    ContentAddressedPath.HashPrefix + name,
-                    cancellationToken
-                )
-            )
-            {
-                RestoreBlob(root, Path.GetRelativePath(trashRoot, trashPath));
-                restored++;
-            }
-            else
-            {
-                System.IO.File.Delete(trashPath);
-                purged++;
-            }
-        }
+                    if (
+                        await IsReferencedByAny(
+                            checkers,
+                            ContentAddressedPath.HashPrefix + name,
+                            cancellationToken
+                        )
+                    )
+                    {
+                        RestoreBlob(root, Path.GetRelativePath(trashRoot, trashPath));
+                        restored++;
+                    }
+                    else
+                    {
+                        System.IO.File.Delete(trashPath);
+                        purged++;
+                    }
+                }
+
+                // Emptied folders go, so later walks list only populated ones; trashing a blob
+                // recreates its folder.
+                if (folder.Count > 0)
+                {
+                    TryDeleteEmptyDirectory(directory);
+                }
+
+                progress.Finished(folder);
+            },
+            cancellationToken
+        );
 
         return (purged, restored);
     }
@@ -270,90 +425,146 @@ public class BlobDeletionSweepWorker : BackgroundService
         IReadOnlyList<IBlobReferenceChecker> checkers,
         string root,
         DateTime now,
+        BlobSweepProgress progress,
         CancellationToken cancellationToken
     )
     {
         var graceCutoff = now.AddHours(-EffectiveGraceHours);
-        var todaySlot = (int)now.DayOfWeek;
+        var slot = progress.Run.Slot;
         var trashed = 0;
+        var pending = new List<string>();
 
         var tiers = _sweepOptions.ReconciliationIncludesAudioTier
             ? new[] { FileStorageTiers.Blob, FileStorageTiers.Audio }
             : new[] { FileStorageTiers.Blob };
-        foreach (var tier in tiers)
+        await SortedDirectoryWalk.Walk(
+            root,
+            progress.Run.Position,
+            folder => IsReconciledFolder(folder, tiers, slot),
+            async (directory, folder) =>
+            {
+                // Blobs sit at or below <tier>/<algorithm>/<shard>. Listing reads only the
+                // folder; a file's timestamp is read later, and only if no row references it.
+                if (folder.Count >= 3)
+                {
+                    pending.AddRange(
+                        Directory
+                            .EnumerateFiles(directory)
+                            .Where(p => HexName.IsMatch(Path.GetFileName(p)))
+                    );
+                }
+
+                // Folders share one reference query; a folder becomes the position only once
+                // its files' batch is done. The root is visited last, so it settles the rest.
+                if (pending.Count >= ReconciliationQueryChunkSize || folder.Count == 0)
+                {
+                    trashed += await ReconcileCandidates(
+                        checkers,
+                        root,
+                        pending,
+                        now,
+                        graceCutoff,
+                        cancellationToken
+                    );
+                    pending.Clear();
+                }
+
+                if (pending.Count == 0)
+                {
+                    progress.Finished(folder);
+                }
+            },
+            cancellationToken
+        );
+
+        return trashed;
+    }
+
+    private static bool IsReconciledFolder(
+        IReadOnlyList<string> folder,
+        IReadOnlyCollection<string> tiers,
+        int slot
+    )
+    {
+        return folder.Count switch
         {
-            var algorithmRoot = Path.Combine(root, tier, ContentAddressedPath.Algorithm);
-            if (!Directory.Exists(algorithmRoot))
-            {
-                continue;
-            }
+            1 => tiers.Contains(folder[0]),
+            2 => folder[1] == ContentAddressedPath.Algorithm,
+            3 => folder[2].Length == 2
+                && int.TryParse(
+                    folder[2],
+                    System.Globalization.NumberStyles.HexNumber,
+                    null,
+                    out var shardByte
+                )
+                && shardByte % ReconciliationSlots == slot,
+            _ => true,
+        };
+    }
 
-            foreach (var shardDir in Directory.EnumerateDirectories(algorithmRoot))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
+    private async Task<int> ReconcileCandidates(
+        IReadOnlyList<IBlobReferenceChecker> checkers,
+        string root,
+        IReadOnlyList<string> candidates,
+        DateTime now,
+        DateTime graceCutoff,
+        CancellationToken cancellationToken
+    )
+    {
+        var trashed = 0;
+        foreach (var chunk in candidates.Chunk(ReconciliationQueryChunkSize))
+        {
+            // Two tiers can hold the same bytes, so a hash may name more than one path.
+            var referenced = await GetReferencedByAny(
+                checkers,
+                chunk.Select(HashOf).Distinct().ToList(),
+                cancellationToken
+            );
 
-                var shard = Path.GetFileName(shardDir);
+            foreach (var fullPath in chunk)
+            {
+                var hash = HashOf(fullPath);
+                // Old enough that any owning row has long committed; young files are skipped.
                 if (
-                    shard.Length != 2
-                    || !int.TryParse(
-                        shard,
-                        System.Globalization.NumberStyles.HexNumber,
-                        null,
-                        out var shardByte
-                    )
-                    || shardByte % 7 != todaySlot
+                    referenced.Contains(hash)
+                    || System.IO.File.GetLastWriteTimeUtc(fullPath) >= graceCutoff
                 )
                 {
                     continue;
                 }
 
-                // Old enough that any owning row has long committed; young files are skipped.
-                var candidates = Directory
-                    .EnumerateFiles(shardDir, "*", SearchOption.AllDirectories)
-                    .Where(p =>
-                        HexName.IsMatch(Path.GetFileName(p))
-                        && System.IO.File.GetLastWriteTimeUtc(p) < graceCutoff
-                    )
-                    .ToList();
-
-                foreach (var chunk in candidates.Chunk(ReconciliationQueryChunkSize))
+                var relativePath = Path.GetRelativePath(root, fullPath)
+                    .Replace(Path.DirectorySeparatorChar, '/');
+                if (TryTrashBlob(root, relativePath, now))
                 {
-                    var byHash = chunk.ToDictionary(
-                        p => ContentAddressedPath.HashPrefix + Path.GetFileName(p),
-                        p => p
-                    );
-                    var referenced = await GetReferencedByAny(
-                        checkers,
-                        byHash.Keys.ToList(),
-                        cancellationToken
-                    );
-
-                    foreach (var (hash, fullPath) in byHash)
+                    if (await IsReferencedByAny(checkers, hash, cancellationToken))
                     {
-                        if (referenced.Contains(hash))
-                        {
-                            continue;
-                        }
-
-                        var relativePath = Path.GetRelativePath(root, fullPath)
-                            .Replace(Path.DirectorySeparatorChar, '/');
-                        if (TryTrashBlob(root, relativePath, now))
-                        {
-                            if (await IsReferencedByAny(checkers, hash, cancellationToken))
-                            {
-                                RestoreBlob(root, relativePath);
-                            }
-                            else
-                            {
-                                trashed++;
-                            }
-                        }
+                        RestoreBlob(root, relativePath);
+                    }
+                    else
+                    {
+                        trashed++;
                     }
                 }
             }
         }
 
         return trashed;
+    }
+
+    private static string HashOf(string blobPath) =>
+        ContentAddressedPath.HashPrefix + Path.GetFileName(blobPath);
+
+    private static void TryDeleteEmptyDirectory(string directory)
+    {
+        try
+        {
+            Directory.Delete(directory, recursive: false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Still holds a file or folder; only an empty one is removed.
+        }
     }
 
     private static async Task<bool> IsReferencedByAny(

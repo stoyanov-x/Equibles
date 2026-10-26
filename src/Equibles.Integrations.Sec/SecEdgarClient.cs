@@ -210,6 +210,8 @@ public class SecEdgarClient : ISecEdgarClient
             }
             _submissionsCache[url] = content;
 
+            var recentFilings = MapToFilingData(apiResponse.Filings?.Recent, cik);
+
             return new CompanyMetadata
             {
                 Cik = cik,
@@ -220,9 +222,16 @@ public class SecEdgarClient : ISecEdgarClient
                 SicDescription = apiResponse.SicDescription,
                 Category = apiResponse.Category,
                 StateOfIncorporation = apiResponse.StateOfIncorporation,
+                BusinessStateOrCountry = apiResponse.Addresses?.Business?.LocationCode,
                 Exchanges = apiResponse.Exchanges ?? [],
                 FiscalYearEnd = apiResponse.FiscalYearEnd,
                 Website = apiResponse.Website,
+                PeriodicReportFileNumber = SecRegistrantFilings.PeriodicReportFileNumber(
+                    recentFilings
+                ),
+                BdcElectionFiledOn = SecRegistrantFilings.LatestBdcElection(recentFilings),
+                BdcWithdrawalFiledOn = SecRegistrantFilings.LatestBdcWithdrawal(recentFilings),
+                HasArchivedFilings = apiResponse.Filings?.Files is { Count: > 0 },
             };
         }
         catch (HttpRequestException ex)
@@ -1287,28 +1296,21 @@ public class SecEdgarClient : ISecEdgarClient
             // by real instruments, so creating a company from such a row lets
             // price enrichment attach another instrument's data. Skip the row;
             // a registrant with no exchange-listed row is not a listed company.
-            if (
-                exchangeIndex != -1
-                && (
-                    row.Count <= exchangeIndex
-                    || string.IsNullOrWhiteSpace(row[exchangeIndex]?.ToString())
-                )
-            )
+            var exchange =
+                exchangeIndex != -1 && row.Count > exchangeIndex
+                    ? row[exchangeIndex]?.ToString()?.Trim()
+                    : null;
+            if (exchangeIndex != -1 && string.IsNullOrEmpty(exchange))
                 continue;
 
-            if (companiesByCik.TryGetValue(cik, out var existing))
+            if (!companiesByCik.TryGetValue(cik, out var company))
             {
-                existing.Tickers.Add(ticker);
+                company = new CompanyInfo { Cik = cik, Name = name ?? string.Empty };
+                companiesByCik[cik] = company;
             }
-            else
-            {
-                companiesByCik[cik] = new CompanyInfo
-                {
-                    Cik = cik,
-                    Name = name ?? string.Empty,
-                    Tickers = [ticker],
-                };
-            }
+            company.Tickers.Add(ticker);
+            if (exchange != null)
+                company.TickerExchanges.TryAdd(ticker, exchange);
         }
 
         return companiesByCik.Values.ToList();
@@ -1397,6 +1399,10 @@ public class SecEdgarClient : ISecEdgarClient
             Items =
                 i < recent.Items.Count && !string.IsNullOrWhiteSpace(recent.Items[i])
                     ? recent.Items[i]
+                    : null,
+            FileNumber =
+                i < recent.FileNumber.Count && !string.IsNullOrWhiteSpace(recent.FileNumber[i])
+                    ? recent.FileNumber[i].Trim()
                     : null,
         };
         return true;

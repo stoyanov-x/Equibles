@@ -25,6 +25,30 @@ public class FinancialFactsModuleConfiguration : Equibles.Data.IFinancialModule
                 .HasForeignKey(row => row.EquityIssuerId)
                 .OnDelete(DeleteBehavior.Restrict);
             b.Property(e => e.Form).HasConversion(docTypeConversion);
+            // Issuer-and-concept fact reads (valuation universe, statements, ratio inputs) select
+            // these columns, so carrying them serves those reads index-only instead of fetching a
+            // heap page of a table far larger than memory for every fact.
+            b.HasIndex(f => new
+                {
+                    f.EquityIssuerId,
+                    f.FinancialConceptId,
+                    f.PeriodEnd,
+                })
+                .HasDatabaseName("IX_FinancialFact_IssuerConceptPeriod")
+                .IncludeProperties(f => new
+                {
+                    f.PeriodStart,
+                    f.PeriodType,
+                    f.FiscalYear,
+                    f.FiscalPeriod,
+                    f.Value,
+                    f.Unit,
+                    f.FiledDate,
+                    f.Form,
+                    f.DimensionsKey,
+                    f.Id,
+                })
+                .IsCreatedConcurrently();
             // The consolidated filing-XBRL rows the Company Facts import supersedes; the import's
             // nothing-new check probes it for every issuer every cycle.
             b.HasIndex(f => new { f.EquityIssuerId, f.AccessionNumber })
@@ -56,5 +80,19 @@ public class FinancialFactsModuleConfiguration : Equibles.Data.IFinancialModule
             .WithMany()
             .HasForeignKey(row => row.EquityIssuerId)
             .OnDelete(DeleteBehavior.Restrict);
+
+        builder.Entity<IssuerCoverStatement>(b =>
+        {
+            b.HasOne(row => row.Issuer)
+                .WithMany()
+                .HasForeignKey(row => row.EquityIssuerId)
+                .OnDelete(DeleteBehavior.Restrict);
+            // Derived from the filing alone, so it goes with the filing.
+            b.HasOne(row => row.Document)
+                .WithMany()
+                .HasForeignKey(row => row.DocumentId)
+                .OnDelete(DeleteBehavior.Cascade);
+            b.Property(e => e.Form).HasConversion(docTypeConversion);
+        });
     }
 }

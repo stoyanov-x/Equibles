@@ -8,7 +8,16 @@ x-embedding-environment: &embedding-environment
 
 services:
   db:
-    image: paradedb/paradedb:latest
+    # Pinned (upstream): chunk searches use parallel BM25 workers, which need
+    # pg_search 0.25.11 or later. A bump that changes pg_search ships with a
+    # migration running ALTER EXTENSION ... UPDATE, or BM25 queries fail on the
+    # existing database.
+    #
+    # Fork note 2026-10-26: the Pi was on pg_search 0.25.6, so this pin is an
+    # upgrade and not a downgrade. It still needs ALTER EXTENSION pg_search
+    # UPDATE to take effect; chunk searches are currently unused (embeddings
+    # disabled), so nothing depends on BM25 while that migration runs.
+    image: paradedb/paradedb:0.26.2-pg18
     # Throttle the database so it cannot starve the other ~19 containers on the
     # 2-core prod box. A cap does NOT create capacity -- it only decides who
     # loses the race, so memory stays generous (shared_buffers alone is ~954 MB)

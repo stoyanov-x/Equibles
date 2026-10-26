@@ -233,8 +233,8 @@ public class HoldingsScraperWorker : BaseScraperWorker
         // terminating once the back catalogue is clean, so it costs one query per cycle after that.
         await RepairImpossiblePositions(stoppingToken);
 
-        // Restamp FilingType on filing rollup rows written before the column existed. Self-
-        // terminating like the pass above.
+        // Remove off-quarter 13F rollups left with no holdings. Self-terminating like the pass
+        // above.
         await BackfillFilingRollupTypes(stoppingToken);
     }
 
@@ -303,6 +303,8 @@ public class HoldingsScraperWorker : BaseScraperWorker
         dataSets.Delete(pending);
         foreach (var row in realRows)
             dataSets.Delete(row);
+        // A resume checkpoint would keep the accessions it names under the old mapping.
+        await dataSets.ClearAllCommittedAccessions(cancellationToken);
         if (
             rows.All(r => r.FileName != Holdings.Data.Models.ProcessedDataSet.BackfillGuardFileName)
         )
@@ -520,7 +522,13 @@ public class HoldingsScraperWorker : BaseScraperWorker
     // Upsert rather than insert: after a parser-version bump the row already
     // exists at the old version (FileName is unique), so a blind Add would
     // collide on the unique index and the data set would re-import every cycle.
-    private async Task MarkAsProcessed(string fileName, int submissionCount)
+    // The resume checkpoint goes after the mark; a failure between them leaves rows the next
+    // import of this file discards.
+    internal async Task MarkAsProcessed(
+        string fileName,
+        int submissionCount,
+        CancellationToken cancellationToken
+    )
     {
         await using var scope = ScopeFactory.CreateAsyncScope();
         var repo = scope.ServiceProvider.GetRequiredService<ProcessedDataSetRepository>();
@@ -544,6 +552,7 @@ public class HoldingsScraperWorker : BaseScraperWorker
         }
 
         await repo.SaveChanges();
+        await repo.ClearCommittedAccessions(fileName, cancellationToken);
     }
 
     private async Task RecalculatePendingValues(CancellationToken cancellationToken)
@@ -638,6 +647,7 @@ public class HoldingsScraperWorker : BaseScraperWorker
                     archive,
                     minReportDate,
                     BulkBatchPause,
+                    fileName,
                     cancellationToken
                 );
 
@@ -668,7 +678,7 @@ public class HoldingsScraperWorker : BaseScraperWorker
                 {
                     try
                     {
-                        await MarkAsProcessed(fileName, result.SubmissionCount);
+                        await MarkAsProcessed(fileName, result.SubmissionCount, cancellationToken);
                     }
                     catch (Exception ex)
                     {

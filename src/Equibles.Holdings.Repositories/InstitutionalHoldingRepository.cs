@@ -223,6 +223,20 @@ public class InstitutionalHoldingRepository : BaseRepository<InstitutionalHoldin
         return Get13FByHolder(holder, reportDate).Include(h => h.Issuer);
     }
 
+    // Get13FByHolderWithStock for several holders in one query, for callers that compare funds'
+    // portfolios at the same quarter end; group the rows by InstitutionalHolderId.
+    public IQueryable<InstitutionalHolding> Get13FByHoldersWithStock(
+        IReadOnlyCollection<InstitutionalHolder> holders,
+        DateOnly reportDate
+    )
+    {
+        var holderIds = holders.Select(h => h.Id).ToList();
+        return GetAll()
+            .Where(h => holderIds.Contains(h.InstitutionalHolderId) && h.ReportDate == reportDate)
+            .Where(Is13F)
+            .Include(h => h.Issuer);
+    }
+
     // Minimal per-security projection for portfolio-summary maths. Loading thousands of full
     // tracked holding entities for two quarters made a cold summary proportional to the raw
     // filing row count even though concentration and turnover only use these fields.
@@ -2475,16 +2489,22 @@ public class InstitutionalHoldingRepository : BaseRepository<InstitutionalHoldin
             .StillSucceeded(DbContext);
 
     // Distinct holder ids among the given set that filed ANY 13F at reportDate — the "has this
-    // fund reported yet?" test behind the combined view's reported-so-far counts.
+    // fund reported yet?" test behind the combined view's reported-so-far counts. Each holder is
+    // probed for one 13F row of the quarter: reading the ids off every position scanned whole
+    // books, millions of rows for a large stock's holders (3 to 16 s per comparison).
     public IQueryable<Guid> GetFiledHolderIdsAmong(
         DateOnly reportDate,
         IReadOnlyCollection<Guid> holderIds
     )
     {
-        return GetAll()
-            .Where(Is13F)
-            .Where(h => h.ReportDate == reportDate && holderIds.Contains(h.InstitutionalHolderId))
-            .Select(h => h.InstitutionalHolderId)
+        var quarter13F = GetAll().Where(Is13F).Where(h => h.ReportDate == reportDate);
+        return DbContext
+            .Set<InstitutionalHolder>()
+            .Where(holder =>
+                holderIds.Contains(holder.Id)
+                && quarter13F.Any(h => h.InstitutionalHolderId == holder.Id)
+            )
+            .Select(holder => holder.Id)
             .Union(
                 Zero13FRestatements()
                     .Where(f =>
