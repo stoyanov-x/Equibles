@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO;
 using System.IO.Compression;
 using System.Net;
@@ -42,6 +43,21 @@ public class SecEdgarClient : ISecEdgarClient
     private readonly ILogger<SecEdgarClient> _logger;
     private readonly ISecRateLimitNotifier _rateLimitNotifier;
 
+    // Only this many response bodies may be materialised at once, process-wide.
+    // Deliberately STATIC: the client is registered Scoped, so an instance field
+    // would give every scope its own gate and bound nothing. Peak memory is
+    // shared, so the limit has to be too. Measured 2026-10-30 on the 1.5 GiB
+    // worker: 13 concurrent statements in PostgreSQL and 90 OutOfMemoryExceptions
+    // in 2,000 log lines while fetching multi-megabyte filings. A per-response
+    // size cap cannot bound peak memory when N documents decode simultaneously.
+    private const int MaxConcurrentDocumentFetches = 3;
+    private static readonly SemaphoreSlim DocumentFetchGate = new(
+        MaxConcurrentDocumentFetches,
+        MaxConcurrentDocumentFetches
+    );
+
+    private const int BufferChunkSize = 81920;
+
     // Caches the current company's submissions artifacts (main CIK*.json plus its
     // paginated CIK*-submissions-*.json archive pages) keyed by URL. The scraper
     // calls GetCompanyFilings once per synced document type (~13×) for the same
@@ -84,6 +100,12 @@ public class SecEdgarClient : ISecEdgarClient
         }
 
         _httpClient.Timeout = TimeSpan.FromMinutes(2);
+
+        var maxBufferedBytes = configuration["Sec:MaxBufferedResponseBytes"];
+        _maxStringResponseBytes =
+            long.TryParse(maxBufferedBytes, out var bufferedBytes) && bufferedBytes > 0
+                ? bufferedBytes
+                : DefaultMaxStringResponseBytes;
 
         var pauseSeconds = configuration["Sec:RateLimitPauseSeconds"];
         _rateLimitPause =
@@ -949,10 +971,18 @@ public class SecEdgarClient : ISecEdgarClient
     // production, so it is not a behaviour change for real filings - it exists
     // so an oversized response fails once, naming the URL, instead of
     // exhausting the process and stalling every other worker with it.
-    private const long MaxStringResponseBytes = 64L * 1024 * 1024;
+    // Lowered from 64 MiB on 2026-10-30, when the ceiling stopped protecting
+    // anything: buffered bytes, a ToArray copy and the UTF-16 string cost roughly
+    // 4x the body, so the old limit let one response approach the whole container
+    // budget before decoding. 24 MiB still clears every filing observed in
+    // production. Override with Sec:MaxBufferedResponseBytes.
+    private const long DefaultMaxStringResponseBytes = 24L * 1024 * 1024;
+    private readonly long _maxStringResponseBytes;
 
     // Send a retrying GET, throw on a non-success status, and return the body as
-    // a string, refusing to buffer more than MaxStringResponseBytes.
+    // a string, refusing to buffer more than the configured ceiling. The body is
+    // read under a process-wide gate, because the ceiling bounds one response
+    // while the gate bounds how many responses exist at once.
     private async Task<string> FetchStringAsync(
         string url,
         CancellationToken cancellationToken = default
@@ -970,23 +1000,58 @@ public class SecEdgarClient : ISecEdgarClient
 
         // Refuse a body we already know is too large, without reading a byte of it.
         var declared = response.Content.Headers.ContentLength;
-        if (declared > MaxStringResponseBytes)
-            throw Oversized(url, declared.Value, MaxStringResponseBytes);
+        if (declared > _maxStringResponseBytes)
+            throw Oversized(url, declared.Value, _maxStringResponseBytes);
 
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        var capacity = declared is > 0 and < int.MaxValue ? (int)declared.Value : 0;
-        using var buffered = new MemoryStream(capacity);
-        var chunk = new byte[81920];
-        int read;
-        while ((read = await stream.ReadAsync(chunk, cancellationToken)) > 0)
+        await DocumentFetchGate.WaitAsync(cancellationToken);
+        try
         {
-            // A chunked response declares no length, so the bound is enforced here.
-            if (buffered.Length + read > MaxStringResponseBytes)
-                throw Oversized(url, buffered.Length + read, MaxStringResponseBytes);
-            buffered.Write(chunk, 0, read);
-        }
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var capacity = declared is > 0 and < int.MaxValue ? (int)declared.Value : 0;
+            using var buffered = new MemoryStream(capacity);
+            var chunk = ArrayPool<byte>.Shared.Rent(BufferChunkSize);
+            try
+            {
+                int read;
+                while (
+                    (
+                        read = await stream.ReadAsync(
+                            chunk,
+                            0,
+                            BufferChunkSize,
+                            cancellationToken
+                        )
+                    ) > 0
+                )
+                {
+                    // A chunked response declares no length, so the bound is enforced here.
+                    if (buffered.Length + read > _maxStringResponseBytes)
+                        throw Oversized(
+                            url,
+                            buffered.Length + read,
+                            _maxStringResponseBytes
+                        );
+                    buffered.Write(chunk, 0, read);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(chunk);
+            }
 
-        return System.Text.Encoding.UTF8.GetString(buffered.ToArray());
+            // GetBuffer() rather than ToArray(): ToArray duplicates the whole body
+            // purely to hand it to the decoder, which for a 21 MB filing is another
+            // 21 MB of peak memory for no reason.
+            return System.Text.Encoding.UTF8.GetString(
+                buffered.GetBuffer(),
+                0,
+                (int)buffered.Length
+            );
+        }
+        finally
+        {
+            DocumentFetchGate.Release();
+        }
     }
 
     private static InvalidOperationException Oversized(string url, long size, long limit) =>
