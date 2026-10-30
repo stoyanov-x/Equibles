@@ -1014,23 +1014,13 @@ public class SecEdgarClient : ISecEdgarClient
             {
                 int read;
                 while (
-                    (
-                        read = await stream.ReadAsync(
-                            chunk,
-                            0,
-                            BufferChunkSize,
-                            cancellationToken
-                        )
-                    ) > 0
+                    (read = await stream.ReadAsync(chunk, 0, BufferChunkSize, cancellationToken))
+                    > 0
                 )
                 {
                     // A chunked response declares no length, so the bound is enforced here.
                     if (buffered.Length + read > _maxStringResponseBytes)
-                        throw Oversized(
-                            url,
-                            buffered.Length + read,
-                            _maxStringResponseBytes
-                        );
+                        throw Oversized(url, buffered.Length + read, _maxStringResponseBytes);
                     buffered.Write(chunk, 0, read);
                 }
             }
