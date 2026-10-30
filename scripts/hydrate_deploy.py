@@ -234,15 +234,35 @@ def main() -> int:
     # only place to set it is the connection string itself. Applies to web/mcp/
     # worker alike, which also stops the worker's spurious
     # "Timeout during reading attempt" rows.
-    CONN_TIMEOUT = ";Command Timeout=" + os.environ.get("EQUIBLES_COMMAND_TIMEOUT", "300")
+    # Meridian-only change #7: raise the Npgsql CONNECTION timeout (default 15 s).
+    # `Timeout` also bounds the bootstrap read that loads the type catalog before
+    # the first query runs. On 2026-10-30 a *cold* catalog made that fail outright:
+    # `select count(*) from pg_type` took 11,540 ms for 15 pages, because
+    # shared_buffers is 512 MB against a 300 GB database and heavy scans evict the
+    # catalog, so every page came from a USB SMR disk at ~750 ms. A freshly started
+    # web container exceeded 15 s, threw "Timeout during reading attempt" during
+    # Npgsql bootstrap and crash-looped before it could read migrations - the whole
+    # deploy looked like a web bug. Warming the catalog dropped the same query to
+    # 67 ms and web went healthy in 15 s. 60 s means a cold catalog cannot gate
+    # startup; it does not paper over a genuinely unreachable database.
+    COMMAND_TIMEOUT_SUFFIX = ";Command Timeout=" + os.environ.get(
+        "EQUIBLES_COMMAND_TIMEOUT", "300"
+    )
+    CONNECT_TIMEOUT_SUFFIX = ";Timeout=" + os.environ.get("EQUIBLES_CONNECT_TIMEOUT", "60")
     for svc in services.values():
         env = svc.get("environment") if isinstance(svc, dict) else None
         if not isinstance(env, dict):
             continue
         for key, value in list(env.items()):
-            if key.startswith("ConnectionStrings__") and isinstance(value, str):
-                if "command timeout" not in value.lower():
-                    env[key] = value.rstrip(";") + CONN_TIMEOUT
+            if not (key.startswith("ConnectionStrings__") and isinstance(value, str)):
+                continue
+            if "command timeout" not in value.lower():
+                value = value.rstrip(";") + COMMAND_TIMEOUT_SUFFIX
+            # "timeout=" alone also matches "command timeout=", so compare with
+            # that phrase removed before deciding the connect timeout is missing.
+            if "timeout=" not in value.lower().replace("command timeout=", ""):
+                value = value.rstrip(";") + CONNECT_TIMEOUT_SUFFIX
+            env[key] = value
 
     with open(OUT, "w") as fh:
         yaml.safe_dump(merged, fh, sort_keys=False, default_flow_style=False, width=1000)
