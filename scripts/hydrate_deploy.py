@@ -166,12 +166,16 @@ def main() -> int:
 
     # Meridian-only change #4: give the worker the headroom it measurably needs.
     # Measured on 2026-10-19, ~4 h into load, from the container's own cgroup:
-    #   worker   1024 MiB peak / 1024 limit - EXACTLY at the cap, 657 throttled CPU
-    #            periods, 828 MB RSS, kernel compaction 33 % of the time. The image
-    #            sets DOTNET_GCHeapHardLimitPercent=0x5A (90 %), so the managed heap
-    #            is 90 % of the cgroup limit read AT STARTUP: under a 1024m cap the
-    #            heap tops out near 921 MB and the GC spends its time fighting the
-    #            cap. 1280m lifts it to ~1152 MB.
+    #   worker   raised from 1280m to 1536m on 2026-10-30. At 1280m the managed
+    #            heap (90 % of the cgroup limit, read at startup) was exhausted by
+    #            the as-filed HTML backfill: 90 OutOfMemoryExceptions in 2,000 log
+    #            lines, zero documents created, and every other hosted service in
+    #            the process stalled behind the same heap. At 1536m the OOM storm
+    #            stopped (0 in 5,000 lines) and ingestion resumed.
+    #            This is a floor, not a fix: the code-level fix is bounding how many
+    #            SEC responses are decoded at once (SecEdgarClient). 1280m was
+    #            measured against a 1024m image cap on 2026-10-19 and was simply too
+    #            close to what the backfill actually needs.
     #   cpu       the Pi has 4 cores and is dedicated to this stack. Raised to db
     #             1.25 + worker 2.5 (3.75 declared). Both were genuinely throttled
     #             before: the worker at 97-107 % of a 1.0 share, the db at 78 % of
@@ -190,7 +194,7 @@ def main() -> int:
     #            When it is, cap each a few multiples above its peak, not at it.
     SERVICE_LIMITS = {
         "db": {"mem_limit": "2048m", "cpus": "1.25"},
-        "worker": {"mem_limit": "1280m", "cpus": "2.5"},
+        "worker": {"mem_limit": "1536m", "cpus": "2.5"},
     }
     for svc, limits in SERVICE_LIMITS.items():
         if svc in services:

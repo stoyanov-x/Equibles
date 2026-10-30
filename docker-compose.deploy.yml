@@ -85,7 +85,7 @@ services:
     image: ghcr.io/stoyanov-x/equibles-web:main
   worker:
     cpus: '2.5'
-    mem_limit: 1280m
+    mem_limit: 1536m
     env_file:
     - path: .env
       required: false
