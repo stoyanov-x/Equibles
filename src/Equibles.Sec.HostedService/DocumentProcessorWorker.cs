@@ -50,10 +50,23 @@ public class DocumentProcessorWorker : BaseScraperWorker
         }
 
         Logger.LogInformation("Phase 1: Chunking all pending documents");
+        var legacyDrainPending = true;
         while (!stoppingToken.IsCancellationRequested)
         {
             await using var chunkScope = ScopeFactory.CreateAsyncScope();
             var documentManager = chunkScope.ServiceProvider.GetRequiredService<DocumentManager>();
+
+            // Run the legacy compatibility drain once per pass, not per batch. It walks the whole
+            // pending queue to discover there is nothing left to mark, so paying for it every
+            // cycle starved the chunking it precedes and the backlog never moved.
+            if (legacyDrainPending)
+            {
+                if (await documentManager.BackfillLegacyChunkedBatch(stoppingToken))
+                    continue;
+
+                legacyDrainPending = false;
+            }
+
             var workDone = await documentManager.ChunkDocumentBatch(stoppingToken);
             if (!workDone)
                 break;

@@ -45,12 +45,18 @@ public class DocumentManager
     // null marker on every document, so a bounded compatibility update marks legacy rows that
     // already have chunks while holding their document row locks. This drains the corpus without
     // an unbounded anti-join and makes concurrent reset/replacement authoritative.
+    //
+    // The drain is exposed separately rather than called from ChunkDocumentBatch, because the
+    // caller has to run it once per chunking pass instead of once per batch. Its LIMIT applies
+    // after the EXISTS probe, so when nothing is left to drain it walks the entire pending queue
+    // - every row probing the Chunk index - before it can report zero. On a backlog of tens of
+    // thousands of pending documents that took minutes per cycle and starved the chunking it was
+    // meant to precede.
+    public async Task<bool> BackfillLegacyChunkedBatch(CancellationToken cancellationToken) =>
+        await BackfillChunkedAtBatch(cancellationToken) > 0;
 
     public async Task<bool> ChunkDocumentBatch(CancellationToken cancellationToken)
     {
-        if (await BackfillChunkedAtBatch(cancellationToken) > 0)
-            return true;
-
         var pendingDocumentIds = await _documentRepository
             .GetAll()
             .Where(d =>
