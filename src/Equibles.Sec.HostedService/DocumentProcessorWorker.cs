@@ -28,6 +28,14 @@ public class DocumentProcessorWorker : BaseScraperWorker
     // pending index makes every FIFO lookup bounded by the actual backlog.
     private readonly BackfillCursor _embeddingCursor = new("chunk-embedding");
 
+    // Whether the legacy compatibility drain has finished for this process. It has to live on the
+    // worker rather than inside DoWork: BaseScraperWorker calls DoWork again on every cycle, so a
+    // local would reset each time and the drain - which walks the whole pending queue to discover
+    // there is nothing left to mark - would run on every cycle and starve the chunking it
+    // precedes. Documents ingested while the process runs are handled by the normal pending query,
+    // not by this drain, so completing it once is enough.
+    private bool _legacyChunkDrainComplete;
+
     public DocumentProcessorWorker(
         ILogger<DocumentProcessorWorker> logger,
         IServiceScopeFactory scopeFactory,
@@ -50,21 +58,18 @@ public class DocumentProcessorWorker : BaseScraperWorker
         }
 
         Logger.LogInformation("Phase 1: Chunking all pending documents");
-        var legacyDrainPending = true;
         while (!stoppingToken.IsCancellationRequested)
         {
             await using var chunkScope = ScopeFactory.CreateAsyncScope();
             var documentManager = chunkScope.ServiceProvider.GetRequiredService<DocumentManager>();
 
-            // Run the legacy compatibility drain once per pass, not per batch. It walks the whole
-            // pending queue to discover there is nothing left to mark, so paying for it every
-            // cycle starved the chunking it precedes and the backlog never moved.
-            if (legacyDrainPending)
+            // Run the legacy compatibility drain once per process, not per batch or per cycle.
+            if (!_legacyChunkDrainComplete)
             {
                 if (await documentManager.BackfillLegacyChunkedBatch(stoppingToken))
                     continue;
 
-                legacyDrainPending = false;
+                _legacyChunkDrainComplete = true;
             }
 
             var workDone = await documentManager.ChunkDocumentBatch(stoppingToken);
