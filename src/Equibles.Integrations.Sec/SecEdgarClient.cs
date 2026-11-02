@@ -50,7 +50,11 @@ public class SecEdgarClient : ISecEdgarClient
     // worker: 13 concurrent statements in PostgreSQL and 90 OutOfMemoryExceptions
     // in 2,000 log lines while fetching multi-megabyte filings. A per-response
     // size cap cannot bound peak memory when N documents decode simultaneously.
-    private const int MaxConcurrentDocumentFetches = 3;
+    //
+    // Held at 2 rather than 3 once the document ceiling moved above real filing
+    // size: one buffered body plus its UTF-16 decode costs about 3x the bytes, so
+    // 2 slots against a 96 MiB ceiling is ~576 MiB of transient peak.
+    private const int MaxConcurrentDocumentFetches = 2;
     private static readonly SemaphoreSlim DocumentFetchGate = new(
         MaxConcurrentDocumentFetches,
         MaxConcurrentDocumentFetches
@@ -106,6 +110,12 @@ public class SecEdgarClient : ISecEdgarClient
             long.TryParse(maxBufferedBytes, out var bufferedBytes) && bufferedBytes > 0
                 ? bufferedBytes
                 : DefaultMaxStringResponseBytes;
+
+        var maxDocumentBytes = configuration["Sec:MaxDocumentBytes"];
+        _maxDocumentBytes =
+            long.TryParse(maxDocumentBytes, out var documentBytes) && documentBytes > 0
+                ? documentBytes
+                : DefaultMaxDocumentBytes;
 
         var pauseSeconds = configuration["Sec:RateLimitPauseSeconds"];
         _rateLimitPause =
@@ -531,7 +541,9 @@ public class SecEdgarClient : ISecEdgarClient
 
             _logger.LogInformation("Requesting document: {Url}", url);
 
-            var content = await FetchStringAsync(url, cancellationToken);
+            // A filing body is the complete submission .txt, so it is measured
+            // against the document ceiling rather than the metadata one.
+            var content = await FetchStringAsync(url, cancellationToken, _maxDocumentBytes);
 
             _logger.LogInformation(
                 "Successfully retrieved document content ({Length} characters)",
@@ -961,23 +973,27 @@ public class SecEdgarClient : ISecEdgarClient
         return true;
     }
 
-    // The largest response body this client will materialise as a string. A
-    // filing is normally a few hundred kilobytes; a merged document-set
-    // submission reaches tens of megabytes, and decoding one costs its full
-    // width in UTF-16 on top of the bytes buffered for it. Measured
-    // 2026-10-21: one 21,369,955-character document put a 1.25 GiB worker into a
-    // storm of OutOfMemoryExceptions (64 in thirty minutes) and it stopped
-    // making progress for hours. The limit sits well above anything observed in
-    // production, so it is not a behaviour change for real filings - it exists
-    // so an oversized response fails once, naming the URL, instead of
-    // exhausting the process and stalling every other worker with it.
-    // Lowered from 64 MiB on 2026-10-30, when the ceiling stopped protecting
-    // anything: buffered bytes, a ToArray copy and the UTF-16 string cost roughly
-    // 4x the body, so the old limit let one response approach the whole container
-    // budget before decoding. 24 MiB still clears every filing observed in
-    // production. Override with Sec:MaxBufferedResponseBytes.
-    private const long DefaultMaxStringResponseBytes = 24L * 1024 * 1024;
+    // Ceilings for a response body materialised as a string. Decoding costs the
+    // full width in UTF-16 on top of the bytes buffered for it, so a body of B
+    // bytes peaks at roughly 3B.
+    //
+    // Two ceilings, because the two kinds of response are not the same size. A
+    // metadata response (submissions JSON, ticker lists, company facts) is a few
+    // hundred kilobytes and never legitimately reaches tens of megabytes; a
+    // filing body is the complete submission .txt and routinely does. SEC's own
+    // `size` field puts Microsoft's latest 10-K at 36 MB, Wells Fargo's 10-Qs at
+    // 50 MB, JPMorgan's 10-K at 65 MB and Citigroup's 10-K at 81 MB, so a single
+    // ceiling low enough to be safe for metadata silently refuses real filings.
+    //
+    // Measured 2026-10-21: one 21,369,955-character document put a 1.25 GiB
+    // worker into a storm of OutOfMemoryExceptions (64 in thirty minutes) and it
+    // stopped making progress for hours. That is what the document ceiling and
+    // the fetch gate exist for - not to reject filings that are simply large.
+    // Override with Sec:MaxBufferedResponseBytes and Sec:MaxDocumentBytes.
+    private const long DefaultMaxStringResponseBytes = 32L * 1024 * 1024;
+    private const long DefaultMaxDocumentBytes = 96L * 1024 * 1024;
     private readonly long _maxStringResponseBytes;
+    private readonly long _maxDocumentBytes;
 
     // Send a retrying GET, throw on a non-success status, and return the body as
     // a string, refusing to buffer more than the configured ceiling. The body is
@@ -985,9 +1001,11 @@ public class SecEdgarClient : ISecEdgarClient
     // while the gate bounds how many responses exist at once.
     private async Task<string> FetchStringAsync(
         string url,
-        CancellationToken cancellationToken = default
+        CancellationToken cancellationToken = default,
+        long? maxBytes = null
     )
     {
+        var limit = maxBytes ?? _maxStringResponseBytes;
         // ResponseHeadersRead, not the default ResponseContentRead: read the body
         // through a stream so the size can be bounded while it arrives instead of
         // after it has all been buffered.
@@ -1000,8 +1018,8 @@ public class SecEdgarClient : ISecEdgarClient
 
         // Refuse a body we already know is too large, without reading a byte of it.
         var declared = response.Content.Headers.ContentLength;
-        if (declared > _maxStringResponseBytes)
-            throw Oversized(url, declared.Value, _maxStringResponseBytes);
+        if (declared > limit)
+            throw Oversized(url, declared.Value, limit);
 
         await DocumentFetchGate.WaitAsync(cancellationToken);
         try
@@ -1019,8 +1037,8 @@ public class SecEdgarClient : ISecEdgarClient
                 )
                 {
                     // A chunked response declares no length, so the bound is enforced here.
-                    if (buffered.Length + read > _maxStringResponseBytes)
-                        throw Oversized(url, buffered.Length + read, _maxStringResponseBytes);
+                    if (buffered.Length + read > limit)
+                        throw Oversized(url, buffered.Length + read, limit);
                     buffered.Write(chunk, 0, read);
                 }
             }
