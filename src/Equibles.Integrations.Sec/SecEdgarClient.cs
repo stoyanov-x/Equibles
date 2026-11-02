@@ -516,13 +516,31 @@ public class SecEdgarClient : ISecEdgarClient
         if (string.IsNullOrEmpty(filing.AccessionNumber) || string.IsNullOrEmpty(filing.Cik))
             throw new ArgumentException("Filing data must contain valid AccessionNumber and Cik");
 
-        return await GetDocumentContent(filing.AccessionNumber, filing.Cik);
+        return await GetDocumentContent(
+            filing.AccessionNumber,
+            filing.Cik,
+            filing.PrimaryDocument,
+            default
+        );
     }
 
     public async Task<string> GetDocumentContent(
         string accessionNumber,
         string cik,
         CancellationToken cancellationToken = default
+    ) => await GetDocumentContent(accessionNumber, cik, null, cancellationToken);
+
+    // The complete submission .txt concatenates every document in the filing, so a 10-K with
+    // large exhibits runs to tens of megabytes - SEC's own size field puts Citigroup's latest
+    // 10-K at 81 MB - while the primary document inside it is usually a few megabytes. When the
+    // whole envelope exceeds the buffered-response ceiling we cannot read it into memory, so
+    // fall back to the primary document rather than discarding the filing entirely. Callers that
+    // only passed an accession number have no primary document name and keep the old behaviour.
+    private async Task<string> GetDocumentContent(
+        string accessionNumber,
+        string cik,
+        string primaryDocument,
+        CancellationToken cancellationToken
     )
     {
         try
@@ -535,6 +553,28 @@ public class SecEdgarClient : ISecEdgarClient
 
             _logger.LogInformation(
                 "Successfully retrieved document content ({Length} characters)",
+                content.Length
+            );
+            return content;
+        }
+        catch (SecResponseTooLargeException ex) when (!string.IsNullOrWhiteSpace(primaryDocument))
+        {
+            var url = GetPrimaryDocumentUrl(cik, accessionNumber, primaryDocument);
+
+            _logger.LogWarning(
+                "Submission for {AccessionNumber} exceeds the {Limit:N0}-byte ceiling "
+                    + "({Size:N0} bytes); falling back to the primary document {Url}. As-filed "
+                    + "HTML and XBRL envelope capture are skipped for this filing.",
+                accessionNumber,
+                ex.Limit,
+                ex.Size,
+                url
+            );
+
+            var content = await FetchStringAsync(url, cancellationToken);
+
+            _logger.LogInformation(
+                "Retrieved primary document instead ({Length} characters)",
                 content.Length
             );
             return content;
@@ -1044,11 +1084,24 @@ public class SecEdgarClient : ISecEdgarClient
         }
     }
 
-    private static InvalidOperationException Oversized(string url, long size, long limit) =>
-        new(
+    private static SecResponseTooLargeException Oversized(string url, long size, long limit) =>
+        new(url, size, limit);
+
+    /// <summary>
+    /// Thrown when a response body is larger than the configured buffered-response ceiling. Typed
+    /// so a caller can tell "this document is too big to buffer" apart from a genuine failure and
+    /// degrade deliberately instead of retrying it.
+    /// </summary>
+    public sealed class SecResponseTooLargeException(string url, long size, long limit)
+        : InvalidOperationException(
             $"Response from {url} is {size:N0} bytes, over the {limit:N0}-byte limit for a "
                 + "buffered response. Refusing to read it into memory."
-        );
+        )
+    {
+        public long Size { get; } = size;
+
+        public long Limit { get; } = limit;
+    }
 
     private Task<HttpResponseMessage> SendWithRetryAsync(
         string url,
@@ -1503,6 +1556,33 @@ public class SecEdgarClient : ISecEdgarClient
 
         // Official SEC pattern for raw text files
         return $"{FilesBaseUrl}/Archives/edgar/data/{formattedCik}/{accessionNumber}.txt";
+    }
+
+    /// <summary>
+    /// Direct URL of one named document inside a filing's submission envelope, e.g.
+    /// <c>/Archives/edgar/data/0001234567/000123456724000001/aapl-20240928.htm</c>. The archive
+    /// directory is the accession number without its dashes, which is the same layout the
+    /// per-artifact fetch uses.
+    /// </summary>
+    private static string GetPrimaryDocumentUrl(
+        string cik,
+        string accessionNumber,
+        string primaryDocument
+    )
+    {
+        if (
+            string.IsNullOrEmpty(cik)
+            || string.IsNullOrEmpty(accessionNumber)
+            || string.IsNullOrEmpty(primaryDocument)
+        )
+        {
+            return string.Empty;
+        }
+
+        var formattedCik = FormatCik(cik);
+        var accessionWithoutDashes = accessionNumber.Replace("-", string.Empty);
+
+        return $"{FilesBaseUrl}/Archives/edgar/data/{formattedCik}/{accessionWithoutDashes}/{primaryDocument}";
     }
 
     private static string FormatCik(string cik)
