@@ -28,13 +28,17 @@ public class DocumentProcessorWorker : BaseScraperWorker
     // pending index makes every FIFO lookup bounded by the actual backlog.
     private readonly BackfillCursor _embeddingCursor = new("chunk-embedding");
 
-    // Whether the legacy compatibility drain has finished for this process. It has to live on the
-    // worker rather than inside DoWork: BaseScraperWorker calls DoWork again on every cycle, so a
-    // local would reset each time and the drain - which walks the whole pending queue to discover
-    // there is nothing left to mark - would run on every cycle and starve the chunking it
-    // precedes. Documents ingested while the process runs are handled by the normal pending query,
-    // not by this drain, so completing it once is enough.
-    private bool _legacyChunkDrainComplete;
+    // NOTE (Meridian fork): the legacy "mark rows that already have chunks" drain is deliberately
+    // NOT called here. Each execution walks every pending document and probes the Chunk index for
+    // it, so with 33,307 pending documents against 9.8M Chunk rows a single call ran for minutes
+    // and never completed, which starved chunking entirely - the backlog did not move in days.
+    //
+    // This deployment never had pre-marker data: chunking only ever created chunks for documents
+    // it then marked, so there are no rows carrying chunks with a null marker to find. Removing
+    // the call is therefore a no-op here. Upstream still needs the drain for installations that
+    // predate the marker; the right shape there is a persisted one-time completion flag rather
+    // than an unbounded probe on every cycle.
+    // DocumentManager.BackfillLegacyChunkedBatch is kept for that work.
 
     public DocumentProcessorWorker(
         ILogger<DocumentProcessorWorker> logger,
@@ -62,16 +66,6 @@ public class DocumentProcessorWorker : BaseScraperWorker
         {
             await using var chunkScope = ScopeFactory.CreateAsyncScope();
             var documentManager = chunkScope.ServiceProvider.GetRequiredService<DocumentManager>();
-
-            // Run the legacy compatibility drain once per process, not per batch or per cycle.
-            if (!_legacyChunkDrainComplete)
-            {
-                if (await documentManager.BackfillLegacyChunkedBatch(stoppingToken))
-                    continue;
-
-                _legacyChunkDrainComplete = true;
-            }
-
             var workDone = await documentManager.ChunkDocumentBatch(stoppingToken);
             if (!workDone)
                 break;
