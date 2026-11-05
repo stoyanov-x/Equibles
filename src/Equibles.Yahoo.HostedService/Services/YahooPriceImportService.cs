@@ -60,6 +60,10 @@ public class YahooPriceImportService
 {
     private const double MinimumReferenceHistoryCoverageShare = 0.90;
     private const int InsertBatchSize = 500;
+
+    // One dormant listing is offered after every this many actively-traded ones, so the stale tail
+    // of the rotation is reached inside a cycle instead of queueing behind the whole active group.
+    private const int StalePerCurrent = 4;
     private const int AppliedSplitBasisAuditLookbackDays = 180;
     private const decimal MaterialSplitRatioFloor = 0.5m;
     private const decimal MaterialSplitRatioCeiling = 2m;
@@ -209,25 +213,20 @@ public class YahooPriceImportService
         HasEnrichmentBacklog = false;
         var targets = await BuildCatalogPriceTargets(cancellationToken);
         using var scope = _scopeFactory.CreateScope();
-        var listings = scope.ServiceProvider.GetRequiredService<EquityListingRepository>();
         var prices = scope.ServiceProvider.GetRequiredService<EquityDailyStockPriceRepository>();
         var ids = targets.Select(target => target.EquityListingId).ToArray();
-        // Each indexed latest-row lookup avoids rescanning the complete price history per batch.
-        var latest = await listings
-            .GetAll()
-            .Where(listing => ids.Contains(listing.Id))
-            .Select(listing => new
+        // One grouped read of the batch's newest bar instead of a correlated lookup per listing.
+        // The listing-driven form ran two newest-row subqueries for every target, so a catalog
+        // pass of ~10k targets issued ~20k probes and could not finish inside a cycle.
+        var latest = await prices
+            .GetAllSeries()
+            .Where(price => ids.Contains(price.EquityListingId))
+            .GroupBy(price => price.EquityListingId)
+            .Select(group => new
             {
-                listing.Id,
-                Date = prices
-                    .GetAllSeries()
-                    .Where(price => price.EquityListingId == listing.Id)
-                    .OrderByDescending(price => price.Date)
-                    .Select(price => (DateOnly?)price.Date)
-                    .FirstOrDefault(),
-                Source = prices
-                    .GetAllSeries()
-                    .Where(price => price.EquityListingId == listing.Id)
+                Id = group.Key,
+                Date = group.Max(price => (DateOnly?)price.Date),
+                Source = group
                     .OrderByDescending(price => price.Date)
                     .Select(price => price.SourceTicker)
                     .FirstOrDefault(),
@@ -1052,7 +1051,7 @@ public class YahooPriceImportService
     {
         var activeSince = today.AddDays(-ActivelyTradedWindowDays);
 
-        return targets
+        var ranked = targets
             .Select(target => new
             {
                 Target = target,
@@ -1067,8 +1066,44 @@ public class YahooPriceImportService
             .ThenBy(x => x.LastDate)
             .ThenBy(x => x.Target.Ticker, StringComparer.Ordinal)
             .ThenBy(x => x.Target.EquityListingId)
-            .Select(x => x.Target)
             .ToList();
+
+        var ordered = new List<PriceSeriesTarget>(ranked.Count);
+        foreach (var partition in ranked.GroupBy(x => x.Target.IsHistorical).OrderBy(g => g.Key))
+        {
+            var active = partition.Where(x => x.LastDate >= activeSince).Select(x => x.Target);
+            var dormant = partition.Where(x => x.LastDate < activeSince).Select(x => x.Target);
+            ordered.AddRange(InterleaveDormant(active.ToList(), dormant.ToList()));
+        }
+
+        return ordered;
+    }
+
+    // One dormant target per StalePerCurrent actively-traded ones. Ordering the dormant tail last
+    // meant a listing that stopped trading was only reached once every active listing had been
+    // walked; because each cycle rebuilds this order from the top, a listing that was never
+    // refreshed never left that tail and starved permanently. The catalog queue interleaves for
+    // the same reason (YahooCatalogPriceQueue.CurrentPerBackfill).
+    private static List<PriceSeriesTarget> InterleaveDormant(
+        IReadOnlyList<PriceSeriesTarget> active,
+        IReadOnlyList<PriceSeriesTarget> dormant
+    )
+    {
+        var interleaved = new List<PriceSeriesTarget>(active.Count + dormant.Count);
+        var activeIndex = 0;
+        var dormantIndex = 0;
+        while (activeIndex < active.Count || dormantIndex < dormant.Count)
+        {
+            for (
+                var emitted = 0;
+                emitted < StalePerCurrent && activeIndex < active.Count;
+                emitted++
+            )
+                interleaved.Add(active[activeIndex++]);
+            if (dormantIndex < dormant.Count)
+                interleaved.Add(dormant[dormantIndex++]);
+        }
+        return interleaved;
     }
 
     // Re-syncs the full price history of every exact listed series with an effective, unreconciled
