@@ -1073,7 +1073,16 @@ public class YahooPriceImportService
         foreach (var partition in ranked.GroupBy(x => x.Target.IsHistorical).OrderBy(g => g.Key))
         {
             var active = partition.Where(x => x.LastDate >= activeSince).Select(x => x.Target);
-            var dormant = partition.Where(x => x.LastDate < activeSince).Select(x => x.Target);
+            // The dormant group runs newest-first: its oldest members are names that stopped years
+            // ago, while the newest are the ones that went quiet this month and are the only ones a
+            // reader notices missing. Stalest-first put those last, so a listing that went quiet a
+            // month ago sat behind every long-dead symbol in the rotation.
+            var dormant = partition
+                .Where(x => x.LastDate < activeSince)
+                .OrderByDescending(x => x.LastDate)
+                .ThenBy(x => x.Target.Ticker, StringComparer.Ordinal)
+                .ThenBy(x => x.Target.EquityListingId)
+                .Select(x => x.Target);
             ordered.AddRange(InterleaveDormant(active.ToList(), dormant.ToList()));
         }
 

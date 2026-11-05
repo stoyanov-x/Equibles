@@ -36,6 +36,26 @@ public class CrawlOrderTailStarvationTests
     }
 
     [Fact]
+    public void RecentlyDormantListingLeadsTheDormantTailAheadOfLongDeadSymbols()
+    {
+        var ancient = Target("ANCIENT");
+        var recent = Target("RECENT");
+        var lastDates = new Dictionary<Guid, DateOnly>
+        {
+            [ancient.EquityListingId] = Today.AddYears(-4),
+            [recent.EquityListingId] = Today.AddDays(-34),
+        };
+
+        var ordered = YahooPriceImportService.BuildCrawlOrder(
+            new[] { ancient, recent },
+            lastDates,
+            Today
+        );
+
+        ordered.Select(target => target.Ticker).Should().Equal("RECENT", "ANCIENT");
+    }
+
+    [Fact]
     public void ActivelyTradedListingsKeepTheirRelativeOrder()
     {
         var targets = new List<PriceSeriesTarget>();
