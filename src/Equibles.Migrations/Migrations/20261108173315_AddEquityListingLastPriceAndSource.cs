@@ -11,17 +11,40 @@ namespace Equibles.Migrations.Migrations
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)
         {
-            migrationBuilder.AddColumn<DateOnly>(
-                name: "LastPriceDate",
-                table: "EquityListing",
-                type: "date",
-                nullable: true);
-
-            migrationBuilder.AddColumn<string>(
-                name: "LastPriceSource",
-                table: "EquityListing",
-                type: "text",
-                nullable: true);
+            // Both statements need ACCESS EXCLUSIVE / SHARE ROW EXCLUSIVE on tables the scraper fleet
+            // reads and writes continuously, and an unbounded wait QUEUES: every reader and writer of
+            // that table then sits behind the DDL. Measured on this database on 2026-11-08, a 5 s
+            // lock_timeout on EquityListing expired immediately, so a plain ADD COLUMN would have
+            // stalled the fleet for as long as the queue took to drain. Instead each statement gets a
+            // short lock_timeout and retries a bounded number of times, which either finds a gap
+            // between statements or fails the deploy loudly with nothing half-applied.
+            migrationBuilder.Sql(
+                """
+                DO $mig$
+                DECLARE
+                    attempt int := 0;
+                BEGIN
+                    LOOP
+                        BEGIN
+                            SET LOCAL lock_timeout = '5s';
+                            ALTER TABLE "EquityListing"
+                                ADD COLUMN IF NOT EXISTS "LastPriceDate" date,
+                                ADD COLUMN IF NOT EXISTS "LastPriceSource" text;
+                            EXIT;
+                        EXCEPTION WHEN lock_not_available THEN
+                            attempt := attempt + 1;
+                            IF attempt >= 24 THEN
+                                RAISE EXCEPTION
+                                    'could not acquire ACCESS EXCLUSIVE on EquityListing after % attempts',
+                                    attempt;
+                            END IF;
+                            PERFORM pg_sleep(5);
+                        END;
+                    END LOOP;
+                END
+                $mig$;
+                """
+            );
 
             // Kept current by the database rather than by each writer: bars are inserted by the Yahoo
             // import, the delayed-trade writer and the backfills, and a writer that forgot to stamp
@@ -51,13 +74,37 @@ namespace Equibles.Migrations.Migrations
                 """
             );
 
+            // Same retry discipline: CREATE TRIGGER takes SHARE ROW EXCLUSIVE, which conflicts with
+            // the ROW EXCLUSIVE lock every price insert holds.
             migrationBuilder.Sql(
                 """
-                CREATE TRIGGER "TR_EquityDailyStockPrice_ListingLastPrice"
-                AFTER INSERT ON "EquityDailyStockPrice"
-                REFERENCING NEW TABLE AS new_prices
-                FOR EACH STATEMENT
-                EXECUTE FUNCTION equibles_sync_listing_last_price();
+                DO $mig$
+                DECLARE
+                    attempt int := 0;
+                BEGIN
+                    LOOP
+                        BEGIN
+                            SET LOCAL lock_timeout = '5s';
+                            DROP TRIGGER IF EXISTS "TR_EquityDailyStockPrice_ListingLastPrice"
+                                ON "EquityDailyStockPrice";
+                            CREATE TRIGGER "TR_EquityDailyStockPrice_ListingLastPrice"
+                            AFTER INSERT ON "EquityDailyStockPrice"
+                            REFERENCING NEW TABLE AS new_prices
+                            FOR EACH STATEMENT
+                            EXECUTE FUNCTION equibles_sync_listing_last_price();
+                            EXIT;
+                        EXCEPTION WHEN lock_not_available THEN
+                            attempt := attempt + 1;
+                            IF attempt >= 24 THEN
+                                RAISE EXCEPTION
+                                    'could not acquire SHARE ROW EXCLUSIVE on EquityDailyStockPrice after % attempts',
+                                    attempt;
+                            END IF;
+                            PERFORM pg_sleep(5);
+                        END;
+                    END LOOP;
+                END
+                $mig$;
                 """
             );
         }
