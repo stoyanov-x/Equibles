@@ -213,31 +213,41 @@ public class YahooPriceImportService
         HasEnrichmentBacklog = false;
         var targets = await BuildCatalogPriceTargets(cancellationToken);
         using var scope = _scopeFactory.CreateScope();
-        var prices = scope.ServiceProvider.GetRequiredService<EquityDailyStockPriceRepository>();
+        var listings = scope.ServiceProvider.GetRequiredService<EquityListingRepository>();
         var ids = targets.Select(target => target.EquityListingId).ToArray();
-        // One grouped read of the batch's newest bar instead of a correlated lookup per listing.
-        // The listing-driven form ran two newest-row subqueries for every target, so a catalog
-        // pass of ~10k targets issued ~20k probes and could not finish inside a cycle.
-        var latest = await prices
-            .GetAllSeries()
-            .Where(price => ids.Contains(price.EquityListingId))
-            .GroupBy(price => price.EquityListingId)
-            .Select(group => new
+        // Newest bar per target, read from EquityListing.LastPriceDate. The previous form aggregated
+        // max(Date) out of EquityDailyStockPrice for the whole batch, and a `max()` over GROUP BY has
+        // to walk every entry of every group: measured at ~15 cold index pages per listing on the
+        // production host, so a ~10k-listing batch could not finish inside the 300 s command timeout
+        // and this cycle had never completed once. The column is maintained by the AFTER INSERT
+        // trigger on EquityDailyStockPrice, so no writer can leave it behind.
+        var stored = await listings
+            .GetAll()
+            .Where(listing => ids.Contains(listing.Id))
+            .Select(listing => new
             {
-                Id = group.Key,
-                Date = group.Max(price => (DateOnly?)price.Date),
-                Source = group
-                    .OrderByDescending(price => price.Date)
-                    .Select(price => price.SourceTicker)
-                    .FirstOrDefault(),
+                listing.Id,
+                listing.LastPriceDate,
+                listing.LastPriceSource,
             })
             .ToListAsync(cancellationToken);
-        var lastDates = latest.ToDictionary(row => row.Id, row => row.Date);
+        var lastDates = stored.ToDictionary(row => row.Id, row => row.LastPriceDate);
         // A newest bar written by a venue marks the listing as covered, as ResolveCatalogStartDate decides.
-        var venueCovered = latest
-            .Where(row => VenuePriceSource.IsVenueKey(row.Source))
+        var venueCovered = stored
+            .Where(row => VenuePriceSource.IsVenueKey(row.LastPriceSource))
             .Select(row => row.Id)
             .ToHashSet();
+        // Until the one-off backfill has walked the universe this is all of them. The queue treats a
+        // null date as "never priced" and retries daily, so an unbackfilled listing is fetched less
+        // often, never ordered wrongly - but the number is logged every cycle so the gap is visible.
+        var unbackfilled = lastDates.Count(pair => pair.Value == null);
+        if (unbackfilled > 0)
+            _logger.LogWarning(
+                "LastPriceDate is not backfilled for {Unbackfilled} of {Total} catalog listings; "
+                    + "they are queued as never priced until the backfill reaches them",
+                unbackfilled,
+                lastDates.Count
+            );
         var order = YahooCatalogPriceQueue.Order(
             targets,
             lastDates,

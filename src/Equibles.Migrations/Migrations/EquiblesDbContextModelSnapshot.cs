@@ -625,6 +625,12 @@ namespace Equibles.Migrations.Migrations
                     b.Property<bool>("IsReferenceListed")
                         .HasColumnType("boolean");
 
+                    b.Property<DateOnly?>("LastPriceDate")
+                        .HasColumnType("date");
+
+                    b.Property<string>("LastPriceSource")
+                        .HasColumnType("text");
+
                     b.Property<DateOnly?>("ListedOn")
                         .HasColumnType("date");
 
