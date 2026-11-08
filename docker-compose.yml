@@ -8,45 +8,17 @@ x-embedding-environment: &embedding-environment
 
 services:
   db:
-    # Pinned (upstream): chunk searches use parallel BM25 workers, which need
-    # pg_search 0.25.11 or later. A bump that changes pg_search ships with a
-    # migration running ALTER EXTENSION ... UPDATE, or BM25 queries fail on the
-    # existing database.
+    # Pinned: chunk searches use parallel BM25 workers, which need pg_search 0.25.11 or
+    # later. A bump that changes pg_search ships with a migration running
+    # ALTER EXTENSION ... UPDATE, or BM25 queries fail on the existing database.
     #
-    # Fork note 2026-10-26: the Pi was on pg_search 0.25.6, so this pin is an
-    # upgrade and not a downgrade. It still needs ALTER EXTENSION pg_search
-    # UPDATE to take effect; chunk searches are currently unused (embeddings
-    # disabled), so nothing depends on BM25 while that migration runs.
-    image: paradedb/paradedb:0.26.2-pg18
-    # Throttle the database so it cannot starve the other ~19 containers on the
-    # 2-core prod box. A cap does NOT create capacity -- it only decides who
-    # loses the race, so memory stays generous (shared_buffers alone is ~954 MB)
-    # and only CPU is squeezed.
-    #
-    # 0.5 was too tight. During the 2026-09 issuer backfill migration the cgroup
-    # reported 5905 of 6326 periods throttled (93%), which stretched a ~75 minute
-    # migration out far longer and blew web's healthcheck budget. 0.75 keeps the
-    # database from winning every race while leaving burst headroom above the
-    # ~0.44 core it draws at steady state.
-    cpus: "0.75"
-    # Sized from measured cgroup memory, not guesswork. Postgres is NOT
-    # cgroup-aware: it will happily exceed a limit and get OOM-killed, so this
-    # must clear its non-reclaimable floor (anon ~98 MB + shared_buffers
-    # ~991 MB + kernel/slab ~85 MB, i.e. ~1.15 GiB) while still leaving room for
-    # page cache and sort/hash spares. 1536m left only ~360 MB of cache, which
-    # would just push reads back to disk, so 2048m.
-    mem_limit: 2048m
-    # ParadeDB ships max_parallel_workers=10. On 2 cores that lets many concurrent
-    # sessions each claim a parallel worker and saturate the CPU. Cap the global
-    # pool (max_parallel_workers_per_gather is already 1) and maintenance too.
-    # shared_preload_libraries (pg_search,pg_cron,pg_stat_statements) comes from
-    # the image's config files, not from this command, so it is unaffected.
-    command:
-      - postgres
-      - -c
-      - max_parallel_workers=2
-      - -c
-      - max_parallel_maintenance_workers=1
+    # The pin must never trail the extension version a database has already been
+    # updated to: UpdateParadeDbExtensions runs `ALTER EXTENSION pg_search UPDATE`,
+    # so the database adopts whatever the image ships, and Down() is empty because
+    # pg_search provides no downgrade scripts. Deploying a pin older than the
+    # installed extension is a one-way downgrade against bm25 indexes the newer
+    # version wrote. Keep this equal to the pg_search in the tag you deploy.
+    image: paradedb/paradedb:0.26.3-pg18
     ports:
       - "5432:5432"
     environment:
@@ -109,21 +81,6 @@ services:
       Worker__MinSyncDate: ${Worker__MinSyncDate:-}
     volumes:
       - web-keys:/app/keys
-    # Overrides the image's HEALTHCHECK (--start-period=10m). Web runs the EF
-    # migrations on boot, so /healthz stays down for the entire migration, while
-    # worker and mcp gate on `web: service_healthy`. The 2026-09 issuer backfill
-    # took ~75 minutes on this 2-core box, the 10m window expired, Coolify marked
-    # the deployment failed, and worker/mcp were never started -- even though the
-    # migration itself finished cleanly. A long start period cannot slow a
-    # healthy start (Docker only uses it to suppress failures for a container
-    # that is still starting), so this is deliberate headroom above the observed
-    # worst case rather than a workaround.
-    healthcheck:
-      test: ["CMD-SHELL", "curl --fail http://localhost:8080/healthz || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 7200s
     depends_on:
       db:
         condition: service_healthy
@@ -132,13 +89,6 @@ services:
     build:
       context: .
       dockerfile: src/Equibles.Worker.Host/Dockerfile
-    # Background consumer, not latency-sensitive -- the cheapest place to reclaim
-    # CPU. It measured ~57% of the entire 2-core box (the single largest
-    # consumer) once the low-disk guard stopped holding it paused, so it is capped
-    # harder than the database. mem_limit stays above its observed ~678 MB so this
-    # cannot turn into an OOM-kill loop.
-    cpus: "0.5"
-    mem_limit: 1024m
     env_file:
       - path: .env
         required: false

@@ -1,14 +1,6 @@
 services:
   db:
-    image: paradedb/paradedb:0.26.2-pg18
-    cpus: '1.25'
-    mem_limit: 2048m
-    command:
-    - postgres
-    - -c
-    - max_parallel_workers=2
-    - -c
-    - max_parallel_maintenance_workers=1
+    image: paradedb/paradedb:0.26.3-pg18
     ports:
     - ${EQUIBLES_DB_EXPOSE_PORT:-15432}:5432
     environment:
@@ -26,6 +18,14 @@ services:
       retries: 12
       start_period: 300s
     restart: unless-stopped
+    mem_limit: 2048m
+    cpus: '1.25'
+    command:
+    - postgres
+    - -c
+    - max_parallel_workers=2
+    - -c
+    - max_parallel_maintenance_workers=1
     stop_grace_period: 300s
   mcp:
     ports:
@@ -70,6 +70,11 @@ services:
       Worker__MinSyncDate: ${Worker__MinSyncDate:-}
     volumes:
     - web-keys:/app/keys
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    image: ghcr.io/stoyanov-x/equibles-web:main
     healthcheck:
       test:
       - CMD-SHELL
@@ -78,14 +83,7 @@ services:
       timeout: 5s
       retries: 30
       start_period: 7200s
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: unless-stopped
-    image: ghcr.io/stoyanov-x/equibles-web:main
   worker:
-    cpus: '2.5'
-    mem_limit: 1536m
     env_file:
     - path: .env
       required: false
@@ -110,6 +108,8 @@ services:
         condition: service_started
     restart: unless-stopped
     image: ghcr.io/stoyanov-x/equibles-worker:main
+    mem_limit: 1536m
+    cpus: '2.5'
   cloakbrowser:
     image: cloakhq/cloakbrowser:0.3.31@sha256:440907001735f4e2764e614e1b40c40bc0317d34b83c0315897dea443cbe5fcc
     command:

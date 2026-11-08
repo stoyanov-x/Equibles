@@ -46,6 +46,21 @@ Meridian-only changes applied here (NOT in any upstream file):
      Upstream tolerates ~55s of unhealthy, which a 2-minute crash recovery blows
      straight past - and because web/mcp/worker wait on `service_healthy`, that
      turns a recovering database into a failed deployment and a Bad Gateway.
+  8. db command caps max_parallel_workers=2 / max_parallel_maintenance_workers=1.
+     ParadeDB ships 10; on a 4-core Pi many concurrent sessions each claim a
+     parallel worker and saturate the CPU instead of the one spindle that is the
+     real limit. shared_preload_libraries comes from the image's own config, so it
+     is unaffected by overriding `command`.
+  9. web healthcheck start_period 7200s. Web runs the EF migrations on boot, so
+     /healthz stays down for the whole migration while worker and mcp gate on
+     `web: service_healthy`. The 2026-09 issuer backfill took ~75 minutes, the
+     image's 10m window expired, Coolify marked the deployment failed, and
+     worker/mcp never started even though the migration finished cleanly. A long
+     start period cannot slow a healthy start.
+
+These live here rather than in docker-compose.yml, which must stay a byte-for-byte
+mirror of upstream or the weekly sync-upstream merge conflicts on it every run (it
+did, for three weeks, and the fork fell 52 commits behind).
 """
 from __future__ import annotations
 
@@ -199,6 +214,41 @@ def main() -> int:
     for svc, limits in SERVICE_LIMITS.items():
         if svc in services:
             services[svc].update(limits)
+
+    # Meridian-only change #8: cap Postgres' parallel workers. ParadeDB's image
+    # ships max_parallel_workers=10, and on this 4-core Pi several concurrent
+    # sessions each claim one, so the box burns CPU on parallelism it cannot use
+    # while the single USB spindle is the actual bottleneck (0 % idle, 40-90 %
+    # iowait). max_parallel_workers_per_gather is already 1, so this only bounds
+    # the global pool. `shared_preload_libraries` comes from the image's config
+    # files, not from the command line, so overriding `command` does not touch it.
+    # This used to live in docker-compose.yml; see the docstring for why it cannot.
+    if "db" in services:
+        services["db"]["command"] = [
+            "postgres",
+            "-c",
+            "max_parallel_workers=2",
+            "-c",
+            "max_parallel_maintenance_workers=1",
+        ]
+
+    # Meridian-only change #9: web's healthcheck must tolerate a long migration.
+    # Web runs the EF migrations on boot, so /healthz is down for the whole
+    # migration while worker and mcp gate on `web: service_healthy`. The 2026-09
+    # issuer backfill took ~75 minutes on this box: the image's 10m start_period
+    # expired, Coolify marked the deployment failed, and worker/mcp were never
+    # started even though the migration finished cleanly. Docker only uses
+    # start_period to suppress failures while a container is starting, so a long
+    # value cannot slow a healthy start. Also caps the container at 30 x 10s
+    # failures rather than the image's unbounded retries.
+    if "web" in services:
+        services["web"]["healthcheck"] = {
+            "test": ["CMD-SHELL", "curl --fail http://localhost:8080/healthz || exit 1"],
+            "interval": "10s",
+            "timeout": "5s",
+            "retries": 30,
+            "start_period": "7200s",
+        }
 
     # Meridian-only change #6: give Postgres time to stop cleanly. Independent of
     # the resource limits above - it is the one setting that decides whether a
