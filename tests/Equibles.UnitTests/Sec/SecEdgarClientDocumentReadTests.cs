@@ -75,10 +75,16 @@ public class SecEdgarClientDocumentReadTests
             return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
         });
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var exception = await Assert.ThrowsAsync<SecEdgarClient.SecResponseTooLargeException>(() =>
             client.GetDocumentContent("0000000000-00-000000", "1")
         );
 
+        // The size that was refused and the limit it broke, not just the message:
+        // GetDocumentContent's fallback to the primary document keys off this typed
+        // exception, so a regression to a plain InvalidOperationException would
+        // silently turn a recoverable large filing back into a skipped one.
+        Assert.Equal(64L * 1024 * 1024 + 1, exception.Size);
+        Assert.True(exception.Limit > 0);
         Assert.Contains("over the", exception.Message);
         Assert.Contains("limit", exception.Message);
     }
