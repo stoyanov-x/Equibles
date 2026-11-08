@@ -33,6 +33,9 @@ public class CompanyMetadata
     /// <summary>EDGAR's state-or-country code for the business address, e.g. "CA" or "L2"; null when SEC records none.</summary>
     public string BusinessStateOrCountry { get; set; }
 
+    /// <summary>Filing date of the newest annual report (10-K, 10-KT, 20-F or 40-F) among the recent filings; null when none is listed.</summary>
+    public DateOnly? LatestAnnualReportFiledOn { get; set; }
+
     /// <summary>The file number EDGAR indexes the newest 10-K or 10-Q under, from the recent filings; null when none is listed.</summary>
     public string PeriodicReportFileNumber { get; set; }
 
@@ -41,6 +44,9 @@ public class CompanyMetadata
 
     /// <summary>Filing date of the newest N-54C (withdrawal of that election) among the recent filings.</summary>
     public DateOnly? BdcWithdrawalFiledOn { get; set; }
+
+    /// <summary>The newest successor-issuer report (Form 8-K12B, 8-K12G3 or 8-K15D5) among the recent filings; null when none is listed.</summary>
+    public SuccessorRegistration SuccessorRegistration { get; set; }
 
     /// <summary>True when EDGAR pages older filings out of the recent list, so the recent list is not the whole history.</summary>
     public bool HasArchivedFilings { get; set; }

@@ -1,4 +1,5 @@
 using Equibles.CommonStocks.BusinessLogic.Websites;
+using Equibles.Core.Extensions;
 using Equibles.Integrations.Common.RateLimiter;
 using Microsoft.Extensions.Logging;
 
@@ -64,7 +65,112 @@ public class WebsiteProbeClient
         if (bareHost != null && await Probe(bareHost, cancellationToken))
             return bareHost;
 
+        // A disclosure without a scheme ("www.acme.co.in") names no protocol, and many small
+        // companies' sites serve plain HTTP only, so https is only the first guess; a candidate
+        // that stated https keeps it. The fallback is a plain request even with a sidecar, as only
+        // it reports where it landed: an answer from another site (a parked domain, a webmail
+        // login) is not the company's own.
+        var plain = PlainHttp(candidate, normalized);
+        if (plain != null && await ProbePlain(plain, ownSite: true, cancellationToken))
+            return plain;
+
         return null;
+    }
+
+    /// <summary>
+    /// Whether a stored website still answers. A plain request settles most sites without a render.
+    /// Only the sidecar can call a site dead: without it a bot wall reads like a dead host, and a
+    /// timed-out render says nothing about the page.
+    /// </summary>
+    public async Task<WebsiteLiveness> CheckLiveness(
+        string stored,
+        CancellationToken cancellationToken
+    )
+    {
+        var url = Normalize(stored);
+        if (url == null)
+            return WebsiteLiveness.Dead;
+        if (await ProbePlain(url, ownSite: false, cancellationToken))
+            return WebsiteLiveness.Alive;
+        if (!_stealthClient.IsEnabled)
+            return WebsiteLiveness.Unknown;
+
+        try
+        {
+            var render = await _stealthClient.TryFetchHtml(url, cancellationToken);
+            return render.Status switch
+            {
+                StealthFetchStatus.Rendered => WebsiteLiveness.Alive,
+                StealthFetchStatus.PageUnavailable => WebsiteLiveness.Dead,
+                // A refusal is the host answering: a lapsed certificate or a bot wall is not a dead site.
+                _ => WebsiteLiveness.Unknown,
+            };
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Website liveness render failed for {Url}", url);
+            return WebsiteLiveness.Unknown;
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="url"/> renders through the sidecar right now. The control for
+    /// reading a dead site: a sidecar that cannot render a live page has no verdict to give.
+    /// </summary>
+    public async Task<bool> Renders(string url, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var render = await _stealthClient.TryFetchHtml(url, cancellationToken);
+            return render.Status == StealthFetchStatus.Rendered;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Website control render failed for {Url}", url);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Addresses to try when a stored one reads dead, nearest first: its site root, since a retired
+    /// page on a live site loses only its path, then the same site without "www.". A plain-HTTP
+    /// form stays with <see cref="Validate"/>, the one probe that checks where it landed.
+    /// </summary>
+    public static IReadOnlyList<string> Alternatives(string stored)
+    {
+        var normalized = Normalize(stored);
+        if (normalized == null)
+            return [];
+
+        var root = new Uri(normalized).GetLeftPart(UriPartial.Authority);
+        return new[] { root, WithoutWww(root) }
+            .Where(address => address != null && address != normalized.TrimEnd('/'))
+            .Distinct()
+            .ToList();
+    }
+
+    /// <summary>
+    /// The plain-HTTP form of <paramref name="normalizedUrl"/> when its https scheme was assumed
+    /// by <see cref="Normalize"/> rather than stated in <paramref name="candidate"/>, or null.
+    /// </summary>
+    public static string PlainHttp(string candidate, string normalizedUrl)
+    {
+        const string assumed = "https://";
+        if (
+            string.IsNullOrEmpty(normalizedUrl)
+            || candidate.Contains("://")
+            || !normalizedUrl.StartsWith(assumed, StringComparison.Ordinal)
+        )
+            return null;
+        return "http://" + normalizedUrl[assumed.Length..];
     }
 
     /// <summary>
@@ -98,6 +204,19 @@ public class WebsiteProbeClient
             }
         }
 
+        return await ProbePlain(url, ownSite: false, cancellationToken);
+    }
+
+    /// <summary>
+    /// Probes one absolute URL with a plain request; with <paramref name="ownSite"/> the
+    /// response must also come from the URL's own registrable domain after any redirect.
+    /// </summary>
+    private async Task<bool> ProbePlain(
+        string url,
+        bool ownSite,
+        CancellationToken cancellationToken
+    )
+    {
         try
         {
             await RateLimiter.WaitAsync();
@@ -109,7 +228,13 @@ public class WebsiteProbeClient
                 HttpCompletionOption.ResponseHeadersRead,
                 cancellationToken
             );
-            return response.IsSuccessStatusCode;
+            var landed = response.RequestMessage?.RequestUri ?? new Uri(url);
+            return response.IsSuccessStatusCode
+                && (
+                    !ownSite
+                    || RegistrableDomain.Of(landed.Host.ToLowerInvariant())
+                        == RegistrableDomain.Of(new Uri(url).Host.ToLowerInvariant())
+                );
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

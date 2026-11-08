@@ -59,7 +59,9 @@ public class CongressionalTradeSyncService
     // still carry the scrambled "F ILING S TATUS : New" suffix.
     // v9 (House): recovers rows with unpadded transaction months or days; these already
     // consumed source row indices as rejected rows, so replay preserves later identities.
-    private const int CurrentHouseTradeParserVersion = 9;
+    // v10 (House): reads each row's filing status, so amended and deleted rows supersede the rows
+    // they correct and deleted rows stop being stored as trades.
+    private const int CurrentHouseTradeParserVersion = 10;
     private const int CurrentSenateTradeParserVersion = 6;
     private const int ReprocessPerCycleLimit = 1_000;
 
@@ -274,7 +276,7 @@ public class CongressionalTradeSyncService
         await _filingLedger.RecordProcessed(batch.Kind, recordable, ct, parserVersion);
         await ReportPartiallyReadFilings(batch.Kind, recordable, parserVersion);
         await ReportTickerConflicts(batch.Kind, recordable, outcome, parserVersion);
-        await ReportRowsDatedAfterFiling(batch.Kind, recordable, outcome, parserVersion);
+        LogRowsDatedAfterFiling(batch.Kind, recordable, outcome, parserVersion);
 
         if (
             batch.ArchiveYear == null
@@ -343,7 +345,9 @@ public class CongressionalTradeSyncService
 
     internal const string TickerConflictErrorContext = "CongressTrades.TickerConflict";
 
-    private async Task ReportRowsDatedAfterFiling(
+    // A filer's date typo: retrying cannot change it and nobody can act on it, so it is a
+    // warning in the worker log rather than an Errors row.
+    private void LogRowsDatedAfterFiling(
         CongressionalFilingKind kind,
         IReadOnlyCollection<ProcessedFiling> recorded,
         TradePersistOutcome outcome,
@@ -359,24 +363,19 @@ public class CongressionalTradeSyncService
             )
         )
         {
-            await _errorReporter.Report(
-                ErrorSource.CongressScraper,
-                DatedAfterFilingErrorContext,
-                DescribeRowDatedAfterFiling(row, parserVersion),
-                stackTrace: null
+            _logger.LogWarning(
+                "{FilingKind} {SourceId} row {SourceRowIndex}: transaction date {TransactionDate} "
+                    + "is after the filing date {FilingDate}; the row was not stored and the filing "
+                    + "was recorded at parser version {ParserVersion}",
+                row.FilingKind,
+                row.SourceId,
+                row.SourceRowIndex,
+                row.TransactionDate,
+                row.FilingDate,
+                parserVersion
             );
         }
     }
-
-    internal const string DatedAfterFilingErrorContext = "CongressTrades.RowDatedAfterFiling";
-
-    internal static string DescribeRowDatedAfterFiling(
-        TradeDatedAfterFiling row,
-        int parserVersion
-    ) =>
-        $"{row.FilingKind} {row.SourceId} row {row.SourceRowIndex}: transaction date "
-        + $"{row.TransactionDate:yyyy-MM-dd} is after the filing date {row.FilingDate:yyyy-MM-dd}; "
-        + $"the row was not stored and the filing was recorded at parser version {parserVersion}";
 
     internal static string DescribeTickerConflict(
         TradeTickerConflict conflict,
@@ -473,6 +472,11 @@ public class CongressionalTradeSyncService
         {
             throw;
         }
+        catch (SenateAccessDeniedException denial)
+        {
+            await SenateAccessGate.Record(denial, _errorReporter, _logger, "Senate PTR fetch");
+            return new DisclosureFetchResult { IsComplete = false };
+        }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to fetch {Source} disclosure data", sourceLabel);
@@ -558,9 +562,14 @@ public class CongressionalTradeSyncService
                 .Select(t => t.SourceId)
         );
 
-        var trades = BuildTrades(tickered, members, resolutions);
+        var (trades, amendments) = SplitAmendments(
+            tickered,
+            BuildTrades(tickered, members, resolutions)
+        );
         var tickerConflicts = new List<TradeTickerConflict>();
-        unpersistedSourceIds.UnionWith(await PersistTrades(trades, tickerConflicts, dbContext, ct));
+        unpersistedSourceIds.UnionWith(
+            await PersistTrades(trades, amendments, tickerConflicts, dbContext, ct)
+        );
 
         return new TradePersistOutcome(unpersistedSourceIds, tickerConflicts, datedAfterFiling);
     }
@@ -629,7 +638,47 @@ public class CongressionalTradeSyncService
         return trades;
     }
 
-    private static string CleanStoredText(string value) =>
+    /// <summary>
+    /// Separates the rows an amending report changes. Amended rows stay trades (they are the
+    /// corrected facts) and also become amendment records; deleted rows become records only.
+    /// </summary>
+    internal static (
+        List<CongressionalTrade> Trades,
+        List<CongressionalTradeAmendment> Amendments
+    ) SplitAmendments(
+        IEnumerable<DisclosureTransaction> transactions,
+        List<CongressionalTrade> built
+    )
+    {
+        var statuses = transactions
+            .Where(t =>
+                t.SourceId != null
+                && t.FilingStatus
+                    is CongressionalTradeFilingStatus.Amended
+                        or CongressionalTradeFilingStatus.Deleted
+            )
+            .GroupBy(t => new TradeSourceIdentity(t.FilingKind, t.SourceId, t.SourceRowIndex))
+            .ToDictionary(group => group.Key, group => group.First().FilingStatus);
+
+        var trades = new List<CongressionalTrade>();
+        var amendments = new List<CongressionalTradeAmendment>();
+        foreach (var trade in built)
+        {
+            if (!statuses.TryGetValue(TradeSourceIdentity.From(trade), out var status))
+            {
+                trades.Add(trade);
+                continue;
+            }
+
+            amendments.Add(CongressionalTradeAmendmentMatcher.Record(trade, status));
+            if (status == CongressionalTradeFilingStatus.Amended)
+                trades.Add(trade);
+        }
+
+        return (trades, amendments);
+    }
+
+    internal static string CleanStoredText(string value) =>
         value?.Replace("\0", "", StringComparison.Ordinal).Trim() ?? "";
 
     private async Task RepairLegacyInlineSubholdingNames(
@@ -740,20 +789,28 @@ public class CongressionalTradeSyncService
 
     private async Task<IReadOnlySet<string>> PersistTrades(
         List<CongressionalTrade> trades,
+        List<CongressionalTradeAmendment> amendments,
         List<TradeTickerConflict> tickerConflicts,
         EquiblesFinancialDbContext dbContext,
         CancellationToken ct
     )
     {
-        if (trades.Count == 0)
+        if (trades.Count == 0 && amendments.Count == 0)
             return new HashSet<string>();
 
         await using var transaction = await dbContext.Database.BeginTransactionAsync(ct);
-        await RepairLegacyInlineSubholdingNames(trades, dbContext, ct);
-        await RepairLegacyEmptyFiledMetadata(trades, dbContext, ct);
-        await RepairLegacyZeroFloorAmounts(trades, dbContext, ct);
+        var refusedAmendmentSources = await UpsertAmendments(amendments, dbContext, ct);
+        if (trades.Count > 0)
+        {
+            await RepairLegacyInlineSubholdingNames(trades, dbContext, ct);
+            await RepairLegacyEmptyFiledMetadata(trades, dbContext, ct);
+            await RepairLegacyZeroFloorAmounts(trades, dbContext, ct);
+        }
         RemoveUnidentifiedMetadataDuplicates(trades);
+        // Before adoption: a legacy row adopted onto a superseded key would bring the original back.
+        await ApplySupersession(trades, dbContext, ct);
         var unpersistedSourceIds = await AdoptLegacyRows(trades, tickerConflicts, dbContext, ct);
+        unpersistedSourceIds.UnionWith(refusedAmendmentSources);
 
         if (trades.Count > 0)
         {
@@ -794,6 +851,152 @@ public class CongressionalTradeSyncService
         );
 
         return unpersistedSourceIds;
+    }
+
+    // Filed facts refresh on replay; the verdict and the superseded key are the resolver's. A
+    // trade stored at a deleted row's own key (written before v10 read the status) is removed.
+    private async Task<HashSet<string>> UpsertAmendments(
+        List<CongressionalTradeAmendment> amendments,
+        EquiblesFinancialDbContext dbContext,
+        CancellationToken ct
+    )
+    {
+        var refused = new HashSet<string>(StringComparer.Ordinal);
+        if (amendments.Count == 0)
+            return refused;
+
+        var unique = new List<CongressionalTradeAmendment>();
+        foreach (
+            var group in amendments.GroupBy(row =>
+                (row.FilingKind, row.SourceId, row.SourceRowIndex)
+            )
+        )
+        {
+            if (group.Count() == 1)
+                unique.Add(group.Single());
+            else
+                refused.Add(group.Key.SourceId);
+        }
+
+        if (unique.Count > 0)
+        {
+            await dbContext
+                .Set<CongressionalTradeAmendment>()
+                .UpsertRange(unique)
+                .On(row => new
+                {
+                    row.FilingKind,
+                    row.SourceId,
+                    row.SourceRowIndex,
+                })
+                .WhenMatched(
+                    (existing, incoming) =>
+                        new CongressionalTradeAmendment
+                        {
+                            CongressMemberId = incoming.CongressMemberId,
+                            Status = incoming.Status,
+                            FilingDate = incoming.FilingDate,
+                            TransactionDate = incoming.TransactionDate,
+                            TransactionType = incoming.TransactionType,
+                            OwnerType = incoming.OwnerType,
+                            AssetName = incoming.AssetName,
+                            AssetType = incoming.AssetType,
+                            FiledTicker = incoming.FiledTicker,
+                            Subholding = incoming.Subholding,
+                            AmountFrom = incoming.AmountFrom,
+                            AmountTo = incoming.AmountTo,
+                        }
+                )
+                .RunAsync(ct);
+        }
+
+        var deleted = unique
+            .Where(row => row.Status == CongressionalTradeFilingStatus.Deleted)
+            .ToList();
+        if (deleted.Count == 0)
+            return refused;
+
+        var sourceIds = deleted.Select(row => row.SourceId).Distinct().ToList();
+        var deletedKeys = deleted.Select(TradeSourceIdentity.From).ToHashSet();
+        var stale = (
+            await dbContext
+                .Set<CongressionalTrade>()
+                .Where(trade => trade.SourceId != null && sourceIds.Contains(trade.SourceId))
+                .ToListAsync(ct)
+        )
+            .Where(trade => deletedKeys.Contains(TradeSourceIdentity.From(trade)))
+            .ToList();
+        if (stale.Count > 0)
+        {
+            dbContext.RemoveRange(stale);
+            await dbContext.SaveChangesAsync(ct);
+            _logger.LogInformation(
+                "Removed {Count} congressional trades stored from rows their reports mark deleted",
+                stale.Count
+            );
+        }
+
+        return refused;
+    }
+
+    // A matched original never returns when its filing is read again, and an amended row keeps
+    // its original's filing date so the correction cannot make the trade look late.
+    private static async Task ApplySupersession(
+        List<CongressionalTrade> trades,
+        EquiblesFinancialDbContext dbContext,
+        CancellationToken ct
+    )
+    {
+        var sourceIds = trades
+            .Where(trade => trade.SourceId != null)
+            .Select(trade => trade.SourceId)
+            .Distinct()
+            .ToList();
+        if (sourceIds.Count == 0)
+            return;
+
+        var matched = await dbContext
+            .Set<CongressionalTradeAmendment>()
+            .AsNoTracking()
+            .Where(row =>
+                row.Verdict == CongressionalTradeAmendmentVerdict.Matched
+                && (
+                    sourceIds.Contains(row.SupersededSourceId)
+                    || (
+                        row.Status == CongressionalTradeFilingStatus.Amended
+                        && sourceIds.Contains(row.SourceId)
+                    )
+                )
+            )
+            .ToListAsync(ct);
+        if (matched.Count == 0)
+            return;
+
+        var supersededKeys = matched
+            .Select(row => new TradeSourceIdentity(
+                row.FilingKind,
+                row.SupersededSourceId,
+                row.SupersededSourceRowIndex
+            ))
+            .ToHashSet();
+        trades.RemoveAll(trade => supersededKeys.Contains(TradeSourceIdentity.From(trade)));
+
+        var firstDisclosed = matched
+            .Where(row =>
+                row.Status == CongressionalTradeFilingStatus.Amended
+                && row.FirstDisclosedDate.HasValue
+            )
+            .ToDictionary(
+                TradeSourceIdentity.From,
+                row => row.FirstDisclosedDate.GetValueOrDefault()
+            );
+        foreach (
+            var (trade, date) in trades
+                .Select(trade => (Trade: trade, Key: TradeSourceIdentity.From(trade)))
+                .Where(pair => firstDisclosed.ContainsKey(pair.Key))
+                .Select(pair => (pair.Trade, firstDisclosed[pair.Key]))
+        )
+            trade.FilingDate = date;
     }
 
     /// <summary>
@@ -1153,5 +1356,8 @@ public class CongressionalTradeSyncService
     {
         public static TradeSourceIdentity From(CongressionalTrade trade) =>
             new(trade.FilingKind, trade.SourceId, trade.SourceRowIndex);
+
+        public static TradeSourceIdentity From(CongressionalTradeAmendment row) =>
+            new(row.FilingKind, row.SourceId, row.SourceRowIndex);
     }
 }

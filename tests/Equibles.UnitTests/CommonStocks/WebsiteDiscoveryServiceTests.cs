@@ -64,11 +64,14 @@ public class WebsiteDiscoveryServiceTests
         HttpStatusCode probeStatus = HttpStatusCode.OK,
         int? batchSize = null,
         IBus bus = null,
-        IServiceScopeFactory errorScopes = null
+        IServiceScopeFactory errorScopes = null,
+        int? recheckBatchSize = null,
+        IStealthBrowserClient sidecar = null
     )
     {
-        var stealth = Substitute.For<IStealthBrowserClient>();
-        stealth.IsEnabled.Returns(false);
+        var stealth = sidecar ?? Substitute.For<IStealthBrowserClient>();
+        if (sidecar == null)
+            stealth.IsEnabled.Returns(false);
         var probe = new WebsiteProbeClient(
             new HttpClient(new FixedStatusHandler(probeStatus)),
             stealth,
@@ -77,6 +80,8 @@ public class WebsiteDiscoveryServiceTests
         var discoveryOptions = new WebsiteDiscoveryOptions();
         if (batchSize.HasValue)
             discoveryOptions.BatchSize = batchSize.Value;
+        if (recheckBatchSize.HasValue)
+            discoveryOptions.RecheckBatchSize = recheckBatchSize.Value;
         return new WebsiteDiscoveryService(
             ScopeFactory(options),
             sources,
@@ -363,17 +368,511 @@ public class WebsiteDiscoveryServiceTests
         reloaded.WebsiteCheckedAt.Should().BeNull();
     }
 
+    [Fact]
+    public async Task DiscoveredWebsite_IsStampedWithTheCurrentVersion_AndNotRechecked()
+    {
+        var options = NewDbOptions();
+        EquityIssuer stock = await SeedStock(options, "AAA");
+        var source = new StubSource(10, new Dictionary<string, string> { ["AAA"] = "www.aaa.com" });
+
+        await BuildSut(options, [source]).Import(CancellationToken.None);
+
+        (await Reload(options, stock.Id))
+            .WebsiteDiscoveryVersion.Should()
+            .Be(WebsiteDiscoveryVersion.Current);
+        source.RecheckedStocks.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Recheck_ReplacesADisownedWebsite_AndCascadesIntoIrDiscovery()
+    {
+        var options = NewDbOptions();
+        EquityIssuer stock = await SeedStock(options, "AAA", website: "https://amazon.com");
+        var source = new StubSource(
+            10,
+            [],
+            replacements: new Dictionary<string, string> { ["AAA"] = "www.aaa.com" }
+        );
+        var bus = Substitute.For<IBus>();
+
+        await BuildSut(options, [source], bus: bus).Import(CancellationToken.None);
+
+        source
+            .RecheckedStocks.Should()
+            .ContainSingle()
+            .Which.Website.Should()
+            .Be("https://amazon.com");
+        EquityIssuer reloaded = await Reload(options, stock.Id);
+        reloaded.Website.Should().Be("https://www.aaa.com");
+        reloaded
+            .WebsiteCheckedAt.Should()
+            .NotBeNull("IR discovery re-admits a stock whose website changed after its last probe");
+        reloaded.WebsiteDiscoveryVersion.Should().Be(WebsiteDiscoveryVersion.Current);
+        await bus.Received(1)
+            .Publish(
+                Arg.Is<StockWebsiteDiscovered>(e =>
+                    e.CommonStockId == stock.Id && e.Website == "https://www.aaa.com"
+                ),
+                Arg.Any<CancellationToken>()
+            );
+    }
+
+    [Fact]
+    public async Task Recheck_WithoutAReplacement_KeepsTheWebsite_AndRunsOnce()
+    {
+        var options = NewDbOptions();
+        EquityIssuer stock = await SeedStock(options, "AAA", website: "https://www.aaa.com");
+        var source = new StubSource(10, []);
+        var sut = BuildSut(options, [source]);
+
+        await sut.Import(CancellationToken.None);
+        await sut.Import(CancellationToken.None);
+
+        EquityIssuer reloaded = await Reload(options, stock.Id);
+        reloaded.Website.Should().Be("https://www.aaa.com");
+        reloaded.WebsiteDiscoveryVersion.Should().Be(WebsiteDiscoveryVersion.Current);
+        source.RecheckedStocks.Should().ContainSingle("a stamped website is not re-checked again");
+    }
+
+    [Fact]
+    public async Task Recheck_WhoseReplacementFailsTheProbe_KeepsTheWebsite_AndDefersADay()
+    {
+        var options = NewDbOptions();
+        EquityIssuer stock = await SeedStock(options, "AAA", website: "https://amazon.com");
+        var source = new StubSource(
+            10,
+            [],
+            replacements: new Dictionary<string, string> { ["AAA"] = "www.dead-host.com" }
+        );
+        var sut = BuildSut(options, [source], HttpStatusCode.NotFound);
+
+        await sut.Import(CancellationToken.None);
+        await sut.Import(CancellationToken.None);
+
+        EquityIssuer reloaded = await Reload(options, stock.Id);
+        reloaded.Website.Should().Be("https://amazon.com");
+        reloaded
+            .WebsiteDiscoveryVersion.Should()
+            .Be(
+                0,
+                "a probe that could not run reads as a dead site, so the stock gets a second try"
+            );
+        reloaded.WebsiteRecheckProbeFailedAt.Should().NotBeNull();
+        source.RecheckedStocks.Should().ContainSingle("the retry waits a day");
+    }
+
+    [Fact]
+    public async Task Recheck_WhoseReplacementFailsTheProbeAgainADayLater_IsSettled()
+    {
+        var options = NewDbOptions();
+        EquityIssuer stock = await SeedStock(options, "AAA", website: "https://amazon.com");
+        using (var ctx = NewContext(options))
+        {
+            var seeded = await ctx.Set<EquityIssuer>().FirstAsync(s => s.Id == stock.Id);
+            seeded.WebsiteRecheckProbeFailedAt = DateTime.UtcNow.AddDays(-2);
+            await ctx.SaveChangesAsync();
+        }
+        var source = new StubSource(
+            10,
+            [],
+            replacements: new Dictionary<string, string> { ["AAA"] = "www.dead-host.com" }
+        );
+
+        await BuildSut(options, [source], HttpStatusCode.NotFound).Import(CancellationToken.None);
+
+        EquityIssuer reloaded = await Reload(options, stock.Id);
+        reloaded.Website.Should().Be("https://amazon.com");
+        reloaded.WebsiteDiscoveryVersion.Should().Be(WebsiteDiscoveryVersion.Current);
+        reloaded.WebsiteRecheckProbeFailedAt.Should().BeNull();
+    }
+
+    private const string ControlSite = "https://control.example.com";
+
+    // Renders the control site and the named addresses; everything else gets the verdict.
+    private static IStealthBrowserClient Sidecar(
+        StealthFetchResult verdict,
+        params string[] rendering
+    )
+    {
+        var sidecar = Substitute.For<IStealthBrowserClient>();
+        sidecar.IsEnabled.Returns(true);
+        sidecar
+            .TryFetchHtml(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+                call.Arg<string>() == ControlSite || rendering.Contains(call.Arg<string>())
+                    ? StealthFetchResult.Rendered("<html></html>")
+                    : verdict
+            );
+        return sidecar;
+    }
+
+    private static async Task SeedControlSite(DbContextOptions<EquiblesFinancialDbContext> options)
+    {
+        EquityIssuer control = await SeedStock(
+            options,
+            "CTRL",
+            website: ControlSite,
+            checkedAt: Long,
+            marketCap: 1_000_000
+        );
+        using var ctx = NewContext(options);
+        var seeded = await ctx.Set<EquityIssuer>().SingleAsync(s => s.Id == control.Id);
+        seeded.WebsiteDiscoveryVersion = WebsiteDiscoveryVersion.Current;
+        seeded.WebsiteLivenessCheckedAt = DateTime.UtcNow;
+        await ctx.SaveChangesAsync();
+    }
+
+    private static async Task<EquityIssuer> SeedStoredWebsite(
+        DbContextOptions<EquiblesFinancialDbContext> options,
+        string website,
+        DateTime? firstDeadReading = null,
+        string ticker = "AAA"
+    )
+    {
+        EquityIssuer stock = await SeedStock(options, ticker, website: website, checkedAt: Long);
+        using var ctx = NewContext(options);
+        var seeded = await ctx.Set<EquityIssuer>().SingleAsync(s => s.Id == stock.Id);
+        seeded.WebsiteDiscoveryVersion = WebsiteDiscoveryVersion.Current;
+        seeded.WebsiteRecheckProbeFailedAt = firstDeadReading;
+        await ctx.SaveChangesAsync();
+        return seeded;
+    }
+
+    private static readonly DateTime Long = new(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+    [Fact]
+    public void Liveness_CandidateQuery_TranslatesOnPostgres()
+    {
+        var options = new DbContextOptionsBuilder<EquiblesFinancialDbContext>()
+            .UseNpgsql("Host=localhost;Database=translation")
+            .Options;
+        using var ctx = new EquiblesFinancialDbContext(
+            options,
+            new IModuleConfiguration[] { new CommonStocksModuleConfiguration() }
+        );
+
+        var sql = ctx.Set<EquityIssuer>()
+            .Where(
+                WebsiteDiscoveryService.PendingLivenessCheck(1, DateTime.UtcNow, DateTime.UtcNow)
+            )
+            .OrderBy(s => s.WebsiteLivenessCheckedAt != null)
+            .ThenBy(s => s.WebsiteLivenessCheckedAt)
+            .ToQueryString();
+
+        sql.Should().Contain("WebsiteLivenessCheckedAt");
+    }
+
+    [Fact]
+    public async Task Liveness_AnsweringSite_IsStamped_WithoutReopeningIrDiscovery()
+    {
+        var options = NewDbOptions();
+        EquityIssuer stock = await SeedStoredWebsite(options, "https://aaa.com");
+
+        await BuildSut(options, [new StubSource(1, [])]).Import(CancellationToken.None);
+
+        using var ctx = NewContext(options);
+        var reloaded = await ctx.Set<EquityIssuer>().SingleAsync(s => s.Id == stock.Id);
+        reloaded.WebsiteLivenessCheckedAt.Should().NotBeNull();
+        reloaded.WebsiteCheckedAt.Should().Be(Long);
+    }
+
+    [Fact]
+    public async Task Liveness_FirstDeadReading_KeepsTheWebsite_AndWaitsADay()
+    {
+        var options = NewDbOptions();
+        await SeedControlSite(options);
+        EquityIssuer stock = await SeedStoredWebsite(options, "https://gone.example.com");
+        var sidecar = Sidecar(StealthFetchResult.PageUnavailable);
+        var sut = BuildSut(
+            options,
+            [new StubSource(1, [])],
+            HttpStatusCode.NotFound,
+            sidecar: sidecar
+        );
+
+        await sut.Import(CancellationToken.None);
+        await sut.Import(CancellationToken.None);
+
+        using var ctx = NewContext(options);
+        var reloaded = await ctx.Set<EquityIssuer>().SingleAsync(s => s.Id == stock.Id);
+        reloaded.Website.Should().Be("https://gone.example.com");
+        reloaded.WebsiteRecheckProbeFailedAt.Should().NotBeNull();
+        await sidecar
+            .Received(1)
+            .TryFetchHtml("https://gone.example.com", Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Liveness_SecondDeadReading_ClearsTheWebsite_SoDiscoverySeeksAnother()
+    {
+        var options = NewDbOptions();
+        await SeedControlSite(options);
+        EquityIssuer stock = await SeedStoredWebsite(
+            options,
+            "https://gone.example.com",
+            firstDeadReading: DateTime.UtcNow.AddDays(-2)
+        );
+        var sut = BuildSut(
+            options,
+            [new StubSource(1, [])],
+            HttpStatusCode.NotFound,
+            sidecar: Sidecar(StealthFetchResult.PageUnavailable)
+        );
+
+        await sut.Import(CancellationToken.None);
+
+        using var ctx = NewContext(options);
+        var reloaded = await ctx.Set<EquityIssuer>().SingleAsync(s => s.Id == stock.Id);
+        reloaded.Website.Should().BeNull();
+        reloaded.WebsiteRecheckProbeFailedAt.Should().BeNull();
+        reloaded.WebsiteLivenessCheckedAt.Should().NotBeNull();
+        WebsiteDiscoveryService
+            .PendingDiscovery(DateTime.UtcNow)
+            .Compile()(reloaded)
+            .Should()
+            .BeTrue();
+    }
+
+    [Fact]
+    public async Task Discovery_FillingAClearedSite_StampsItsLiveness()
+    {
+        var options = NewDbOptions();
+        EquityIssuer stock = await SeedStock(options, "AAA");
+        DateTime clearedAt = DateTime.UtcNow.AddDays(-5);
+        using (var seed = NewContext(options))
+        {
+            var row = await seed.Set<EquityIssuer>().SingleAsync(s => s.Id == stock.Id);
+            row.WebsiteLivenessCheckedAt = clearedAt;
+            await seed.SaveChangesAsync();
+        }
+        var sut = BuildSut(
+            options,
+            [new StubSource(1, new() { ["AAA"] = "https://www.new-home.example.com" })]
+        );
+
+        await sut.Import(CancellationToken.None);
+
+        using var ctx = NewContext(options);
+        var reloaded = await ctx.Set<EquityIssuer>().SingleAsync(s => s.Id == stock.Id);
+        reloaded.Website.Should().Be("https://www.new-home.example.com");
+        reloaded.WebsiteLivenessCheckedAt.Should().BeAfter(clearedAt);
+    }
+
+    [Fact]
+    public async Task Liveness_RetiredPathOnALiveSite_FallsBackToTheSiteRoot_AndCascades()
+    {
+        var options = NewDbOptions();
+        await SeedControlSite(options);
+        EquityIssuer stock = await SeedStoredWebsite(
+            options,
+            "https://aaa.com/investors",
+            firstDeadReading: DateTime.UtcNow.AddDays(-2)
+        );
+        var bus = Substitute.For<IBus>();
+        var sut = BuildSut(
+            options,
+            [new StubSource(1, [])],
+            HttpStatusCode.NotFound,
+            bus: bus,
+            sidecar: Sidecar(StealthFetchResult.PageUnavailable, "https://aaa.com")
+        );
+
+        await sut.Import(CancellationToken.None);
+
+        using var ctx = NewContext(options);
+        (await ctx.Set<EquityIssuer>().SingleAsync(s => s.Id == stock.Id))
+            .Website.Should()
+            .Be("https://aaa.com");
+        await bus.Received(1).Publish(Arg.Any<StockWebsiteDiscovered>());
+    }
+
+    [Fact]
+    public async Task Liveness_ARetiredPathWhoseRootCannotBeRead_KeepsTheWebsite()
+    {
+        var options = NewDbOptions();
+        await SeedControlSite(options);
+        EquityIssuer stock = await SeedStoredWebsite(
+            options,
+            "https://aaa.com/investors",
+            firstDeadReading: DateTime.UtcNow.AddDays(-2)
+        );
+        var sidecar = Sidecar(StealthFetchResult.PageUnavailable);
+        sidecar
+            .TryFetchHtml("https://aaa.com", Arg.Any<CancellationToken>())
+            .Returns(StealthFetchResult.SidecarUnavailable);
+        var sut = BuildSut(
+            options,
+            [new StubSource(1, [])],
+            HttpStatusCode.NotFound,
+            sidecar: sidecar
+        );
+
+        await sut.Import(CancellationToken.None);
+
+        using var ctx = NewContext(options);
+        (await ctx.Set<EquityIssuer>().SingleAsync(s => s.Id == stock.Id))
+            .Website.Should()
+            .Be("https://aaa.com/investors");
+    }
+
+    [Fact]
+    public async Task Liveness_RenderTimeout_IsNoEvidenceAgainstTheSite()
+    {
+        var options = NewDbOptions();
+        EquityIssuer stock = await SeedStoredWebsite(
+            options,
+            "https://slow.example.com",
+            firstDeadReading: DateTime.UtcNow.AddDays(-2)
+        );
+        var sut = BuildSut(
+            options,
+            [new StubSource(1, [])],
+            HttpStatusCode.ServiceUnavailable,
+            sidecar: Sidecar(StealthFetchResult.SidecarUnavailable)
+        );
+
+        await sut.Import(CancellationToken.None);
+
+        using var ctx = NewContext(options);
+        var reloaded = await ctx.Set<EquityIssuer>().SingleAsync(s => s.Id == stock.Id);
+        reloaded.Website.Should().Be("https://slow.example.com");
+        reloaded.WebsiteRecheckProbeFailedAt.Should().BeNull();
+        reloaded.WebsiteLivenessCheckedAt.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task Liveness_AWholeBatchOfDeadSites_StillSettles()
+    {
+        var options = NewDbOptions();
+        await SeedControlSite(options);
+        var firstReading = DateTime.UtcNow.AddDays(-2);
+        for (var i = 0; i < 12; i++)
+            await SeedStoredWebsite(options, $"https://site{i}.example.com", firstReading, $"T{i}");
+        var sut = BuildSut(
+            options,
+            [new StubSource(1, [])],
+            HttpStatusCode.NotFound,
+            sidecar: Sidecar(StealthFetchResult.PageUnavailable)
+        );
+
+        await sut.Import(CancellationToken.None);
+
+        using var ctx = NewContext(options);
+        (await ctx.Set<EquityIssuer>().CountAsync(s => s.Website != null)).Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Liveness_WhileNoControlSiteRenders_SetsItsDeadReadingsAside()
+    {
+        var options = NewDbOptions();
+        await SeedControlSite(options);
+        EquityIssuer stock = await SeedStoredWebsite(
+            options,
+            "https://site.example.com",
+            firstDeadReading: DateTime.UtcNow.AddDays(-2)
+        );
+        var sidecar = Substitute.For<IStealthBrowserClient>();
+        sidecar.IsEnabled.Returns(true);
+        sidecar
+            .TryFetchHtml(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(StealthFetchResult.PageUnavailable);
+        var sut = BuildSut(
+            options,
+            [new StubSource(1, [])],
+            HttpStatusCode.NotFound,
+            sidecar: sidecar
+        );
+
+        await sut.Import(CancellationToken.None);
+
+        using var ctx = NewContext(options);
+        var reloaded = await ctx.Set<EquityIssuer>().SingleAsync(s => s.Id == stock.Id);
+        reloaded.Website.Should().Be("https://site.example.com");
+        reloaded.WebsiteRecheckProbeFailedAt.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task Liveness_WithoutASidecar_NeverClearsAWebsite()
+    {
+        var options = NewDbOptions();
+        EquityIssuer stock = await SeedStoredWebsite(
+            options,
+            "https://walled.example.com",
+            firstDeadReading: DateTime.UtcNow.AddDays(-2)
+        );
+
+        await BuildSut(options, [new StubSource(1, [])], HttpStatusCode.Forbidden)
+            .Import(CancellationToken.None);
+
+        using var ctx = NewContext(options);
+        (await ctx.Set<EquityIssuer>().SingleAsync(s => s.Id == stock.Id))
+            .Website.Should()
+            .Be("https://walled.example.com");
+    }
+
+    [Fact]
+    public async Task Recheck_RunsOneBatchPerCycle_AndNeverChainsTheWorker()
+    {
+        var options = NewDbOptions();
+        EquityIssuer large = await SeedStock(
+            options,
+            "AAA",
+            website: "https://www.aaa.com",
+            marketCap: 2e9
+        );
+        EquityIssuer small = await SeedStock(
+            options,
+            "BBB",
+            website: "https://www.bbb.com",
+            marketCap: 1e9
+        );
+
+        var more = await BuildSut(options, [new StubSource(10, [])], recheckBatchSize: 1)
+            .DiscoverBatch(CancellationToken.None);
+
+        more.Should().BeFalse("chaining would also re-run discovery's retries every few seconds");
+        (await Reload(options, large.Id))
+            .WebsiteDiscoveryVersion.Should()
+            .Be(WebsiteDiscoveryVersion.Current);
+        (await Reload(options, small.Id)).WebsiteDiscoveryVersion.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Recheck_SourceError_LeavesTheVersionForARetry()
+    {
+        var options = NewDbOptions();
+        EquityIssuer stock = await SeedStock(options, "AAA", website: "https://amazon.com");
+        var source = new StubSource(10, [], recheckFails: true);
+
+        await BuildSut(options, [source]).Import(CancellationToken.None);
+
+        EquityIssuer reloaded = await Reload(options, stock.Id);
+        reloaded.Website.Should().Be("https://amazon.com");
+        reloaded.WebsiteDiscoveryVersion.Should().Be(0);
+    }
+
     private sealed class StubSource : IWebsiteSource
     {
         private readonly Dictionary<string, string> _answers;
+        private readonly Dictionary<string, string> _replacements;
+        private readonly bool _recheckFails;
 
-        public StubSource(int priority, Dictionary<string, string> answers)
+        public StubSource(
+            int priority,
+            Dictionary<string, string> answers,
+            Dictionary<string, string> replacements = null,
+            bool recheckFails = false
+        )
         {
             Priority = priority;
             _answers = answers;
+            _replacements = replacements ?? [];
+            _recheckFails = recheckFails;
         }
 
         public List<string> SeenTickers { get; } = [];
+
+        public List<WebsiteSourceStock> RecheckedStocks { get; } = [];
 
         public List<WebsiteSourceStock> SeenStocks { get; } = [];
 
@@ -391,6 +890,20 @@ public class WebsiteDiscoveryServiceTests
             IReadOnlyDictionary<Guid, string> result = stocks
                 .Where(s => _answers.ContainsKey(s.Ticker))
                 .ToDictionary(s => s.Id, s => _answers[s.Ticker]);
+            return Task.FromResult(result);
+        }
+
+        public Task<IReadOnlyDictionary<Guid, string>> FindReplacements(
+            IReadOnlyList<WebsiteSourceStock> stocks,
+            CancellationToken cancellationToken
+        )
+        {
+            if (_recheckFails)
+                throw new InvalidOperationException("filings store down");
+            RecheckedStocks.AddRange(stocks);
+            IReadOnlyDictionary<Guid, string> result = stocks
+                .Where(s => _replacements.ContainsKey(s.Ticker))
+                .ToDictionary(s => s.Id, s => _replacements[s.Ticker]);
             return Task.FromResult(result);
         }
     }

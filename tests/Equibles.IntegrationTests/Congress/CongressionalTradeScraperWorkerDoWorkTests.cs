@@ -77,8 +77,16 @@ public class CongressionalTradeScraperWorkerDoWorkTests
             Substitute.For<ICongressMemberIdentityService>()
         );
 
+        var retirement = Substitute.For<CongressionalLegacyTradeRetirement>(null, null);
+        var amendmentResolver = Substitute.For<CongressionalTradeAmendmentResolver>(
+            null,
+            null,
+            null
+        );
         var workerScope = ServiceScopeSubstitute.Create(
-            (typeof(CongressionalTradeSyncService), syncService)
+            (typeof(CongressionalTradeSyncService), syncService),
+            (typeof(CongressionalTradeAmendmentResolver), amendmentResolver),
+            (typeof(CongressionalLegacyTradeRetirement), retirement)
         );
         var worker = new CongressionalTradeScraperWorker(
             Substitute.For<ILogger<CongressionalTradeScraperWorker>>(),
@@ -94,5 +102,7 @@ public class CongressionalTradeScraperWorkerDoWorkTests
         var act = async () => await (Task)doWork.Invoke(worker, [CancellationToken.None]);
 
         await act.Should().NotThrowAsync("an empty sync cycle must complete cleanly");
+        await amendmentResolver.Received(1).ResolvePending(Arg.Any<CancellationToken>());
+        await retirement.Received(1).RetireSuperseded(Arg.Any<CancellationToken>());
     }
 }

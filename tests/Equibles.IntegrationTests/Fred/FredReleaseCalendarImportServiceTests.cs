@@ -69,6 +69,27 @@ public class FredReleaseCalendarImportServiceTests : IDisposable
             );
     }
 
+    // FRED knows no such release: asking would fail, and re-stamping would reset its curated tier to Low.
+    [Fact]
+    public async Task Import_ACanadianRelease_IsLeftToItsOwnImporter()
+    {
+        var bank = new FredRelease
+        {
+            CountryCode = "CA",
+            Source = IndicatorSource.BankOfCanada,
+            SourceKey = "Interest rate announcement",
+            Name = "Interest rate announcement",
+            Importance = FredReleaseImportance.High,
+        };
+        _releaseRepo.Add(bank);
+        await _releaseRepo.SaveChanges();
+
+        await _sut.Import(CancellationToken.None);
+
+        bank.Importance.Should().Be(FredReleaseImportance.High);
+        await _fredClient.DidNotReceive().GetReleaseDates(Arg.Any<int>(), Arg.Any<DateOnly?>());
+    }
+
     [Fact]
     public async Task Import_TwoSeriesSharingARelease_CreatesOneReleaseAndKeepsOnlyTrackedDates()
     {
@@ -140,6 +161,55 @@ public class FredReleaseCalendarImportServiceTests : IDisposable
             .Should()
             .BeEquivalentTo([new DateOnly(2026, 6, 11), new DateOnly(2026, 7, 14)]);
         dates.Should().OnlyContain(d => d.FredReleaseId == releases[0].Id);
+    }
+
+    // Only US FRED series are linked to the calendar: FRED is never asked about another
+    // publisher's id, which it would refuse and so end the cycle before any date imports.
+    [Fact]
+    public async Task Import_SeriesOutsideTheUsFredCalendar_AreNeverLinked()
+    {
+        _seriesRepo.Add(new FredSeries { SeriesId = "CPIAUCSL", Title = "CPI All Items" });
+        _seriesRepo.Add(
+            new FredSeries
+            {
+                SeriesId = "BOC-V39079",
+                Title = "Bank of Canada Target for the Overnight Rate",
+                CountryCode = "CA",
+                Source = IndicatorSource.BankOfCanada,
+                SourceKey = "V39079",
+            }
+        );
+        _seriesRepo.Add(
+            new FredSeries
+            {
+                SeriesId = "QCAR628BIS",
+                Title = "Real Residential Property Prices for Canada",
+                CountryCode = "CA",
+            }
+        );
+        await _seriesRepo.SaveChanges();
+        var cpiRelease = new FredReleaseRecord
+        {
+            Id = 10,
+            Name = "Consumer Price Index",
+            PressRelease = true,
+        };
+        _fredClient.GetSeriesRelease("CPIAUCSL").Returns(Task.FromResult(cpiRelease));
+        SetupReleaseDates(
+            new FredReleaseDateRecord
+            {
+                ReleaseId = 10,
+                ReleaseName = "Consumer Price Index",
+                Date = "2026-11-13",
+            }
+        );
+
+        await _sut.Import(CancellationToken.None);
+
+        await _fredClient.Received(1).GetSeriesRelease("CPIAUCSL");
+        await _fredClient.DidNotReceive().GetSeriesRelease("BOC-V39079");
+        await _fredClient.DidNotReceive().GetSeriesRelease("QCAR628BIS");
+        _dateRepo.GetAll().Select(d => d.Date).Should().Equal(new DateOnly(2026, 11, 13));
     }
 
     [Fact]

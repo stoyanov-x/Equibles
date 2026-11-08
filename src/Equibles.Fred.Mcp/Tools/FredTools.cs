@@ -40,7 +40,7 @@ public class FredTools
         ReadOnly = true
     )]
     [Description(
-        "Get time series data for a FRED economic indicator. Returns historical observations for indicators like FEDFUNDS (fed funds rate), CPIAUCSL (CPI inflation), UNRATE (unemployment), GDP, T10Y2Y (yield spread), VIXCLS (VIX), SP500, MORTGAGE30US, M2SL (money supply), and more. Covers the curated ~40-series set Equibles tracks, not the full FRED catalog — use SearchEconomicIndicators to find available series."
+        "Get time series data for a FRED economic indicator. Returns historical observations for indicators like FEDFUNDS (fed funds rate), CPIAUCSL (CPI inflation), UNRATE (unemployment), GDP, T10Y2Y (yield spread), VIXCLS (VIX), SP500, MORTGAGE30US, M2SL (money supply), and more. Covers the curated set Equibles tracks, not the full FRED catalog, including Canadian series from the Bank of Canada (BOC-V39079 policy rate, CORRA, 2- and 10-year bond yields) and Statistics Canada (STATCAN-V41690973 CPI, CPI-trim and CPI-median, unemployment, employment, real GDP) — use SearchEconomicIndicators to find available series."
     )]
     public Task<string> GetEconomicIndicator(
         [Description(
@@ -100,7 +100,8 @@ public class FredTools
                     observations.OrderBy(o => o.Date).ToList(),
                     $"No observations found for {series.SeriesId} ({series.Title}) in the specified date range.",
                     $"{series.Title} ({series.SeriesId})",
-                    $"Units: {series.Units} | Frequency: {series.Frequency} | Seasonal Adj: {series.SeasonalAdjustment}",
+                    $"Units: {series.Units} | Frequency: {series.Frequency} | Seasonal Adj: {series.SeasonalAdjustment}"
+                        + SourceNote(series),
                     "| Date | Value |",
                     "|------|-------|",
                     obs =>
@@ -140,19 +141,39 @@ public class FredTools
         ReadOnly = true
     )]
     [Description(
-        "Get the latest values for key economic indicators across categories: interest rates, yield spreads, inflation, employment, GDP, money supply, sentiment, housing, exchange rates, and market indicators. Each row shows a series' latest stored observation with its date, plus the previous observation and the change between them for direction — check the Latest Date column for freshness. Returns a snapshot of current macro conditions."
+        "Get the latest values for key economic indicators across categories: interest rates, yield spreads, inflation, employment, GDP, money supply, sentiment, housing, exchange rates, and market indicators. Each row shows a series' latest stored observation with its date, plus the previous observation and the change between them for direction — check the Latest Date column for freshness. Returns a snapshot of current macro conditions for one country: the United States by default, or Canada with country=CA."
     )]
     public Task<string> GetLatestEconomicIndicators(
         [Description(
             "Category filter: InterestRates, YieldSpreads, CorporateBondSpreads, Inflation, Employment, GdpAndOutput, MoneySupply, Sentiment, Housing, ExchangeRates, Market (defaults to all)"
         )]
-            string category = null
+            string category = null,
+        [Description(
+            "Country as an ISO code: US (default) or CA. A snapshot never mixes two countries' series."
+        )]
+            string country = "US"
     )
     {
         return _runner.Execute(
             async () =>
             {
                 IQueryable<FredSeries> seriesQuery;
+                var countryCode = string.IsNullOrWhiteSpace(country)
+                    ? "US"
+                    : country.Trim().ToUpperInvariant();
+                var countries = await _seriesRepository
+                    .GetAll()
+                    .Select(s => s.CountryCode)
+                    .Distinct()
+                    .ToListAsync();
+                if (countryCode != "US" && !countries.Contains(countryCode))
+                {
+                    return McpOutput.InvalidArgument(
+                        "country",
+                        country,
+                        string.Join(", ", countries.Order(StringComparer.Ordinal))
+                    );
+                }
 
                 if (!string.IsNullOrWhiteSpace(category))
                 {
@@ -186,6 +207,7 @@ public class FredTools
                 }
 
                 var allSeries = await seriesQuery
+                    .Where(s => s.CountryCode == countryCode)
                     .OrderBy(s => s.Category)
                     .ThenBy(s => s.SeriesId)
                     .ToListAsync();
@@ -202,7 +224,9 @@ public class FredTools
                     .ToDictionaryAsync(o => o.FredSeriesId);
 
                 var result = MarkdownTable.Start(
-                    "Latest Economic Indicators:",
+                    countryCode == "US"
+                        ? "Latest Economic Indicators:"
+                        : $"Latest Economic Indicators ({countryCode}):",
                     "| Series | Title | Latest Date | Value | Previous | Change | Units |",
                     "|--------|-------|-------------|-------|----------|--------|-------|"
                 );
@@ -251,7 +275,7 @@ public class FredTools
         ReadOnly = true
     )]
     [Description(
-        "Search the curated set of ~40 US macro FRED series Equibles tracks (rates, inflation, employment, GDP, housing, market indicators) — not the full FRED catalog. Search first requires every punctuation-independent query word anywhere across the series ID, title, or category, then broadens to any word only when that strict search has no rows. Standard names such as fed funds rate, jobless claims, payrolls, yield curve, and core CPI are recognized. An empty query lists every tracked series. Results include seasonal adjustment, the latest observation date, and the UTC time Equibles last synced the series."
+        "Search the curated set of US macro series from FRED and Canadian series from FRED, the Bank of Canada and Statistics Canada that Equibles tracks (rates, inflation, employment, GDP, housing, market indicators) — not the full FRED catalog. Search first requires every punctuation-independent query word anywhere across the series ID, title, or category, then broadens to any word only when that strict search has no rows. Standard names such as fed funds rate, jobless claims, payrolls, yield curve, and core CPI are recognized. An empty query lists every tracked series. Results include seasonal adjustment, the latest observation date, and the UTC time Equibles last synced the series."
     )]
     public Task<string> SearchEconomicIndicators(
         [Description(
@@ -269,8 +293,11 @@ public class FredTools
 
                 var matches = _seriesRepository.Search(query);
                 var total = await matches.CountAsync();
+                // US series list first, so a capped search keeps the rows it returned before
+                // Canadian series joined the set; Canada's follow within the same cap.
                 var series = await matches
-                    .OrderBy(s => s.Category)
+                    .OrderBy(s => s.CountryCode != "US")
+                    .ThenBy(s => s.Category)
                     .ThenBy(s => s.SeriesId)
                     .Take(maxResults)
                     .ToListAsync();
@@ -281,7 +308,7 @@ public class FredTools
 
                 var table = MarkdownTable.Render(
                     series,
-                    $"No match for '{query}' in the tracked, curated ~40-series US macro set. This result describes only the tracked set, not whether FRED publishes such a series. Try fewer words, a category name, or an empty query to list every tracked series.",
+                    $"No match for '{query}' in the tracked, curated US and Canadian macro set. This result describes only the tracked set, not whether FRED publishes such a series. Try fewer words, a category name, or an empty query to list every tracked series.",
                     title,
                     // Seasonal adjustment decides whether two series are even comparable. The
                     // ObservationEnd dates the newest data point; LastUpdated is the separate
@@ -315,7 +342,7 @@ public class FredTools
         ReadOnly = true
     )]
     [Description(
-        "Get the economic release calendar — scheduled (upcoming) and recent publication dates of US macro data releases, with the FRED series each release updates and an importance tier per release (High = the tier-1 scheduled market movers: CPI, PPI, Employment Situation, GDP, PCE, retail sales; Medium = other genuine scheduled prints; Low = daily rate/market levels like SOFR or VIX). FOMC meetings are NOT included — FRED's release feed has no real FOMC meeting dates; use the Federal Reserve's published meeting calendar for those. Defaults to the next 30 days. Use minImportance=high to see only the market movers, and GetEconomicIndicator to fetch a series' data after it prints."
+        "Get the economic release calendar — scheduled (upcoming) and recent publication dates of US and Canadian macro data releases, each row naming its market, with the FRED series each release updates and an importance tier per release (High = the tier-1 scheduled market movers: CPI, PPI, Employment Situation, GDP, PCE, retail sales; Medium = other genuine scheduled prints; Low = daily rate/market levels like SOFR or VIX). FOMC meetings are NOT included — FRED's release feed has no real FOMC meeting dates; use the Federal Reserve's published meeting calendar for those. Defaults to the next 30 days. Use minImportance=high to see only the market movers, and GetEconomicIndicator to fetch a series' data after it prints."
     )]
     public Task<string> GetEconomicCalendar(
         [Description("Start date in YYYY-MM-DD format (defaults to today, UTC)")]
@@ -329,7 +356,9 @@ public class FredTools
         [Description(
             "Maximum number of release dates to return (default: 100, max: 500, chronological)"
         )]
-            int maxResults = 100
+            int maxResults = 100,
+        [Description("Market country code, US or CA (defaults to every market)")]
+            string country = null
     )
     {
         return _runner.Execute(
@@ -380,6 +409,25 @@ public class FredTools
                 var inRange = _releaseDateRepository
                     .GetInRange(start, end)
                     .Where(d => d.FredRelease.Importance >= minTier);
+                if (!string.IsNullOrWhiteSpace(country))
+                {
+                    // Like minImportance: "Canada" must surface, not read as a factual "no releases".
+                    var countryCode = country.Trim().ToUpperInvariant();
+                    var countries = await _releaseDateRepository
+                        .GetAll()
+                        .Select(d => d.FredRelease.CountryCode)
+                        .Distinct()
+                        .ToListAsync();
+                    if (countryCode != "US" && !countries.Contains(countryCode))
+                    {
+                        return McpOutput.InvalidArgument(
+                            "country",
+                            country,
+                            string.Join(", ", countries.Order(StringComparer.Ordinal))
+                        );
+                    }
+                    inRange = inRange.Where(d => d.FredRelease.CountryCode == countryCode);
+                }
 
                 var total = await inRange.CountAsync();
 
@@ -391,7 +439,9 @@ public class FredTools
                     .Select(d => new
                     {
                         d.Date,
+                        d.FredRelease.CountryCode,
                         ReleaseName = d.FredRelease.Name,
+                        d.ReferencePeriod,
                         d.FredRelease.Importance,
                         Series = d
                             .FredRelease.Series.OrderBy(s => s.SeriesId)
@@ -413,10 +463,10 @@ public class FredTools
                     entries,
                     $"No economic releases between {start:yyyy-MM-dd} and {end:yyyy-MM-dd}.",
                     title,
-                    "| Date | Release | Importance | Series Updated |",
-                    "|------|---------|------------|----------------|",
+                    "| Date | Market | Release | Period | Importance | Series Updated |",
+                    "|------|--------|---------|--------|------------|----------------|",
                     e =>
-                        $"| {e.Date:yyyy-MM-dd} | {e.ReleaseName} | {e.Importance} | {string.Join(", ", e.Series)} |"
+                        $"| {e.Date:yyyy-MM-dd} | {e.CountryCode} | {e.ReleaseName} | {e.ReferencePeriod} | {e.Importance} | {string.Join(", ", e.Series)} |"
                 );
 
                 if (truncated)
@@ -430,7 +480,21 @@ public class FredTools
                 return table;
             },
             "GetEconomicCalendar",
-            $"startDate: {startDate}, endDate: {endDate}, minImportance: {minImportance}"
+            $"startDate: {startDate}, endDate: {endDate}, minImportance: {minImportance}, country: {country}"
         );
     }
+
+    // A series from another country or publisher says so beside its units; a US FRED series reads as before.
+    private static string SourceNote(FredSeries series) =>
+        series.CountryCode == "US" && series.Source == IndicatorSource.Fred
+            ? ""
+            : $" | Country: {series.CountryCode} | Source: {SourceName(series.Source)}";
+
+    private static string SourceName(IndicatorSource source) =>
+        source switch
+        {
+            IndicatorSource.BankOfCanada => "Bank of Canada",
+            IndicatorSource.StatisticsCanada => "Statistics Canada",
+            _ => "FRED",
+        };
 }

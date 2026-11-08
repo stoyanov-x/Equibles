@@ -15,7 +15,7 @@ public class CongressionalTradeReplayGateTests
     [InlineData(House, true, false, 4)]
     [InlineData(House, true, true, 4)]
     [InlineData(House, false, true, 4)]
-    [InlineData(House, false, false, 9)]
+    [InlineData(House, false, false, 10)]
     [InlineData(Senate, true, false, 4)]
     [InlineData(Senate, false, true, 4)]
     [InlineData(Senate, false, false, 6)]
@@ -46,26 +46,6 @@ public class CongressionalTradeReplayGateTests
         message.Should().Contain("2 transaction rows could not be parsed");
         message.Should().Contain("(3 parsed)");
         message.Should().Contain("parser version 7");
-    }
-
-    [Fact]
-    public void DescribeRowDatedAfterFiling_NamesTheRowAndBothDates()
-    {
-        var message = CongressionalTradeSyncService.DescribeRowDatedAfterFiling(
-            new CongressionalTradeSyncService.TradeDatedAfterFiling(
-                House,
-                "20018672",
-                6,
-                new DateOnly(3031, 4, 30),
-                new DateOnly(2021, 5, 3)
-            ),
-            7
-        );
-
-        message.Should().Contain("20018672 row 6");
-        message.Should().Contain("transaction date 3031-04-30");
-        message.Should().Contain("filing date 2021-05-03");
-        message.Should().Contain("not stored");
     }
 
     [Fact]

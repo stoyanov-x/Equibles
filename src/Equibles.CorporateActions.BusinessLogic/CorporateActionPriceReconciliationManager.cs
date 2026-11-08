@@ -2,6 +2,7 @@ using System.Data;
 using Equibles.CommonStocks.Data.Models;
 using Equibles.CommonStocks.Repositories;
 using Equibles.Core.AutoWiring;
+using Equibles.CorporateActions.Data;
 using Equibles.CorporateActions.Data.Models;
 using Equibles.CorporateActions.Repositories;
 using Microsoft.EntityFrameworkCore;
@@ -38,9 +39,22 @@ public class CorporateActionPriceReconciliationManager
     /// Actions stay pending through their effective date so the provider history is not stamped
     /// before that session has settled and incorporated the adjustment.
     /// </summary>
+    public Task<PendingPriceReconciliationSelection> SelectPendingSeries(
+        int maxPerCycle,
+        DateOnly settledBefore,
+        CancellationToken cancellationToken = default
+    ) => SelectPendingSeries(maxPerCycle, settledBefore, DateOnly.MinValue, cancellationToken);
+
+    /// <summary>
+    /// As above, for a reconciler whose history fetch starts at <paramref name="historyFloor"/>: a
+    /// dividend on or before it is never selected, as that fetch can neither serve it nor adjust a
+    /// bar before it, so each such payment would cost a fetch to settle nothing. A lowered floor
+    /// admits it again.
+    /// </summary>
     public async Task<PendingPriceReconciliationSelection> SelectPendingSeries(
         int maxPerCycle,
         DateOnly settledBefore,
+        DateOnly historyFloor,
         CancellationToken cancellationToken = default
     )
     {
@@ -50,7 +64,7 @@ public class CorporateActionPriceReconciliationManager
         );
         var cursor = await GetCursorForUpdate(cancellationToken);
         var splits = await LoadPendingSplits(settledBefore, cancellationToken);
-        var dividends = await LoadPendingDividends(settledBefore, cancellationToken);
+        var dividends = await LoadPendingDividends(settledBefore, historyFloor, cancellationToken);
         var pendingSeries = splits
             .Keys.Concat(dividends.Keys)
             .Distinct()
@@ -147,7 +161,8 @@ public class CorporateActionPriceReconciliationManager
         IReadOnlyCollection<CapturedDividend> priceSeriesDividends,
         DateOnly settledBefore,
         DateTime appliedTime,
-        CancellationToken cancellationToken = default
+        CancellationToken cancellationToken = default,
+        DateOnly? servedThrough = null
     )
     {
         return StampAppliedCore(
@@ -156,7 +171,8 @@ public class CorporateActionPriceReconciliationManager
             true,
             settledBefore,
             appliedTime,
-            cancellationToken
+            cancellationToken,
+            servedThrough: servedThrough
         );
     }
 
@@ -167,7 +183,8 @@ public class CorporateActionPriceReconciliationManager
         DateTime appliedTime,
         Guid historicalListingId,
         DateOnly expectedDelistedOn,
-        CancellationToken cancellationToken = default
+        CancellationToken cancellationToken = default,
+        DateOnly? servedThrough = null
     )
     {
         return StampAppliedCore(
@@ -178,7 +195,8 @@ public class CorporateActionPriceReconciliationManager
             appliedTime,
             cancellationToken,
             expectedDelistedOn: expectedDelistedOn,
-            expectedHistoricalListingId: historicalListingId
+            expectedHistoricalListingId: historicalListingId,
+            servedThrough: servedThrough
         );
     }
 
@@ -194,7 +212,8 @@ public class CorporateActionPriceReconciliationManager
         DateTime appliedTime,
         bool expectedActive,
         DateOnly? expectedDelistedOn,
-        CancellationToken cancellationToken = default
+        CancellationToken cancellationToken = default,
+        DateOnly? servedThrough = null
     )
     {
         return StampAppliedCore(
@@ -205,7 +224,8 @@ public class CorporateActionPriceReconciliationManager
             appliedTime,
             cancellationToken,
             expectedActive,
-            expectedDelistedOn
+            expectedDelistedOn,
+            servedThrough: servedThrough
         );
     }
 
@@ -255,7 +275,8 @@ public class CorporateActionPriceReconciliationManager
         CancellationToken cancellationToken,
         bool? expectedActive = null,
         DateOnly? expectedDelistedOn = null,
-        Guid? expectedHistoricalListingId = null
+        Guid? expectedHistoricalListingId = null,
+        DateOnly? servedThrough = null
     )
     {
         await using var transaction = await _stockRepository.CreateTransaction(
@@ -315,9 +336,20 @@ public class CorporateActionPriceReconciliationManager
             )
             : await LoadUnchangedDividends(selectedSeries, cancellationToken);
         ApplyMarkers(unchangedSplits, dividendsToStamp, appliedTime);
+        var unserved =
+            requirePriceSeriesDividendMatch && servedThrough is { } served
+                ? await LoadUnservedDividends(
+                    selectedSeries,
+                    dividendsToStamp,
+                    served,
+                    cancellationToken
+                )
+                : [];
+        foreach (var dividend in unserved)
+            dividend.PriceAdjustmentUnservedTime = appliedTime;
 
         var stamped = unchangedSplits.Count + dividendsToStamp.Count;
-        if (stamped > 0)
+        if (stamped > 0 || unserved.Count > 0)
             await _stockRepository.SaveChanges();
 
         await transaction.CommitAsync(cancellationToken);
@@ -370,7 +402,11 @@ public class CorporateActionPriceReconciliationManager
 
     private async Task<
         Dictionary<PriceReconciliationKey, IReadOnlyList<PendingDividendSnapshot>>
-    > LoadPendingDividends(DateOnly settledBefore, CancellationToken cancellationToken)
+    > LoadPendingDividends(
+        DateOnly settledBefore,
+        DateOnly historyFloor,
+        CancellationToken cancellationToken
+    )
     {
         var rows = await _dividendRepository
             .GetPendingPriceAdjustment()
@@ -378,6 +414,8 @@ public class CorporateActionPriceReconciliationManager
                 dividend.EquityListingId != null
                 && dividend.Currency != null
                 && dividend.ExDate < settledBefore
+                && dividend.ExDate > historyFloor
+                && dividend.PriceAdjustmentUnservedTime == null
             )
             .Select(dividend => new
             {
@@ -515,6 +553,26 @@ public class CorporateActionPriceReconciliationManager
             .ToList();
     }
 
+    // A selected dividend the provider's replacement left out although it served bars past the
+    // same-event window after its ex-date: refetching the same provider only repeats that answer.
+    // A dividend a source has only just announced is left pending, since providers list it days late.
+    private async Task<List<CashDividend>> LoadUnservedDividends(
+        PendingPriceReconciliationSeries selectedSeries,
+        IReadOnlyCollection<CashDividend> stamped,
+        DateOnly servedThrough,
+        CancellationToken cancellationToken
+    )
+    {
+        var stampedIds = stamped.Select(dividend => dividend.Id).ToHashSet();
+        return (await LoadUnchangedDividends(selectedSeries, cancellationToken))
+            .Where(dividend =>
+                !stampedIds.Contains(dividend.Id)
+                && dividend.PriceAdjustmentUnservedTime == null
+                && dividend.ExDate.AddDays(SplitEvents.SameEventWindowDays) <= servedThrough
+            )
+            .ToList();
+    }
+
     private static void ApplyMarkers(
         IReadOnlyCollection<StockSplit> splits,
         IReadOnlyCollection<CashDividend> dividends,
@@ -528,6 +586,7 @@ public class CorporateActionPriceReconciliationManager
         {
             dividend.PriceAdjustmentAppliedAmountPerShare = dividend.AmountPerShare;
             dividend.PriceAdjustmentAppliedTime = appliedTime;
+            dividend.PriceAdjustmentUnservedTime = null;
         }
     }
 }

@@ -21,4 +21,18 @@ public enum StockHolderRowFlags
 
     /// <summary>The ownership summary does not add this row's shares.</summary>
     NotSummed = 1 << 3,
+
+    /// <summary>
+    /// A 13D or 13G with shares whose event date is older than
+    /// <see cref="Schedule13DGStatus.UnconfirmedMonths"/>. The schedule stays in force until amended
+    /// and no amendment is due without a material change, so the row stays visible and summed,
+    /// labelled with its last confirmed date.
+    /// </summary>
+    Unconfirmed = 1 << 4,
+
+    /// <summary>
+    /// A non-US notification's percentage is of one class of shares, not of the issuer's voting
+    /// rights; the two differ for an issuer with several classes.
+    /// </summary>
+    PercentOfClass = 1 << 5,
 }

@@ -1,3 +1,4 @@
+using Equibles.CommonStocks.Data.Models;
 using Equibles.EquityMarkets.BusinessLogic.Directory;
 using Equibles.EquityMarkets.Data.Catalog;
 using Equibles.EquityMarkets.Data.Models;
@@ -87,6 +88,194 @@ public class EquityMarketDirectoryGateTests
         var gate = () =>
             EquityMarketDirectoryGate.IsHomeShare(null, row, Firds("XPAR", "XPAR", "FR"));
         gate.Should().Throw<ArgumentNullException>();
+    }
+
+    [Fact]
+    public void IsHomeShare_TakesTheIssuerRequestedLineWhenFirdsHomesTheShareOnAVenueTheIssuerNeverSought()
+    {
+        // A new Madrid ISIN that a German venue traded first: FIRDS homes it there, the issuer sought only Madrid.
+        var market = EquityMarketCatalog.TryGet("bme");
+        var row = Row("XMAD", null);
+        var firds = Line("XMAD", "EQTB", true, "DE");
+        List<FirdsInstrumentRecord> lines =
+        [
+            firds,
+            Line("DMAD", "EQTB", true, "DE"),
+            Line("EQTB", "EQTB", false, "DE"),
+            Line("DUSB", "EQTB", false, "DE"),
+        ];
+
+        EquityMarketDirectoryGate.IsHomeShare(market, row, firds).Should().BeFalse();
+        EquityMarketDirectoryGate.IsHomeShare(market, row, firds, lines).Should().BeTrue();
+        EquityMarketDirectoryGate
+            .IsHomeShare(market, Row("XMAD", "XMAD"), firds, lines)
+            .Should()
+            .BeTrue();
+        EquityMarketDirectoryGate
+            .IsHomeShare(EquityMarketCatalog.TryGet("xetra"), Row("XETR", null), firds, lines)
+            .Should()
+            .BeFalse("the share has no line on Xetra's own venues");
+
+        var unflagged = Line("DMAD", "EQTB", null, "DE");
+        EquityMarketDirectoryGate
+            .IsHomeShare(
+                market,
+                row,
+                unflagged,
+                [unflagged, firds, Line("EQTB", "EQTB", false, "DE")]
+            )
+            .Should()
+            .BeTrue(
+                "any line the issuer sought on the market grants it, not only the one looked up first"
+            );
+        EquityMarketDirectoryGate
+            .IsHomeShare(market, row, firds, [.. lines, Line("XETB", "EQTB", false, "DE")])
+            .Should()
+            .BeTrue("Xetra homes a share only where the issuer sought a German admission");
+    }
+
+    [Theory]
+    [InlineData("CA03753D1042")]
+    [InlineData("US0378331005")]
+    [InlineData("JP3633400001")]
+    public void IsHomeShare_LeavesTheRequestRuleToSharesIssuedWhereFirdsSeesEveryHome(string isin)
+    {
+        // A Canadian issuer's requested Paris line may be secondary to a Toronto home that no FIRDS register reports.
+        var market = EquityMarketCatalog.TryGet("euronext-paris");
+        var row = Row("ALXP", null);
+        var firds = Line("ALXP", "FRAB", true, "DE");
+        var unsought = Line("FRAB", "FRAB", false, "DE");
+        EquityMarketDirectoryGate
+            .IsHomeShare(market, row, firds, [firds, unsought])
+            .Should()
+            .BeTrue();
+
+        row.Isin = isin;
+        firds.Isin = isin;
+        unsought.Isin = isin;
+        EquityMarketDirectoryGate
+            .IsHomeShare(market, row, firds, [firds, unsought])
+            .Should()
+            .BeFalse();
+    }
+
+    [Fact]
+    public void IsHomeShare_AdmitsAGrowthTransferWhoseRelevantVenueIsAnUnsoughtMtf()
+    {
+        var market = EquityMarketCatalog.TryGet("euronext-paris");
+        var firds = Line("ALXP", "SGMU", true, "FR");
+        List<FirdsInstrumentRecord> lines = [firds, Line("SGMU", "SGMU", false, "FR")];
+
+        EquityMarketDirectoryGate.IsHomeShare(market, Row("ALXP", null), firds).Should().BeFalse();
+        EquityMarketDirectoryGate
+            .IsHomeShare(market, Row("ALXP", null), firds, lines)
+            .Should()
+            .BeTrue();
+    }
+
+    [Fact]
+    public void IsHomeShare_LeavesTheRequestRuleWhenAnotherHomeIsPossible()
+    {
+        var market = EquityMarketCatalog.TryGet("euronext-paris");
+        var row = Row("ALXP", null);
+        var firds = Line("ALXP", "SGMU", true, "FR");
+        var unsought = Line("SGMU", "SGMU", false, "FR");
+        bool Gate(params FirdsInstrumentRecord[] others) =>
+            EquityMarketDirectoryGate.IsHomeShare(market, row, firds, [firds, .. others]);
+
+        Gate(unsought).Should().BeTrue();
+        Gate(unsought, Line("XMAD", "SGMU", true, "FR"))
+            .Should()
+            .BeFalse("the issuer also sought Madrid, so Paris is not its only home");
+        Gate(unsought, Line("XMAD", "SGMU", null, "FR"))
+            .Should()
+            .BeFalse("an unknown flag elsewhere counts as sought");
+        Gate(Line("SGMU", "SGMU", null, "FR"))
+            .Should()
+            .BeFalse("the relevant line's flag is unknown");
+        Gate(Line("SGMU", "SGMU", true, "FR"))
+            .Should()
+            .BeFalse("the issuer sought the relevant venue");
+        Gate().Should().BeFalse("FIRDS states no line on the relevant venue");
+
+        var firstNorth = Line("ALXP", "FNSE", true, "SE");
+        EquityMarketDirectoryGate
+            .IsHomeShare(market, row, firstNorth, [firstNorth, Line("FNSE", "FNSE", false, "SE")])
+            .Should()
+            .BeFalse("Stockholm homes the share through its own First North line");
+
+        var london = Line("XLON", "XLON", true, "GB");
+        london.Authority = "FCA";
+        Gate(unsought, london).Should().BeFalse("the FCA register homes the share in London");
+
+        var unknownHere = Line("ALXP", "SGMU", null, "FR");
+        EquityMarketDirectoryGate
+            .IsHomeShare(market, row, unknownHere, [unknownHere, unsought])
+            .Should()
+            .BeFalse("only an explicit request grants a home");
+    }
+
+    [Theory]
+    [InlineData("CEOGES", true)]
+    [InlineData("EYAYFT", true)]
+    [InlineData("ESVUFR", false)]
+    [InlineData("CIOGES", false)]
+    public void ProductLine_IsAnyLiveFundOrNoteLineOnTheMarketWhateverItsHomeVenue(
+        string cfi,
+        bool admitted
+    )
+    {
+        var xetra = EquityMarketCatalog.TryGet("xetra");
+        var row = Row("XETR", statedPrimaryMarket: "XLON");
+        var firds = Firds("XETA", relevantVenue: "XLON", authority: "IE");
+        firds.Cfi = cfi;
+
+        EquityMarketDirectoryGate
+            .IsExchangeTradedProductLine(xetra, row, firds)
+            .Should()
+            .Be(admitted);
+    }
+
+    [Fact]
+    public void ProductLine_RefusesALineOfAnotherMarketOrAnotherSecurity()
+    {
+        var xetra = EquityMarketCatalog.TryGet("xetra");
+        var firds = Firds("XETA", relevantVenue: "XLON", authority: "IE");
+        firds.Cfi = "CEOGES";
+
+        EquityMarketDirectoryGate
+            .IsExchangeTradedProductLine(xetra, Row("XPAR", null), firds)
+            .Should()
+            .BeFalse();
+        firds.Isin = "IE00B5BMR087";
+        EquityMarketDirectoryGate
+            .IsExchangeTradedProductLine(xetra, Row("XETR", null), firds)
+            .Should()
+            .BeFalse();
+        EquityMarketDirectoryGate
+            .IsExchangeTradedProductLine(xetra, Row("XETR", null), null)
+            .Should()
+            .BeFalse();
+    }
+
+    [Theory]
+    [InlineData("CEOGES", EquitySecurityKind.ExchangeTradedFund)]
+    [InlineData("EYAYFT", EquitySecurityKind.ExchangeTradedNote)]
+    [InlineData("ESVUFR", null)]
+    [InlineData(null, null)]
+    public void ProductKind_ComesFromTheCfiAlone(string cfi, EquitySecurityKind? kind) =>
+        EquityMarketDirectoryGate.ProductKind(cfi).Should().Be(kind);
+
+    private static FirdsInstrumentRecord Line(
+        string mic,
+        string relevantVenue,
+        bool? issuerRequested,
+        string authority
+    )
+    {
+        var line = Firds(mic, relevantVenue, authority);
+        line.IssuerRequested = issuerRequested;
+        return line;
     }
 
     private static EquityMarketDirectoryRow Row(string mic, string statedPrimaryMarket) =>

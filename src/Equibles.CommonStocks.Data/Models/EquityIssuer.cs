@@ -36,6 +36,24 @@ public class EquityIssuer
     public string Website { get; set; }
 
     public DateTime? WebsiteCheckedAt { get; set; }
+
+    /// <summary>
+    /// Website discovery rules version that last judged <see cref="Website"/>; an older value
+    /// queues the stored website for its sources to re-check under their current rules.
+    /// </summary>
+    public int WebsiteDiscoveryVersion { get; set; }
+
+    /// <summary>
+    /// When a re-check's replacement website first failed the reachability probe; the stock
+    /// is re-checked once more a day later, since a probe that could not run reads as a dead site.
+    /// </summary>
+    public DateTime? WebsiteRecheckProbeFailedAt { get; set; }
+
+    /// <summary>
+    /// When the stored website was last probed for liveness. Kept apart from
+    /// <see cref="WebsiteCheckedAt"/>, which IR discovery reads as a new website to act on.
+    /// </summary>
+    public DateTime? WebsiteLivenessCheckedAt { get; set; }
     public int? FiscalYearEndMonth { get; set; }
     public int? FiscalYearEndDay { get; set; }
 

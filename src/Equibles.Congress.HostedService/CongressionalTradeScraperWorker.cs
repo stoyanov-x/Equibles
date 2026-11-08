@@ -23,6 +23,12 @@ public class CongressionalTradeScraperWorker : BaseScraperWorker
         await using var scope = ScopeFactory.CreateAsyncScope();
         var syncService = scope.ServiceProvider.GetRequiredService<CongressionalTradeSyncService>();
         await syncService.SyncAll(stoppingToken);
+        await scope
+            .ServiceProvider.GetRequiredService<CongressionalTradeAmendmentResolver>()
+            .ResolvePending(stoppingToken);
+        await scope
+            .ServiceProvider.GetRequiredService<CongressionalLegacyTradeRetirement>()
+            .RetireSuperseded(stoppingToken);
         Logger.LogInformation("Congressional trade sync completed");
     }
 }

@@ -31,6 +31,15 @@ public class CashDividend
 
     public decimal AmountPerShare { get; set; }
 
+    /// <summary>
+    /// The record and payment dates the issuer declared, where the capturing source states them
+    /// (an exchange's dividend record does; a price feed's adjustment history does not). Null is
+    /// unstated, never "none".
+    /// </summary>
+    public DateOnly? RecordDate { get; set; }
+
+    public DateOnly? PaymentDate { get; set; }
+
     public CashDividendSource Source { get; set; }
 
     public DateTime CreationTime { get; set; } = DateTime.UtcNow;
@@ -47,4 +56,10 @@ public class CashDividend
     /// captured listing's price series.
     /// </summary>
     public DateTime? PriceAdjustmentAppliedTime { get; set; }
+
+    /// <summary>
+    /// When a full provider-history replacement served bars well past this dividend's ex-date
+    /// without it. The dividend stays unapplied but stops queueing reconciliation until it changes.
+    /// </summary>
+    public DateTime? PriceAdjustmentUnservedTime { get; set; }
 }

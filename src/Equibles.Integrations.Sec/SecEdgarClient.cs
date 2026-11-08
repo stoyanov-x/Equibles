@@ -248,11 +248,17 @@ public class SecEdgarClient : ISecEdgarClient
                 Exchanges = apiResponse.Exchanges ?? [],
                 FiscalYearEnd = apiResponse.FiscalYearEnd,
                 Website = apiResponse.Website,
+                LatestAnnualReportFiledOn = SecRegistrantFilings.LatestAnnualReportFiledOn(
+                    recentFilings
+                ),
                 PeriodicReportFileNumber = SecRegistrantFilings.PeriodicReportFileNumber(
                     recentFilings
                 ),
                 BdcElectionFiledOn = SecRegistrantFilings.LatestBdcElection(recentFilings),
                 BdcWithdrawalFiledOn = SecRegistrantFilings.LatestBdcWithdrawal(recentFilings),
+                SuccessorRegistration = SecRegistrantFilings.LatestSuccessorRegistration(
+                    recentFilings
+                ),
                 HasArchivedFilings = apiResponse.Filings?.Files is { Count: > 0 },
             };
         }

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Equibles.Core.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -103,18 +104,15 @@ public sealed class OutboundHostGate
 
     /// <summary>
     /// Registrable-domain key: a rate-limit ban is per Cloudflare zone (apex), so investors.bjs.com and
-    /// bjs.com share one cooldown. Approximated as the last two labels — correct for the .com/.net hosts
-    /// that dominate IR; an over-broad key on a multi-part public suffix only throttles slightly more,
-    /// never less, so it never lets a burst through.
+    /// bjs.com share one cooldown, while one blocked site never parks every company under its
+    /// country-code suffix.
     /// </summary>
     internal static string HostKey(string url)
     {
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || string.IsNullOrEmpty(uri.Host))
             return null;
 
-        var host = uri.Host.ToLowerInvariant();
-        var labels = host.Split('.');
-        return labels.Length <= 2 ? host : $"{labels[^2]}.{labels[^1]}";
+        return RegistrableDomain.Of(uri.Host.ToLowerInvariant());
     }
 
     private sealed class HostState

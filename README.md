@@ -19,7 +19,7 @@ See [`docs/`](docs/README.md) for the user guide and technical documentation.
 
 ## What's Included
 
-Everything marked **Self-hosted** is scraped, stored, and served by this repo — **70 MCP tools**, no account, no key. [Equibles Cloud](https://equibles.com) runs this exact core over the same protocol with the same tool names, and adds more tools on top.
+Everything marked **Self-hosted** is scraped, stored, and served by this repo — **71 MCP tools**, no account, no key. [Equibles Cloud](https://equibles.com) runs this exact core over the same protocol with the same tool names, and adds more tools on top.
 
 | Domain | Data Source | Self-hosted | [Equibles Cloud](https://equibles.com) | Description |
 |--------|------------|:---:|:---:|-------------|
@@ -31,12 +31,12 @@ Everything marked **Self-hosted** is scraped, stored, and served by this repo �
 | **Insider Trading** | SEC Forms 3/4/5/144 | ✅ | ✅ | Director, officer, and 10% owner transactions, annual ownership statements, and proposed (Form 144) sales |
 | **Congressional Trading** | House/Senate disclosures | ✅ | ✅ | Securities transactions by members of Congress, including the filed stock, option, bond, or other instrument |
 | **Short Data** | SEC / FINRA | ✅ | ✅ | Fails-to-deliver (SEC), daily short volume and short interest (FINRA) |
-| **Economic Indicators** | FRED (Federal Reserve) | ✅ | ✅ | Interest rates, inflation, employment, GDP, yield spreads, and more |
+| **Economic Indicators** | FRED (Federal Reserve), Bank of Canada, Statistics Canada | ✅ | ✅ | US and Canadian interest rates, inflation, employment, GDP, yield spreads, and more |
 | **Stock Prices** | Yahoo Finance | ✅ | ✅ | Daily OHLCV prices with technical indicators (SMA, RSI, MACD) |
 | **European Listings** | ESMA/FCA FIRDS + exchange directories | ✅ | ✅ | Verified share listings on Euronext (Paris, Amsterdam, Brussels, Dublin, Oslo, Milan, Lisbon), Xetra, Nasdaq Stockholm, Helsinki and Copenhagen (main market and First North), BME, GPW and the London Stock Exchange (main market and AIM), keyed by ISIN and venue, with daily prices in the listing's own currency; every market with a directory adapter runs automatically; the price, dividend, financial-statement and fund-holding MCP tools accept them as `MIC:TICKER` (`XPAR:AIR`; see `docs/equity-identity.md`) |
 | **Futures Positioning** | CFTC | ✅ | ✅ | Commitments of Traders (COT) data for 30+ futures contracts |
 | **Market Indicators** | CBOE | ✅ | ✅ | VIX volatility index (1990+) and put/call ratios by category |
-| **Government Contracts** | USAspending.gov | ✅ | ✅ | Federal contract awards to public companies — amounts, awarding agencies, dates, and NAICS/PSC codes |
+| **Government Contracts** | USAspending.gov, open.canada.ca | ✅ | ✅ | US federal contract awards to public companies (amounts, awarding agencies, dates, NAICS/PSC codes) and Government of Canada contracts over C$10,000 to companies listed in Canada, reported since fiscal 2017-2018 |
 | **FDA Catalysts** | FDA.gov | ✅ | ✅ | Advisory-committee (AdComm) meeting calendar — scheduled FDA panel dates, center, and title that act as regulatory catalysts for biotech/pharma stocks |
 | **Earnings Call Transcripts** | Company webcasts | — | ✅ | Full quarterly-call transcripts with speaker attribution, searchable alongside filings |
 | **Earnings Call Audio** | Company webcasts | — | ✅ | The recorded call itself, playable and aligned to the transcript |
@@ -94,7 +94,7 @@ This starts:
 | **db** | 5432 | ParadeDB (PostgreSQL + pgvector + pg_search) |
 | **web** | 8080 | Web portal for browsing data |
 | **mcp** | 8081 | MCP server for AI assistants |
-| **worker** | — | Scrapers (SEC, FINRA, Congress, FRED, Yahoo, CFTC, CBOE, USAspending, FDA, FIRDS, European exchange directories) |
+| **worker** | — | Scrapers (SEC, FINRA, Congress, FRED, Bank of Canada, Statistics Canada, Yahoo, CFTC, CBOE, USAspending, open.canada.ca contracts, FDA, FIRDS, European exchange directories) |
 
 Data scraping starts automatically. SEC filings, holdings, insider trades, and congressional trades will begin populating within minutes.
 
@@ -205,7 +205,7 @@ The web portal at `http://localhost:8080` provides a browser-based interface for
 - **Advisers** — Browse SEC-registered and exempt reporting investment advisers (`/advisers`), ranked by assets under management, with per-firm profiles (regulatory AUM, main office, employee count, fee structure)
 - **Insider Trading** — Dashboard showing the top insider buys, sells, and biggest transactions over the last 90 days
 - **Short Activity** — Most-shorted leaderboard (`/most-shorted`, ranked by FINRA short interest) and largest daily short volume (`/short-volume`), each with a date selector, server-side sort, and pagination
-- **Economy** — Browse FRED economic indicators grouped by category (interest rates, inflation, employment, GDP, etc.) with charts and statistics
+- **Economy** — Browse US and Canadian economic indicators from FRED, the Bank of Canada and Statistics Canada, grouped by category (interest rates, inflation, employment, GDP, etc.) with charts and statistics
 - **Futures** — CFTC Commitments of Traders positioning data for 30+ futures contracts (commodities, indices, currencies) with commercial/non-commercial position charts
 - **Market** — CBOE market indicators: VIX volatility index with OHLC charts, put/call ratios (equity, index, total, VIX, ETP)
 - **Search** — Global search across stocks, institutions, insiders, and congress members with category filtering and date ranges
@@ -222,11 +222,11 @@ The MCP server exposes financial data tools for AI assistants (Claude, ChatGPT, 
 - **Financial Statements** — XBRL fact time series per ticker, cross-ticker fact comparison, full income statement / balance sheet / cash flow per fiscal period
 - **Fund & Adviser Filings** — Fund portfolio holdings (NPORT), registered-fund operations (N-CEN), exempt offerings (Form D), and SEC-registered and exempt reporting investment-adviser lookup and search (Form ADV)
 - **Short Data** — Daily short volume, market-wide largest daily short volume, bi-monthly short interest, and the latest short-interest snapshot across tickers
-- **Economic Indicators** — FRED data lookup, latest macro snapshot, indicator search across categories
+- **Economic Indicators** — FRED, Bank of Canada and Statistics Canada lookup, a latest macro snapshot per country (US or CA), indicator search across categories
 - **Stock Prices** — Daily OHLCV history with adjusted close, latest close across one or more tickers, and on-demand technical indicators (EMA, Stochastic Oscillator, Average True Range, On-Balance Volume, Bollinger Bands)
 - **Futures Positioning** — COT positioning data, latest snapshot across all contracts, contract search
 - **Market Indicators** — VIX historical data, put/call ratios by type (equity, index, total, VIX, ETP)
-- **Government Contracts** — Federal contract awards won by a ticker (awarding agency, amount, period dates) and a ranking of the top public-company contractors by total federal dollars over a date range (USAspending.gov)
+- **Government Contracts** — Federal contract awards won by a ticker (awarding agency, amount, period dates) and a ranking of the top public-company contractors by total federal dollars over a date range, for the US (USAspending.gov) or Canada (open.canada.ca proactive publication of contracts since fiscal 2017-2018, in Canadian dollars)
 - **FDA Catalysts** — Scheduled FDA advisory-committee (AdComm) meetings over a date range — the regulatory catalyst dates that move biotech and pharma stocks (FDA.gov)
 
 ### Output Format (GCF, opt-in)
@@ -344,7 +344,7 @@ Build first: a plain `dotnet run` restores and prints build output on stdout, wh
 
 ## Tools
 
-This self-hosted build exposes 70 tools over MCP. The hosted server at `https://mcp.equibles.com/mcp` runs this same core and [adds more on top](#whats-included). Full catalog and client setup: [daniel3303/stock-market-mcp-server](https://github.com/daniel3303/stock-market-mcp-server).
+This self-hosted build exposes 71 tools over MCP. The hosted server at `https://mcp.equibles.com/mcp` runs this same core and [adds more on top](#whats-included). Full catalog and client setup: [daniel3303/stock-market-mcp-server](https://github.com/daniel3303/stock-market-mcp-server).
 
 **13F institutional holdings**
 
@@ -367,6 +367,7 @@ This self-hosted build exposes 70 tools over MCP. The hosted server at `https://
 - GetInstitutionStyleHistory — a filer's measured style, turnover and horizon bands quarter by quarter
 - GetInstitutionSectorAllocation — allocation by sector
 - GetInstitutionQuarterlyActivity — initiated/increased/reduced/exited vs prior quarter
+- GetInstitutionBeneficialOwnership — an institution's Schedule 13D and 13G stakes, each with its dates and a status (current, unconfirmed, below 5%, exited, security retired)
 - CompareInstitutionPortfolios — portfolio overlap between two institutions
 - GetInstitutionConsensusHoldings — consensus portfolio of 2–25 institutions
 
@@ -402,12 +403,12 @@ This self-hosted build exposes 70 tools over MCP. The hosted server at `https://
 - CompareFinancialFact — a concept across companies
 - GetRevenueBreakdown — revenue by segment/geography/product plus reported segment operating income and derived margin
 
-**Economic data (FRED)**
+**Economic data (FRED, Bank of Canada, Statistics Canada)**
 
-- GetEconomicIndicator — a FRED series
-- GetLatestEconomicIndicators — latest values by category
+- GetEconomicIndicator — a curated US or Canadian series
+- GetLatestEconomicIndicators — latest values by category for one country (US or CA)
 - SearchEconomicIndicators — strict-first tokenized curated-series search with standard macro aliases
-- GetEconomicCalendar — US macro release calendar
+- GetEconomicCalendar — US and Canadian macro release calendar
 
 **Futures (CFTC COT)**
 
@@ -450,7 +451,7 @@ This self-hosted build exposes 70 tools over MCP. The hosted server at `https://
 - GetOnBalanceVolume — on-balance volume (OBV)
 - GetBollingerBands — Bollinger Bands
 
-**Government contracts (USAspending)**
+**Government contracts (USAspending, open.canada.ca)**
 
 - GetGovernmentContracts — federal contract awards for a company
 - GetTopGovernmentContractors — largest public-company contractors

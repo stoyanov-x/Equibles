@@ -19,7 +19,7 @@ namespace Equibles.Migrations.Migrations
         {
 #pragma warning disable 612, 618
             modelBuilder
-                .HasAnnotation("ProductVersion", "10.0.13")
+                .HasAnnotation("ProductVersion", "10.0.14")
                 .HasAnnotation("Proxies:ChangeTracking", false)
                 .HasAnnotation("Proxies:CheckEquality", false)
                 .HasAnnotation("Proxies:LazyLoading", true)
@@ -372,6 +372,15 @@ namespace Equibles.Migrations.Migrations
                         .HasColumnType("character varying(256)");
 
                     b.Property<DateTime?>("WebsiteCheckedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("WebsiteDiscoveryVersion")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTime?>("WebsiteLivenessCheckedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime?>("WebsiteRecheckProbeFailedAt")
                         .HasColumnType("timestamp with time zone");
 
                     b.HasKey("Id");
@@ -1350,6 +1359,101 @@ namespace Equibles.Migrations.Migrations
                     b.ToTable("CongressionalTrade");
                 });
 
+            modelBuilder.Entity("Equibles.Congress.Data.Models.CongressionalTradeAmendment", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .HasColumnType("uuid");
+
+                    b.Property<long>("AmountFrom")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("AmountTo")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("AssetName")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<string>("AssetType")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<Guid>("CongressMemberId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("CreationTime")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("FiledTicker")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<DateOnly>("FilingDate")
+                        .HasColumnType("date");
+
+                    b.Property<int>("FilingKind")
+                        .HasColumnType("integer");
+
+                    b.Property<DateOnly?>("FirstDisclosedDate")
+                        .HasColumnType("date");
+
+                    b.Property<string>("OwnerType")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTime?>("ResolvedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("SourceId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<int>("SourceRowIndex")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("Status")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Subholding")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<string>("SupersededSourceId")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<int?>("SupersededSourceRowIndex")
+                        .HasColumnType("integer");
+
+                    b.Property<DateOnly>("TransactionDate")
+                        .HasColumnType("date");
+
+                    b.Property<int>("TransactionType")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("Verdict")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CongressMemberId");
+
+                    b.HasIndex("Verdict");
+
+                    b.HasIndex(new[] { "FilingKind", "SourceId", "SourceRowIndex" }, "IX_CongressionalTradeAmendment_SourceRow")
+                        .IsUnique();
+
+                    b.HasIndex(new[] { "SupersededSourceId", "SupersededSourceRowIndex" }, "IX_CongressionalTradeAmendment_Superseded");
+
+                    b.ToTable("CongressionalTradeAmendment");
+                });
+
             modelBuilder.Entity("Equibles.Congress.Data.Models.CongressionalTradeImportPartition", b =>
                 {
                     b.Property<Guid>("Id")
@@ -1406,11 +1510,20 @@ namespace Equibles.Migrations.Migrations
                     b.Property<DateOnly>("ExDate")
                         .HasColumnType("date");
 
+                    b.Property<DateOnly?>("PaymentDate")
+                        .HasColumnType("date");
+
                     b.Property<decimal?>("PriceAdjustmentAppliedAmountPerShare")
                         .HasColumnType("numeric");
 
                     b.Property<DateTime?>("PriceAdjustmentAppliedTime")
                         .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime?>("PriceAdjustmentUnservedTime")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateOnly?>("RecordDate")
+                        .HasColumnType("date");
 
                     b.Property<string>("Source")
                         .IsRequired()
@@ -2252,6 +2365,11 @@ namespace Equibles.Migrations.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("uuid");
 
+                    b.Property<string>("CountryCode")
+                        .IsRequired()
+                        .HasMaxLength(2)
+                        .HasColumnType("character varying(2)");
+
                     b.Property<DateTime>("CreationTime")
                         .HasColumnType("timestamp with time zone");
 
@@ -2270,12 +2388,24 @@ namespace Equibles.Migrations.Migrations
                     b.Property<bool>("PressRelease")
                         .HasColumnType("boolean");
 
-                    b.Property<int>("ReleaseId")
+                    b.Property<int?>("ReleaseId")
                         .HasColumnType("integer");
+
+                    b.Property<int>("Source")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("SourceKey")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
 
                     b.HasKey("Id");
 
+                    b.HasIndex("CountryCode");
+
                     b.HasIndex("ReleaseId")
+                        .IsUnique();
+
+                    b.HasIndex("Source", "SourceKey")
                         .IsUnique();
 
                     b.ToTable("FredRelease");
@@ -2296,6 +2426,10 @@ namespace Equibles.Migrations.Migrations
                     b.Property<Guid>("FredReleaseId")
                         .HasColumnType("uuid");
 
+                    b.Property<string>("ReferencePeriod")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
                     b.HasKey("Id");
 
                     b.HasIndex("Date");
@@ -2314,6 +2448,11 @@ namespace Equibles.Migrations.Migrations
 
                     b.Property<int>("Category")
                         .HasColumnType("integer");
+
+                    b.Property<string>("CountryCode")
+                        .IsRequired()
+                        .HasMaxLength(2)
+                        .HasColumnType("character varying(2)");
 
                     b.Property<DateTime>("CreationTime")
                         .HasColumnType("timestamp with time zone");
@@ -2343,6 +2482,17 @@ namespace Equibles.Migrations.Migrations
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)");
 
+                    b.Property<int>("Source")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("SourceKey")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("SourceUrl")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
                     b.Property<string>("Title")
                         .IsRequired()
                         .HasMaxLength(256)
@@ -2355,6 +2505,8 @@ namespace Equibles.Migrations.Migrations
                     b.HasKey("Id");
 
                     b.HasIndex("Category");
+
+                    b.HasIndex("CountryCode");
 
                     b.HasIndex("FredReleaseId");
 
@@ -2390,6 +2542,11 @@ namespace Equibles.Migrations.Migrations
                     b.Property<string>("AwardingAgency")
                         .HasMaxLength(256)
                         .HasColumnType("character varying(256)");
+
+                    b.Property<string>("CountryCode")
+                        .IsRequired()
+                        .HasMaxLength(2)
+                        .HasColumnType("character varying(2)");
 
                     b.Property<DateTime>("CreationTime")
                         .HasColumnType("timestamp with time zone");
@@ -2432,6 +2589,8 @@ namespace Equibles.Migrations.Migrations
 
                     b.HasIndex("AwardUniqueKey")
                         .IsUnique();
+
+                    b.HasIndex("CountryCode", "ActionDate");
 
                     b.HasIndex("EquityIssuerId", "ActionDate");
 
@@ -7709,6 +7868,17 @@ namespace Equibles.Migrations.Migrations
                     b.Navigation("CongressMember");
 
                     b.Navigation("Issuer");
+                });
+
+            modelBuilder.Entity("Equibles.Congress.Data.Models.CongressionalTradeAmendment", b =>
+                {
+                    b.HasOne("Equibles.Congress.Data.Models.CongressMember", "CongressMember")
+                        .WithMany()
+                        .HasForeignKey("CongressMemberId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("CongressMember");
                 });
 
             modelBuilder.Entity("Equibles.CorporateActions.Data.Models.CashDividend", b =>
