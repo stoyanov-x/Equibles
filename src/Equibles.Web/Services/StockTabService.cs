@@ -14,6 +14,7 @@ using Equibles.Finra.Repositories;
 using Equibles.Holdings.BusinessLogic;
 using Equibles.Holdings.Data.Models;
 using Equibles.Holdings.Repositories;
+using Equibles.Holdings.Repositories.Extensions;
 using Equibles.InsiderTrading.Data.Extensions;
 using Equibles.InsiderTrading.Repositories;
 using Equibles.Sec.FinancialFacts.Data.Enums;
@@ -57,6 +58,16 @@ public class StockTabService
     // backfill from it — so historical series clamp to it rather than render
     // misleading low/zero readings. Null = no floor configured, no clamp.
     private readonly DateOnly? _minSyncDate;
+
+    private const string UsDollarsPerShare = "USD/shares";
+
+    private static readonly Equibles.Sec.Data.Models.DocumentType[] ForeignAnnualForms =
+    [
+        Equibles.Sec.Data.Models.DocumentType.TwentyF,
+        Equibles.Sec.Data.Models.DocumentType.TwentyFa,
+        Equibles.Sec.Data.Models.DocumentType.FortyF,
+        Equibles.Sec.Data.Models.DocumentType.FortyFa,
+    ];
 
     // Benchmark the Price tab compares each stock's returns against.
     private const string BenchmarkTicker = "SPY";
@@ -199,17 +210,19 @@ public class StockTabService
             AvailableDates = reportDates,
             SelectedDate = selectedDate,
             Ticker = stock.Presentation.Listing.Ticker,
-            TotalValue = allCurrent.Sum(h => h.Value),
-            // Restated onto today's split basis so the header stat matches the ownership
-            // trend's latest point (the trend is restated by MarketActivityShareRestater)
-            // and stays comparable to today's SharesOutStanding.
-            TotalShares = allCurrent.Sum(h =>
-                HoldingShareRestatement.RestateToToday(
-                    h,
-                    effectiveSplits,
-                    stock.Presentation.Listing.Ticker
-                )
-            ),
+            // Common-share legs only and restated onto today's split basis, so the header
+            // stats match the ownership trend's latest point (common shares, restated by
+            // MarketActivityShareRestater) and stay comparable to today's SharesOutStanding.
+            TotalValue = allCurrent.Where(h => h.IsCommonShareLeg()).Sum(h => h.Value),
+            TotalShares = allCurrent
+                .Where(h => h.IsCommonShareLeg())
+                .Sum(h =>
+                    HoldingShareRestatement.RestateToToday(
+                        h,
+                        effectiveSplits,
+                        stock.Presentation.Listing.Ticker
+                    )
+                ),
             HolderCount = allCurrent.Select(h => h.InstitutionalHolderId).Distinct().Count(),
             SharesOutstanding = stock.Presentation.Listing.Security.SharesOutstanding,
             OwnershipTrend = await LoadOwnershipTrend(stock),
@@ -274,14 +287,15 @@ public class StockTabService
                     CurrentHolding = g.OrderBy(h => h.ListedTicker == null ? 0 : 1)
                         .ThenByDescending(h => h.FilingDate)
                         .First(),
-                    CurrentShares = g.Sum(h =>
-                        HoldingShareRestatement.RestateToToday(
-                            h,
-                            effectiveSplits,
-                            stock.Presentation.Listing.Ticker
-                        )
-                    ),
-                    CurrentValue = g.Sum(h => h.Value),
+                    CurrentShares = g.Where(h => h.IsCommonShareLeg())
+                        .Sum(h =>
+                            HoldingShareRestatement.RestateToToday(
+                                h,
+                                effectiveSplits,
+                                stock.Presentation.Listing.Ticker
+                            )
+                        ),
+                    CurrentValue = g.Where(h => h.IsCommonShareLeg()).Sum(h => h.Value),
                     ChangeType = PositionChangeType.Unchanged,
                     LatestReportDate = latestDate,
                 };
@@ -305,14 +319,16 @@ public class StockTabService
             AvailableDates = reportDates,
             SelectedDate = current,
             Ticker = stock.Presentation.Listing.Ticker,
-            TotalValue = allCombined.Sum(h => h.Value),
-            TotalShares = allCombined.Sum(h =>
-                HoldingShareRestatement.RestateToToday(
-                    h,
-                    effectiveSplits,
-                    stock.Presentation.Listing.Ticker
-                )
-            ),
+            TotalValue = allCombined.Where(h => h.IsCommonShareLeg()).Sum(h => h.Value),
+            TotalShares = allCombined
+                .Where(h => h.IsCommonShareLeg())
+                .Sum(h =>
+                    HoldingShareRestatement.RestateToToday(
+                        h,
+                        effectiveSplits,
+                        stock.Presentation.Listing.Ticker
+                    )
+                ),
             HolderCount = holders.Count,
             SharesOutstanding = stock.Presentation.Listing.Security.SharesOutstanding,
             OwnershipTrend = await LoadOwnershipTrend(stock),
@@ -745,7 +761,7 @@ public class StockTabService
             .Select(p => new FinancialsPeriodOption(
                 p.FiscalYear,
                 p.FiscalPeriod,
-                $"FY{p.FiscalYear} {p.FiscalPeriod.NameForHumans()}"
+                $"FY{FiscalYearLabel.For(p.FiscalYear, stock)} {p.FiscalPeriod.NameForHumans()}"
             ))
             .ToList();
     }
@@ -813,6 +829,17 @@ public class StockTabService
                 )
                 .ToListAsync();
 
+        // Depreciation and amortization reads as the issuer's whole history folds it, the same
+        // figure the MCP statement tool shows (DepreciationTotal).
+        if (statementLines.Any(line => DepreciationTotal.IsFamily(line.Concepts)))
+            facts = await DepreciationTotalFacts.ForStatement(
+                _financialFactRepository,
+                _financialConceptRepository,
+                stock.Id,
+                facts,
+                fiscalYear
+            );
+
         if (statementType != FinancialStatementType.BalanceSheet)
         {
             var rejectNegativeConceptIds = StatementQuarterDerivation.GetNonNegativeConceptIds(
@@ -867,8 +894,10 @@ public class StockTabService
         ).ToHashSet();
 
         return statementLines
+            // A line never reported under its own concepts still shows where its parts sum.
             .Where(line =>
                 StatementLineFacts.IsEverReported(line, conceptIdByKey, everReportedConceptIds)
+                || StatementLineFacts.PickFact(line, conceptIdByKey, latestByConcept) != null
             )
             .Select(line =>
             {
@@ -883,6 +912,7 @@ public class StockTabService
                     row.Form = fact.Form?.DisplayName;
                     row.FiledDate = fact.FiledDate;
                     row.Derived = StatementQuarterDerivation.IsDerived(fact);
+                    row.Summed = DepreciationTotal.IsSum(fact);
                 }
                 return row;
             })
@@ -943,20 +973,49 @@ public class StockTabService
 
         if (epsConcept != Guid.Empty)
         {
-            var epsFact = await _financialFactRepository
-                .GetConsolidatedByIssuerId(stock.Id)
+            // The annual bucket also holds a discrete fourth quarter and comparative years under a
+            // later filing's stamp, so the year is picked by its own span and end date. Only a
+            // dollar figure can sit under the tile's "$" and beside a dollar close.
+            var epsFact = (
+                await _financialFactRepository
+                    .GetConsolidatedByIssuerId(stock.Id)
+                    .Where(f =>
+                        f.FinancialConceptId == epsConcept
+                        && f.FiscalPeriod == SecFiscalPeriod.FullYear
+                        && f.Unit == UsDollarsPerShare
+                    )
+                    .ToListAsync()
+            )
                 .Where(f =>
-                    f.FinancialConceptId == epsConcept && f.FiscalPeriod == SecFiscalPeriod.FullYear
+                    f.PeriodEnd.DayNumber - f.PeriodStart.DayNumber
+                        is >= FiscalPeriodSpanDays.MinAnnual
+                            and <= FiscalPeriodSpanDays.MaxAnnual
                 )
-                .OrderByDescending(f => f.FiscalYear)
+                .OrderByDescending(f => f.PeriodEnd)
                 .ThenByDescending(f => f.FiledDate)
-                .FirstOrDefaultAsync();
+                .FirstOrDefault();
 
             if (epsFact != null)
             {
-                vm.EpsDiluted = epsFact.Value;
-                if (vm.LatestClose.HasValue && epsFact.Value != 0)
-                    vm.PeRatio = Math.Round(vm.LatestClose.Value / epsFact.Value, 2);
+                // A filing states per-share figures on its filing date's share basis; the close is
+                // on today's.
+                var eps = SplitAdjustment.AdjustPerShareValue(
+                    epsFact.Value,
+                    epsFact.FiledDate,
+                    ShareCountSplitScope.ForListing(
+                        await LoadEffectiveSplits(stock),
+                        stock.Presentation.Listing.Id
+                    )
+                );
+                vm.EpsDiluted = eps;
+                // A loss has no multiple, and a 20-F or 40-F states earnings per ordinary share
+                // while the listing may be a receipt for several.
+                if (
+                    vm.LatestClose.HasValue
+                    && eps > 0
+                    && !ForeignAnnualForms.Contains(epsFact.Form)
+                )
+                    vm.PeRatio = Math.Round(vm.LatestClose.Value / eps, 2);
             }
         }
 
@@ -968,23 +1027,27 @@ public class StockTabService
         InstitutionalHolder holder
     )
     {
-        // AsNoTracking: rows are mutated below for display and must never flush back.
-        var holdings = await _institutionalHoldingRepository
-            .GetHistoryByStock(stock)
+        // The whole 13F history, so the oldest row shown still finds its earlier quarter. A
+        // Schedule 13D/G row carries an event date, not a quarter. AsNoTracking: rows are mutated
+        // below for display and must never flush back.
+        var history = await _institutionalHoldingRepository
+            .Get13FHistoryByStock(stock)
             .Where(h => h.InstitutionalHolderId == holder.Id)
             .OrderByDescending(h => h.ReportDate)
-            .Take(50)
+            .ThenBy(h => h.ListedTicker)
+            .ThenBy(h => h.ShareType)
+            .ThenBy(h => h.OptionType)
             .AsNoTracking()
             .ToListAsync();
 
         // Restate every quarter's count onto today's split basis so the position-over-time
         // chart is continuous across a split and the quarter-over-quarter change compares
         // like with like (as filed, an unchanged position reads as a 10x jump across a
-        // 10:1 forward split). Values stay as filed.
+        // 10:1 forward split). Values stay as filed, and so does a principal amount.
         var effectiveSplits = await LoadEffectiveSplits(stock);
         if (effectiveSplits.Count > 0)
         {
-            foreach (var holding in holdings)
+            foreach (var holding in history.Where(h => h.ShareType == ShareType.Shares))
                 holding.Shares = HoldingShareRestatement.RestateToToday(
                     holding,
                     effectiveSplits,
@@ -997,8 +1060,27 @@ public class StockTabService
             Stock = stock,
             Holder = holder,
             HolderType = await _institutionalHolderRepository.GetEntityType(holder),
-            Holdings = holdings,
+            Holdings = NewestWholeQuarters(history, HolderDetailViewModel.MaxRows),
+            ChangePercent = HolderHistoryChange.PercentByRow(history),
         };
+    }
+
+    // The newest rows up to the cap, ending on a whole quarter: a quarter cut part-way would
+    // show some of its lines and chart a position smaller than the one held.
+    public static List<InstitutionalHolding> NewestWholeQuarters(
+        List<InstitutionalHolding> newestFirst,
+        int maxRows
+    )
+    {
+        if (newestFirst.Count <= maxRows)
+            return newestFirst;
+        var cutQuarter = newestFirst[maxRows].ReportDate;
+        var whole = newestFirst.Take(maxRows).Where(h => h.ReportDate != cutQuarter).ToList();
+        // The newest quarter alone can pass the cap (a trust held across many of its funds); it
+        // is shown whole rather than not at all.
+        return whole.Count > 0
+            ? whole
+            : newestFirst.Where(h => h.ReportDate == cutQuarter).ToList();
     }
 
     // Stamp each holder's first-owned quarter for this stock via one batched lookup.
@@ -1037,8 +1119,8 @@ public class StockTabService
         return dates.ToList();
     }
 
-    // Mirrors the header-stat semantics per report date: Shares summed over every
-    // row (share classes included), holders counted distinct — so the trend's
+    // Mirrors the header-stat semantics per report date: common shares summed over every
+    // share class, holders counted distinct over every leg — so the trend's
     // latest point matches the stats shown for the latest quarter.
     private async Task<List<OwnershipTrendPoint>> LoadOwnershipTrend(EquityIssuer stock)
     {

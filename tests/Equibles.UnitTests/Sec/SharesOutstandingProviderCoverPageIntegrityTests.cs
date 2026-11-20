@@ -106,6 +106,7 @@ public class SharesOutstandingProviderCoverPageIntegrityTests
         };
 
     private static FinancialFact ClassFact(
+        EquiblesFinancialDbContext db,
         EquityIssuer stock,
         FinancialConcept concept,
         decimal value,
@@ -118,8 +119,7 @@ public class SharesOutstandingProviderCoverPageIntegrityTests
     )
     {
         var fact = Fact(stock, concept, value, filed, asOf, accession, form);
-        fact.DimensionsKey = $"{axis}={member}";
-        fact.Dimensions.Add(new FinancialFactDimension { Axis = axis, Member = member });
+        fact.DimensionsKey = Equibles.TestSupport.FinancialDimensionSeed.Key(db, (axis, member));
         return fact;
     }
 
@@ -148,6 +148,7 @@ public class SharesOutstandingProviderCoverPageIntegrityTests
         const string acc = "0001185185-26-001069";
         db.Add(
             ClassFact(
+                db,
                 stock,
                 coverPage,
                 42m,
@@ -161,6 +162,7 @@ public class SharesOutstandingProviderCoverPageIntegrityTests
         );
         db.Add(
             ClassFact(
+                db,
                 stock,
                 coverPage,
                 3_887_729m,
@@ -177,6 +179,46 @@ public class SharesOutstandingProviderCoverPageIntegrityTests
         var shares = await NewProvider(db).GetCurrentSharesOutstanding(stock);
 
         shares.Should().Be(3_887_771);
+    }
+
+    // A cover page stating Class A, Class B and their roll-up under the common-stock member, plus
+    // the receipt count: summing every member doubled the company and added another unit.
+    [Fact]
+    public async Task GetCurrentSharesOutstanding_RollUpAndReceiptMembersBesideTheClasses_CountsEachShareOnce()
+    {
+        await using var db = NewDb();
+        EquityIssuer stock = Stock("DUAL");
+        var coverPage = CoverPageConcept();
+        db.AddRange(stock, coverPage);
+        const string acc = "0001185185-26-001070";
+        foreach (
+            var (member, value) in new[]
+            {
+                ("us-gaap:CommonClassAMember", 600m),
+                ("us-gaap:CommonClassBMember", 400m),
+                ("us-gaap:CommonStockMember", 1_000m),
+                ("dei:AdrMember", 250m),
+            }
+        )
+            db.Add(
+                ClassFact(
+                    db,
+                    stock,
+                    coverPage,
+                    value,
+                    new(2026, 3, 26),
+                    new(2026, 3, 20),
+                    acc,
+                    member,
+                    "us-gaap:StatementClassOfStockAxis",
+                    DocumentType.TenK
+                )
+            );
+        await db.SaveChangesAsync();
+
+        var shares = await NewProvider(db).GetCurrentSharesOutstanding(stock);
+
+        shares.Should().Be(1_000);
     }
 
     [Fact]
@@ -202,6 +244,7 @@ public class SharesOutstandingProviderCoverPageIntegrityTests
         );
         db.Add(
             ClassFact(
+                db,
                 stock,
                 coverPage,
                 3_887_729m,
@@ -426,6 +469,7 @@ public class SharesOutstandingProviderCoverPageIntegrityTests
         db.Add(Fact(stock, coverPage, 200m, new(2026, 5, 7), new(2026, 5, 5), acc));
         db.Add(
             ClassFact(
+                db,
                 stock,
                 balanceSheet,
                 112_415_671m,
@@ -438,6 +482,7 @@ public class SharesOutstandingProviderCoverPageIntegrityTests
         );
         db.Add(
             ClassFact(
+                db,
                 stock,
                 balanceSheet,
                 0m,
@@ -453,6 +498,7 @@ public class SharesOutstandingProviderCoverPageIntegrityTests
         // Both must be excluded from the sum.
         db.Add(
             ClassFact(
+                db,
                 stock,
                 balanceSheet,
                 112_415_671m,
@@ -465,6 +511,7 @@ public class SharesOutstandingProviderCoverPageIntegrityTests
         );
         db.Add(
             ClassFact(
+                db,
                 stock,
                 balanceSheet,
                 9_000_000m,

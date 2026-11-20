@@ -1,6 +1,7 @@
 using Equibles.Core.Configuration;
 using Equibles.Errors.BusinessLogic;
 using Equibles.Errors.Data.Models;
+using Equibles.Holdings.BusinessLogic;
 using Equibles.Holdings.Data.Models;
 using Equibles.Holdings.HostedService.Services;
 using Equibles.Holdings.Repositories;
@@ -27,18 +28,31 @@ public class Holdings13FRealtimeWorker : BaseScraperWorker
     // Once a watermark exists, every cycle still re-sweeps this many recent days
     // so late/amended filings (which carry a fresh accession) are picked up even
     // after the watermark has advanced past their report period.
-    private const int TrailingReSweepDays = 14;
+    internal const int TrailingReSweepDays = 14;
     internal const int CatchUpWindowDays = 7;
     private const int FilingsPerCycle = 100;
     internal static readonly TimeSpan BacklogRetryInterval = TimeSpan.FromSeconds(5);
 
     // Identifies this worker's row in RealtimeSweepState.
-    internal const string WorkerStateName = "Holdings13FRealtime";
+    internal const string WorkerStateName = HoldingsImportCoverage.SweepWorkerName;
+
+    // Daily indexes change once a day; a backlog wakes this worker every few seconds.
+    internal static readonly TimeSpan DiscoveryInterval = TimeSpan.FromHours(1);
 
     private readonly WorkerOptions _workerOptions;
     private readonly IConfiguration _configuration;
     private DateTime? _nextRecoveryAt;
     private bool _hasMoreFilings;
+    private bool _storedReplaysRestated;
+
+    // True from start and after a replay request until a sweep completes: the daily-index sweep
+    // then runs even inside its interval. Every other wake (a queued filing, a due retry, a
+    // backlog) only recovers until the sweep is due.
+    private bool _sweepRequested = true;
+
+    // When the sweep is next owed after a cycle that skipped it, so a run of recovery wakes
+    // cannot keep pushing the sweep a full interval away.
+    private DateTime? _sweepDueAt;
 
     protected override string WorkerName => "13F real-time ingestion";
     protected override TimeSpan SleepInterval => TimeSpan.FromHours(6);
@@ -74,10 +88,20 @@ public class Holdings13FRealtimeWorker : BaseScraperWorker
             if (untilRecovery < interval)
                 interval = untilRecovery;
         }
+        if (_sweepDueAt is { } sweepDueAt)
+        {
+            var untilSweep = sweepDueAt - DateTime.UtcNow;
+            if (untilSweep < BacklogRetryInterval)
+                untilSweep = BacklogRetryInterval;
+            if (untilSweep < interval)
+                interval = untilSweep;
+        }
         using var wait = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         var requested = signal.WaitAsync(wait.Token);
+        var recovery = signal.WaitForRecoveryAsync(wait.Token);
         var elapsed = Task.Delay(interval, wait.Token);
-        await Task.WhenAny(requested, elapsed);
+        await Task.WhenAny(requested, recovery, elapsed);
+        _sweepRequested = _sweepRequested || requested.IsCompletedSuccessfully;
         await wait.CancelAsync();
     }
 
@@ -90,30 +114,71 @@ public class Holdings13FRealtimeWorker : BaseScraperWorker
 
     protected override async Task DoWork(CancellationToken stoppingToken)
     {
+        var sweepContinues = _hasMoreFilings;
         _hasMoreFilings = false;
+        _sweepDueAt = null;
         var startDate = _workerOptions.MinSyncDate ?? new DateTime(2020, 1, 1);
         var minReportDate = DateOnly.FromDateTime(startDate);
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
 
         await using var scope = ScopeFactory.CreateAsyncScope();
+        var failures = scope.ServiceProvider.GetRequiredService<HoldingsImportFailureRepository>();
+        if (!_storedReplaysRestated)
+        {
+            // Once per start: the rows an older release queued, before recovery ranks them.
+            var restated = await failures.RestateStoredReplays(stoppingToken);
+            _storedReplaysRestated = true;
+            if (restated > 0)
+                Logger.LogInformation(
+                    "Restated {Count} pending 13F recoveries of stored filings as ordered replays",
+                    restated
+                );
+        }
         await scope
             .ServiceProvider.GetRequiredService<HoldingsImportRecoveryService>()
             .Recover(minReportDate, stoppingToken);
-        _nextRecoveryAt = await scope
-            .ServiceProvider.GetRequiredService<HoldingsImportFailureRepository>()
-            .GetAll()
-            .Where(row => row.ResolvedAt == null)
-            .MinAsync(row => (DateTime?)row.NextAttemptAt, stoppingToken);
-        if (_nextRecoveryAt <= DateTime.UtcNow)
-        {
-            Logger.LogInformation("13F due recovery remains; deferring daily-index catch-up");
-            return;
-        }
         var stateRepo = scope.ServiceProvider.GetRequiredService<RealtimeSweepStateRepository>();
         var ingestionService =
             scope.ServiceProvider.GetRequiredService<Realtime13FIngestionService>();
 
         var state = await stateRepo.GetByWorker(WorkerStateName).FirstOrDefaultAsync(stoppingToken);
+        // False while a rewound sweep is still more than one window behind today.
+        var sweepReachesToday =
+            state != null
+            && ComputeWindowEnd(
+                today,
+                ComputeWindowStart(today, state.SweptThrough, TrailingReSweepDays, 0)
+            ) >= today;
+        if (state != null && !sweepReachesToday)
+            await QueueFilingsAheadOfSweep(stateRepo, ingestionService, today, stoppingToken);
+
+        _nextRecoveryAt = await failures
+            .GetAll()
+            .Where(row => row.ResolvedAt == null)
+            .MinAsync(row => (DateTime?)row.NextAttemptAt, stoppingToken);
+        // Only a filing not stored yet holds the sweep back: stored filings awaiting a replay
+        // would otherwise keep every new filing waiting behind a days-long queue.
+        var now = DateTime.UtcNow;
+        if (await failures.GetWithheld().AnyAsync(row => row.NextAttemptAt <= now, stoppingToken))
+        {
+            Logger.LogInformation("13F due recovery remains; deferring daily-index catch-up");
+            // A sweep that yielded mid-window still owes its remainder after this recovery.
+            _hasMoreFilings = sweepContinues;
+            return;
+        }
+        // A replay backlog wakes this worker every few seconds, a queued filing at once and a
+        // retry within minutes. A sweep that already reaches today repeats on its own interval
+        // instead of re-reading the same daily indexes on each of those wakes.
+        if (
+            sweepReachesToday
+            && !sweepContinues
+            && !_sweepRequested
+            && now - state.UpdatedAt < SleepInterval
+        )
+        {
+            _sweepDueAt = state.UpdatedAt + SleepInterval;
+            return;
+        }
 
         // Cold start (no watermark) backfills the season via the quarter-floor
         // lookback; once a watermark exists we only resume from it plus the
@@ -177,6 +242,8 @@ public class Holdings13FRealtimeWorker : BaseScraperWorker
             return;
         }
 
+        // A sweep that yielded stays owed, so a faulted next cycle cannot drop its remainder.
+        _sweepRequested = _hasMoreFilings;
         Logger.LogInformation(
             "13F real-time ingestion cycle complete: {Count} filings processed, swept through {Watermark:yyyy-MM-dd}",
             result.FilingsImported,
@@ -192,6 +259,36 @@ public class Holdings13FRealtimeWorker : BaseScraperWorker
                 scope.ServiceProvider.GetRequiredService<HoldingsTableMaintenanceService>();
             await maintenance.VacuumInstitutionalHoldings(stoppingToken);
         }
+    }
+
+    /// <summary>
+    /// While the sweep cannot reach today this cycle, queues the newest days' unstored filings
+    /// for recovery and records how far that discovery read.
+    /// </summary>
+    private async Task QueueFilingsAheadOfSweep(
+        RealtimeSweepStateRepository stateRepo,
+        Realtime13FIngestionService ingestionService,
+        DateOnly today,
+        CancellationToken stoppingToken
+    )
+    {
+        var discovery = await stateRepo
+            .GetByWorker(HoldingsImportCoverage.DiscoveryWorkerName)
+            .AsNoTracking()
+            .FirstOrDefaultAsync(stoppingToken);
+        if (discovery != null && DateTime.UtcNow - discovery.UpdatedAt < DiscoveryInterval)
+            return;
+        var earliestFailedDate = await ingestionService.QueueUnseenFilings(
+            today,
+            TrailingReSweepDays + 1,
+            stoppingToken
+        );
+        await stateRepo.SaveProgress(
+            HoldingsImportCoverage.DiscoveryWorkerName,
+            discovery,
+            ComputeNextWatermark(today, earliestFailedDate),
+            stoppingToken
+        );
     }
 
     /// <summary>

@@ -1,4 +1,5 @@
 using Equibles.Data;
+using Equibles.Holdings.Data.Extensions;
 using Equibles.Holdings.Data.Models;
 using Microsoft.EntityFrameworkCore;
 
@@ -41,28 +42,81 @@ public class HoldingsImportFailureRepository(EquiblesFinancialDbContext dbContex
         (int)HoldingsImportFailureReason.OutsideHistoryWindow,
     ];
 
+    /// <summary>
+    /// The unresolved filings whose rows are not stored yet. A stored filing awaiting its ordered
+    /// replay is left out: it delays nothing a reader can see.
+    /// </summary>
+    /// <summary>
+    /// The filings closed as withholding their positions that have no confidential-treatment
+    /// report recorded.
+    /// </summary>
+    public IQueryable<HoldingsImportFailure> GetConfidentialClosuresWithoutReport() =>
+        GetAll()
+            .Where(row =>
+                row.Reason == HoldingsImportFailureReason.ConfidentialTreatment
+                && !DbContext
+                    .Set<Form13FConfidentialFiling>()
+                    .Any(report => report.AccessionNumber == row.AccessionNumber)
+            );
+
+    /// <summary>
+    /// Restates as <see cref="HoldingsImportFailureReason.StoredReplay"/> every pending recovery
+    /// whose filing is stored. A release that did not tell the two apart queued them alike, and
+    /// such a backlog would keep deferring the sweep and counting against coverage.
+    /// </summary>
+    public Task<int> RestateStoredReplays(CancellationToken cancellationToken) =>
+        GetAll()
+            .Where(row =>
+                row.ResolvedAt == null
+                && row.Reason == HoldingsImportFailureReason.PendingRecovery
+                && (
+                    DbContext
+                        .Set<InstitutionalHolding>()
+                        .Any(holding =>
+                            holding.AccessionNumber == row.AccessionNumber
+                            && holding.FilingType == FilingType.Form13F
+                        )
+                    || DbContext
+                        .Set<InstitutionalFiling>()
+                        .Zero13FRestatements()
+                        .Any(filing => filing.AccessionNumber == row.AccessionNumber)
+                )
+            )
+            .ExecuteUpdateAsync(
+                update =>
+                    update.SetProperty(row => row.Reason, HoldingsImportFailureReason.StoredReplay),
+                cancellationToken
+            );
+
+    public IQueryable<HoldingsImportFailure> GetWithheld() =>
+        GetAll()
+            .Where(row =>
+                row.ResolvedAt == null && row.Reason != HoldingsImportFailureReason.StoredReplay
+            );
+
     // Discovery is not an import attempt and must not postpone an existing retry. A reopened row
-    // drops the reason it closed under, which a later write would otherwise contradict.
-    public Task EnqueueRecovery(
+    // drops the reason it closed under, which a later write would otherwise contradict. Returns 1
+    // when the filing was queued or reopened, 0 when it was already waiting.
+    public Task<int> EnqueueRecovery(
         string accession,
         string cik,
         DateOnly filed,
         CancellationToken cancellationToken,
-        bool supersedesActiveAttempt = false
+        bool supersedesActiveAttempt = false,
+        HoldingsImportFailureReason reason = HoldingsImportFailureReason.PendingRecovery
     ) =>
         DbContext.Database.ExecuteSqlInterpolatedAsync(
             $"""
             INSERT INTO "HoldingsImportFailure"
               ("AccessionNumber", "Cik", "FilingDate", "Reason", "Attempts",
                "FirstFailedAt", "LastAttemptAt", "NextAttemptAt", "ResolvedAt")
-            VALUES ({accession}, {cik}, {filed}, {(int)
-                HoldingsImportFailureReason.PendingRecovery}, 0,
+            VALUES ({accession}, {cik}, {filed}, {(int)reason}, 0,
                     clock_timestamp(), clock_timestamp(), clock_timestamp(), NULL)
             ON CONFLICT ("AccessionNumber") DO UPDATE SET
               "ResolvedAt" = NULL, "LastAttemptAt" = clock_timestamp(),
               "NextAttemptAt" = clock_timestamp(),
               "Reason" = CASE WHEN "HoldingsImportFailure"."ResolvedAt" IS NOT NULL
-                THEN {(int)HoldingsImportFailureReason.PendingRecovery}
+                THEN {(int)reason}
                 ELSE "HoldingsImportFailure"."Reason" END
             WHERE "HoldingsImportFailure"."ResolvedAt" IS NOT NULL OR {supersedesActiveAttempt}
             """,
@@ -109,6 +163,22 @@ public class HoldingsImportFailureRepository(EquiblesFinancialDbContext dbContex
             """,
             cancellationToken
         );
+
+    // Brings forward the filer's rows first queued since <paramref name="discoveredSince"/>.
+    public Task<int> RetrySoon(
+        string cik,
+        DateTime discoveredSince,
+        DateTime nextAttemptAt,
+        CancellationToken cancellationToken
+    ) =>
+        GetAll()
+            .Where(row =>
+                row.Cik == cik && row.ResolvedAt == null && row.FirstFailedAt >= discoveredSince
+            )
+            .ExecuteUpdateAsync(
+                setters => setters.SetProperty(row => row.NextAttemptAt, nextAttemptAt),
+                cancellationToken
+            );
 
     public Task Defer(string cik, DateTime attemptedAt, CancellationToken cancellationToken) =>
         GetAll()

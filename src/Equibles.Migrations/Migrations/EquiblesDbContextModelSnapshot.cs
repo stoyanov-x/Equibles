@@ -328,6 +328,15 @@ namespace Equibles.Migrations.Migrations
                     b.Property<int?>("FiscalYearEndMonth")
                         .HasColumnType("integer");
 
+                    b.Property<int?>("FiscalYearEndMonthBeforeChange")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTime?>("FiscalYearEndMonthChangedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int?>("FiscalYearLabelOffset")
+                        .HasColumnType("integer");
+
                     b.Property<string>("IdentitySourceUrl")
                         .HasMaxLength(2000)
                         .HasColumnType("character varying(2000)");
@@ -658,6 +667,9 @@ namespace Equibles.Migrations.Migrations
                         .HasMaxLength(3)
                         .HasColumnType("character varying(3)");
 
+                    b.Property<bool>("WasReferenceListed")
+                        .HasColumnType("boolean");
+
                     b.Property<DateTime?>("YahooEnrichmentAttemptedAt")
                         .HasColumnType("timestamp with time zone");
 
@@ -953,6 +965,41 @@ namespace Equibles.Migrations.Migrations
                     b.ToTable("IsinLegalEntityLookup");
                 });
 
+            modelBuilder.Entity("Equibles.CommonStocks.Data.Models.SecListingEvidenceCheck", b =>
+                {
+                    b.Property<string>("Cik")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<string>("CertificationAccessionNumber")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<DateTime>("CheckedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("Outcome")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("ProspectusAccessionNumber")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<DateOnly?>("ProspectusFiledOn")
+                        .HasColumnType("date");
+
+                    b.Property<string>("RegistrationAccessionNumber")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.PrimitiveCollection<List<string>>("Tickers")
+                        .HasColumnType("text[]");
+
+                    b.HasKey("Cik");
+
+                    b.ToTable("SecListingEvidenceCheck");
+                });
+
             modelBuilder.Entity("Equibles.CommonStocks.Data.Models.SecTickerDirectoryObservation", b =>
                 {
                     b.Property<Guid>("Id")
@@ -1179,8 +1226,14 @@ namespace Equibles.Migrations.Migrations
                     b.Property<long>("NetWorthMaximum")
                         .HasColumnType("bigint");
 
+                    b.Property<bool>("NetWorthMaximumOpenEnded")
+                        .HasColumnType("boolean");
+
                     b.Property<long>("NetWorthMinimum")
                         .HasColumnType("bigint");
+
+                    b.Property<bool>("NetWorthMinimumOpenEnded")
+                        .HasColumnType("boolean");
 
                     b.Property<string>("ReportId")
                         .IsRequired()
@@ -1226,6 +1279,9 @@ namespace Equibles.Migrations.Migrations
                     b.Property<long?>("IncomeMinimum")
                         .HasColumnType("bigint");
 
+                    b.Property<bool>("IncomeOpenEnded")
+                        .HasColumnType("boolean");
+
                     b.Property<string>("IncomeType")
                         .HasMaxLength(256)
                         .HasColumnType("character varying(256)");
@@ -1238,6 +1294,9 @@ namespace Equibles.Migrations.Migrations
 
                     b.Property<long>("RangeMinimum")
                         .HasColumnType("bigint");
+
+                    b.Property<bool>("RangeOpenEnded")
+                        .HasColumnType("boolean");
 
                     b.HasKey("Id");
 
@@ -2865,6 +2924,47 @@ namespace Equibles.Migrations.Migrations
                         .IsUnique();
 
                     b.ToTable("FilingOtherManager");
+                });
+
+            modelBuilder.Entity("Equibles.Holdings.Data.Models.Form13FConfidentialFiling", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("AccessionNumber")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<int?>("DeclaredEntryTotal")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("DisclosedPositionCount")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("FilerCik")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<DateOnly>("FilingDate")
+                        .HasColumnType("date");
+
+                    b.Property<bool>("IsAmendment")
+                        .HasColumnType("boolean");
+
+                    b.Property<DateOnly>("ReportDate")
+                        .HasColumnType("date");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AccessionNumber")
+                        .IsUnique();
+
+                    b.HasIndex("FilerCik", "ReportDate");
+
+                    b.ToTable("Form13FConfidentialFiling");
                 });
 
             modelBuilder.Entity("Equibles.Holdings.Data.Models.Form13FNotice", b =>
@@ -6909,6 +7009,9 @@ namespace Equibles.Migrations.Migrations
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)");
 
+                    b.Property<decimal?>("LendingCashCollateralValue")
+                        .HasColumnType("numeric");
+
                     b.Property<string>("Name")
                         .HasMaxLength(512)
                         .HasColumnType("character varying(512)");
@@ -7155,6 +7258,41 @@ namespace Equibles.Migrations.Migrations
                     b.ToTable("FinancialConcept");
                 });
 
+            modelBuilder.Entity("Equibles.Sec.FinancialFacts.Data.Models.FinancialDimensionSet", b =>
+                {
+                    b.Property<string>("Key")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTime>("CreationTime")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Key");
+
+                    b.ToTable("FinancialDimensionSet");
+                });
+
+            modelBuilder.Entity("Equibles.Sec.FinancialFacts.Data.Models.FinancialDimensionSetMember", b =>
+                {
+                    b.Property<string>("DimensionSetKey")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("Axis")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<string>("Member")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.HasKey("DimensionSetKey", "Axis", "Member");
+
+                    b.HasIndex("Axis", "Member");
+
+                    b.ToTable("FinancialDimensionSetMember");
+                });
+
             modelBuilder.Entity("Equibles.Sec.FinancialFacts.Data.Models.FinancialFact", b =>
                 {
                     b.Property<Guid>("Id")
@@ -7241,37 +7379,6 @@ namespace Equibles.Migrations.Migrations
                         .IsUnique();
 
                     b.ToTable("FinancialFact");
-                });
-
-            modelBuilder.Entity("Equibles.Sec.FinancialFacts.Data.Models.FinancialFactDimension", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .HasColumnType("uuid");
-
-                    b.Property<string>("Axis")
-                        .IsRequired()
-                        .HasMaxLength(256)
-                        .HasColumnType("character varying(256)");
-
-                    b.Property<DateTime>("CreationTime")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<Guid>("FinancialFactId")
-                        .HasColumnType("uuid");
-
-                    b.Property<string>("Member")
-                        .IsRequired()
-                        .HasMaxLength(256)
-                        .HasColumnType("character varying(256)");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("Axis", "Member");
-
-                    b.HasIndex("FinancialFactId", "Axis", "Member")
-                        .IsUnique();
-
-                    b.ToTable("FinancialFactDimension");
                 });
 
             modelBuilder.Entity("Equibles.Sec.FinancialFacts.Data.Models.FinancialFactsSyncStatus", b =>
@@ -8612,6 +8719,17 @@ namespace Equibles.Migrations.Migrations
                     b.Navigation("Issuer");
                 });
 
+            modelBuilder.Entity("Equibles.Sec.FinancialFacts.Data.Models.FinancialDimensionSetMember", b =>
+                {
+                    b.HasOne("Equibles.Sec.FinancialFacts.Data.Models.FinancialDimensionSet", "DimensionSet")
+                        .WithMany("Members")
+                        .HasForeignKey("DimensionSetKey")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("DimensionSet");
+                });
+
             modelBuilder.Entity("Equibles.Sec.FinancialFacts.Data.Models.FinancialFact", b =>
                 {
                     b.HasOne("Equibles.Sec.Data.Models.Document", "Document")
@@ -8635,17 +8753,6 @@ namespace Equibles.Migrations.Migrations
                     b.Navigation("FinancialConcept");
 
                     b.Navigation("Issuer");
-                });
-
-            modelBuilder.Entity("Equibles.Sec.FinancialFacts.Data.Models.FinancialFactDimension", b =>
-                {
-                    b.HasOne("Equibles.Sec.FinancialFacts.Data.Models.FinancialFact", "FinancialFact")
-                        .WithMany("Dimensions")
-                        .HasForeignKey("FinancialFactId")
-                        .OnDelete(DeleteBehavior.Cascade)
-                        .IsRequired();
-
-                    b.Navigation("FinancialFact");
                 });
 
             modelBuilder.Entity("Equibles.Sec.FinancialFacts.Data.Models.FinancialFactsSyncStatus", b =>
@@ -8870,9 +8977,9 @@ namespace Equibles.Migrations.Migrations
                     b.Navigation("Facts");
                 });
 
-            modelBuilder.Entity("Equibles.Sec.FinancialFacts.Data.Models.FinancialFact", b =>
+            modelBuilder.Entity("Equibles.Sec.FinancialFacts.Data.Models.FinancialDimensionSet", b =>
                 {
-                    b.Navigation("Dimensions");
+                    b.Navigation("Members");
                 });
 #pragma warning restore 612, 618
         }

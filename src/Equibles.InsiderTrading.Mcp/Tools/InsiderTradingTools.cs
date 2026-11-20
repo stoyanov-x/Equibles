@@ -76,6 +76,11 @@ public class InsiderTradingTools
         ["Other"] = TransactionCode.Other,
     };
 
+    // SEC code M covers both the exercise and the conversion of a derivative, and nearly every
+    // such row is an option exercise, so the bare enum name misread it as a conversion.
+    private static string TypeLabel(TransactionCode code) =>
+        code == TransactionCode.Conversion ? "Exercise/Conversion" : code.NameForHumans();
+
     private const string AcceptedTransactionTypes =
         "Buy, Sell, Award, Conversion, Exercise, TaxPayment, Expiration, Gift, Inheritance, Discretionary, Other";
 
@@ -85,7 +90,7 @@ public class InsiderTradingTools
         ReadOnly = true
     )]
     [Description(
-        "Get recent insider trading transactions for a stock from SEC Forms 4 and 5, newest first. Form 3 supplies initial ownership rather than a transaction. The Type column carries the SEC transaction code meaning: 'Buy'/'Sell' are open-market purchases/sales only, while Award, Conversion, Exercise, Tax Payment, Expiration, Gift, Inheritance, Discretionary and Other are compensation or derivative mechanics — not conviction trades. The 10b5-1 column marks trades made under a pre-arranged Rule 10b5-1 plan ('-' = filing predates the 2023 checkbox). Per-row Shares/Price/Value are as filed; Owned After is the post-transaction balance restated onto today's split basis, tracked per security kind and ownership form. Supports optional date-range, transaction-type and insider-name filters to reach history beyond the newest rows. Use this to understand insider buying/selling activity."
+        "Get recent insider trading transactions for a stock from SEC Forms 4 and 5, newest first. Form 3 supplies initial ownership rather than a transaction. Type is the SEC transaction code: 'Buy'/'Sell' are open-market purchases/sales only, while Award, Exercise/Conversion (SEC code M: a derivative exercised or converted into shares, typically a stock-option exercise; filter value Conversion), Exercise (code X), Tax Payment, Expiration, Gift, Inheritance, Discretionary and Other are compensation or derivative mechanics, not conviction trades. 10b5-1 marks trades under a pre-arranged Rule 10b5-1 plan ('-' = filing predates the 2023 checkbox). Date is the transaction day; Filed is the day its Form 4 or 5 reached the SEC, when the trade became public. Shares/Price/Value are as filed; Owned After is the post-transaction balance on today's split basis, per security kind and ownership form. Optional date-range, transaction-type and insider-name filters reach history beyond the newest rows."
     )]
     public Task<string> GetInsiderTransactions(
         [Description("Company ticker symbol (e.g., AAPL, MSFT)")] string ticker,
@@ -102,7 +107,7 @@ public class InsiderTradingTools
         )]
             string toDate = null,
         [Description(
-            "Only include one transaction type: Buy, Sell, Award, Conversion, Exercise, TaxPayment, Expiration, Gift, Inheritance, Discretionary or Other (optional)"
+            "Only include one transaction type: Buy, Sell, Award, Conversion (SEC code M, option exercises included), Exercise (code X), TaxPayment, Expiration, Gift, Inheritance, Discretionary or Other (optional)"
         )]
             string transactionType = null,
         [Description(
@@ -228,16 +233,16 @@ public class InsiderTradingTools
                 );
                 sb.AppendLine();
                 sb.AppendLine(
-                    "| Date | Insider | Role | Type | Shares | Price | Value | Owned After | Security | Ownership | 10b5-1 |"
+                    "| Date | Filed | Insider | Role | Type | Shares | Price | Value | Owned After | Security | Ownership | 10b5-1 |"
                 );
                 sb.AppendLine(
-                    "|------|---------|------|------|--------|-------|-------|-------------|----------|-----------|--------|"
+                    "|------|-------|---------|------|------|--------|-------|-------|-------------|----------|-----------|--------|"
                 );
                 sb.AppendRows(
                     transactions,
                     t =>
                     {
-                        var role = GetRole(t.InsiderOwner);
+                        var role = InsiderRoleLabel.Of(t.InsiderOwner, t.OwnerRelationship);
                         // Reserve the Buy/Sell trade labels strictly for open-market
                         // purchases/sales; every other SEC code renders its own meaning so
                         // comp mechanics (conversions, tax withholding, expirations) are
@@ -246,7 +251,7 @@ public class InsiderTradingTools
                         {
                             TransactionCode.Purchase => "Buy",
                             TransactionCode.Sale => "Sell",
-                            _ => t.TransactionCode.NameForHumans(),
+                            _ => TypeLabel(t.TransactionCode),
                         };
 
                         var value = t.Shares * t.PricePerShare;
@@ -268,7 +273,7 @@ public class InsiderTradingTools
                             t.SecurityTitle,
                             t.SecurityKind.NameForHumans()
                         );
-                        return $"| {t.TransactionDate:yyyy-MM-dd} | {t.InsiderOwner.Name} | {role} | {type} | {McpFormat.WholeNumber(t.Shares)} | ${McpFormat.Invariant(t.PricePerShare, "N2")} | ${McpFormat.WholeNumber(value)} | {McpFormat.WholeNumber(ownedAfter)} | {security} | {t.OwnershipNature.NameForHumans()} | {plan} |";
+                        return $"| {t.TransactionDate:yyyy-MM-dd} | {t.FilingDate:yyyy-MM-dd} | {t.InsiderOwner.Name} | {role} | {type} | {McpFormat.WholeNumber(t.Shares)} | ${McpFormat.Invariant(t.PricePerShare, "N2")} | ${McpFormat.WholeNumber(value)} | {McpFormat.WholeNumber(ownedAfter)} | {security} | {t.OwnershipNature.NameForHumans()} | {plan} |";
                     }
                 );
 
@@ -292,7 +297,7 @@ public class InsiderTradingTools
         ReadOnly = true
     )]
     [Description(
-        "Get a summary of insider ownership for a stock, ranked by total shares held. Shares come from each insider's most recent SEC Form 3/4/5 filing: the filing's closing balance per security, held directly or through each indirect vehicle the filing names (a trust, partnership or LLC, told apart by its stated nature of ownership and by which balance each trade continues), actual shares only (options and other derivative holdings are excluded), summed into Direct and Indirect columns and restated onto today's split basis, so they can differ from the raw figures in older filings. A vehicle the newest filing does not list is not counted. Former insiders may linger with stale dates or zero shares. Returns at most maxResults insiders (default 30). Use this to understand the insider ownership structure of a company; use GetInsiderTransactions for the underlying trades."
+        "Get a summary of insider ownership for a stock, ranked by total shares held. Shares come from each insider's most recent SEC Form 3/4/5 filing: the filing's closing balance per security, held directly or through each indirect vehicle the filing names (a trust, partnership or LLC, told apart by its stated nature of ownership and by which balance each trade continues), actual shares only (options and other derivative holdings are excluded), summed into Direct and Indirect columns and restated onto today's split basis, so they can differ from the raw figures in older filings. A vehicle the newest filing does not list is not counted. Last Transaction is the newest trade that filing reports, or Holding when it reports positions only. Former insiders may linger with stale dates or zero shares. Returns at most maxResults insiders (default 30). Use this to understand the insider ownership structure of a company; use GetInsiderTransactions for the underlying trades."
     )]
     public Task<string> GetInsiderOwnership(
         [Description("Company ticker symbol (e.g., AAPL, MSFT)")] string ticker,
@@ -352,7 +357,7 @@ public class InsiderTradingTools
                 );
                 sb.AppendLine($"Showing {ranked.Count} insiders with most recent data");
                 sb.AppendLine(
-                    "_Each row is as-of that insider's most recent filing: the filing's closing balance per security, held directly or through each indirect vehicle it names (actual shares only), summed into Direct and Indirect and restated onto today's split basis. A vehicle the newest filing does not list is not counted. Former insiders may linger with stale dates or zero shares._"
+                    "_Each row is as-of that insider's most recent filing: the filing's closing balance per security, held directly or through each indirect vehicle it names (actual shares only), summed into Direct and Indirect and restated onto today's split basis. A vehicle the newest filing does not list is not counted. Last Transaction is the newest trade that filing reports, or Holding when it reports positions only. Former insiders may linger with stale dates or zero shares._"
                 );
                 sb.AppendLine();
                 sb.AppendLine(
@@ -365,10 +370,14 @@ public class InsiderTradingTools
                     ranked,
                     p =>
                     {
-                        var role = GetRole(p.Anchor.InsiderOwner);
-                        var lastType = p.Anchor.TransactionCode.NameForHumans();
+                        var role = InsiderRoleLabel.Of(
+                            p.Anchor.InsiderOwner,
+                            p.Anchor.OwnerRelationship
+                        );
+                        var latest = p.LatestActivity;
+                        var lastType = TypeLabel(latest.TransactionCode);
                         var total = McpFormat.WholeNumber(p.DirectShares + p.IndirectShares);
-                        return $"| {p.Anchor.InsiderOwner.Name} | {role} | {McpFormat.WholeNumber(p.DirectShares)} | {McpFormat.WholeNumber(p.IndirectShares)} | {total} | {lastType} | {p.Anchor.TransactionDate:yyyy-MM-dd} |";
+                        return $"| {p.Anchor.InsiderOwner.Name} | {role} | {McpFormat.WholeNumber(p.DirectShares)} | {McpFormat.WholeNumber(p.IndirectShares)} | {total} | {lastType} | {latest.TransactionDate:yyyy-MM-dd} |";
                     }
                 );
 
@@ -625,7 +634,11 @@ public class InsiderTradingTools
                     insiders,
                     insider =>
                     {
-                        var role = GetRole(insider);
+                        // The role shown is the one filed at the company on the same row.
+                        var role = InsiderRoleLabel.Of(
+                            insider,
+                            latestByOwner.GetValueOrDefault(insider.Id)?.OwnerRelationship
+                        );
                         var company =
                             latestByOwner.TryGetValue(insider.Id, out var transaction)
                             && transaction.Issuer != null
@@ -654,8 +667,6 @@ public class InsiderTradingTools
             $"query: {query}, offset: {offset}"
         );
     }
-
-    private static string GetRole(InsiderOwner owner) => InsiderRoleLabel.Of(owner);
 
     // Thin forwarder so existing reflection-based normalization tests still find the method.
     private Task<(EquityIssuer Stock, string Error)> ResolveStockByTicker(string ticker) =>

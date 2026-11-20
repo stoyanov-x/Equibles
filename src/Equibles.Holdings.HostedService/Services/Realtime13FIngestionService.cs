@@ -88,6 +88,16 @@ public class Realtime13FIngestionService
             .AsNoTracking()
             .ToListAsync(cancellationToken);
         var recoveringManagers = pendingRows.Select(row => row.Cik.TrimStart('0')).ToHashSet();
+        var retained = await LoadRetainedAccessions(
+            entries
+                .Where(e =>
+                    recoveringManagers.Contains(e.Cik.TrimStart('0'))
+                    && !alreadyProcessed.Contains(e.AccessionNumber)
+                )
+                .Select(e => e.AccessionNumber)
+                .ToList(),
+            cancellationToken
+        );
         var retryFrom = new Dictionary<string, DateOnly>();
 
         // Sort chronologically so originals are always imported before their
@@ -117,7 +127,10 @@ public class Realtime13FIngestionService
                         entry.AccessionNumber,
                         entry.Cik.TrimStart('0'),
                         entry.DateFiled,
-                        cancellationToken
+                        cancellationToken,
+                        reason: retained.Contains(entry.AccessionNumber)
+                            ? HoldingsImportFailureReason.StoredReplay
+                            : HoldingsImportFailureReason.PendingRecovery
                     );
                 continue;
             }
@@ -188,6 +201,107 @@ public class Realtime13FIngestionService
         );
 
         return new RealtimeIngestionResult(totalImported, earliestRetryDate);
+    }
+
+    /// <summary>
+    /// Queues for recovery, without importing, every filing in the window that is neither processed
+    /// nor stored. A rewound sweep reaches these days last, and importing a filing here would let
+    /// the sweep re-apply an older one over it; recovery walks each manager's tail in order.
+    /// Returns the earliest day whose index could not be read.
+    /// </summary>
+    public virtual async Task<DateOnly?> QueueUnseenFilings(
+        DateOnly today,
+        int lookbackDays,
+        CancellationToken cancellationToken
+    )
+    {
+        var (entries, earliestFailedDate) = await DiscoverEntries(
+            today,
+            lookbackDays,
+            cancellationToken
+        );
+        var queued = await QueueUnstored(entries, cancellationToken);
+        if (queued > 0)
+            _logger.LogInformation(
+                "13F discovery queued {Count} unstored filings ahead of the sweep",
+                queued
+            );
+        return earliestFailedDate;
+    }
+
+    /// <summary>
+    /// Queues for recovery the 13F filings EDGAR's latest-filings feed just listed, hours before
+    /// the day's index exists. Returns how many were queued; a filing already processed, stored
+    /// or queued is left alone.
+    /// </summary>
+    public virtual async Task<int> QueueFeedFilings(
+        IReadOnlyCollection<EdgarRecentFilingEntry> feedEntries,
+        CancellationToken cancellationToken
+    )
+    {
+        var entries = feedEntries
+            .Where(entry =>
+                entry.FormType is "13F-HR" or "13F-HR/A"
+                && !string.IsNullOrEmpty(entry.AccessionNumber)
+                && !string.IsNullOrEmpty(entry.Cik)
+            )
+            .DistinctBy(entry => entry.AccessionNumber, StringComparer.OrdinalIgnoreCase)
+            .Select(entry => new EdgarDailyIndexEntry
+            {
+                FormType = entry.FormType,
+                CompanyName = entry.CompanyName,
+                Cik = entry.Cik,
+                AccessionNumber = entry.AccessionNumber,
+                // The acceptance day in SEC's own offset. A filing accepted after 17:30 ET is
+                // dated the next business day, so this is never later than its filing date.
+                DateFiled = DateOnly.FromDateTime((entry.Updated ?? DateTimeOffset.UtcNow).Date),
+            })
+            .ToList();
+        if (entries.Count == 0)
+            return 0;
+        var queued = await QueueUnstored(entries, cancellationToken);
+        if (queued > 0)
+            _logger.LogInformation(
+                "13F live feed queued {Count} newly filed 13F filings for import",
+                queued
+            );
+        return queued;
+    }
+
+    // Queues the entries that are neither processed, stored nor already queued; returns how many.
+    private async Task<int> QueueUnstored(
+        IReadOnlyCollection<EdgarDailyIndexEntry> entries,
+        CancellationToken cancellationToken
+    )
+    {
+        var processed = await LoadProcessedAccessions(
+            entries.Select(e => e.AccessionNumber),
+            cancellationToken
+        );
+        var unseen = entries.Where(e => !processed.Contains(e.AccessionNumber)).ToList();
+        var retained = await LoadRetainedAccessions(
+            unseen.Select(e => e.AccessionNumber).ToList(),
+            cancellationToken
+        );
+        // A stored filing is the rewound sweep's to re-apply; only one never stored is owed now.
+        unseen.RemoveAll(e => retained.Contains(e.AccessionNumber));
+        if (unseen.Count == 0)
+            return 0;
+
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var failures = scope.ServiceProvider.GetRequiredService<HoldingsImportFailureRepository>();
+        var queued = 0;
+        foreach (var entry in unseen)
+            queued += await failures.EnqueueRecovery(
+                entry.AccessionNumber,
+                entry.Cik.TrimStart('0'),
+                // A filing EDGAR lists again on a later day is recovered from the day it was
+                // filed: the manager's tail is read from this date on.
+                entry.StatedFilingDate
+                    ?? entry.DateFiled,
+                cancellationToken
+            );
+        return queued;
     }
 
     /// <summary>
@@ -415,6 +529,8 @@ public class Realtime13FIngestionService
             entry.Cik,
             filing.PeriodOfReport
         );
+        if (filing.ConfidentialOmitted)
+            await RecordConfidentialFiling(entry, filing, cancellationToken);
 
         ImportResult importResult;
         try
@@ -628,6 +744,206 @@ public class Realtime13FIngestionService
             );
     }
 
+    // Recorded before the import: a report that withholds its whole book stores no holdings, and
+    // this row then is the only trace that the filer reported the quarter.
+    private async Task RecordConfidentialFiling(
+        EdgarDailyIndexEntry entry,
+        Parsed13FFiling filing,
+        CancellationToken cancellationToken
+    )
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        await scope
+            .ServiceProvider.GetRequiredService<Form13FConfidentialFilingRepository>()
+            .Record(
+                entry.AccessionNumber,
+                filing.Cik,
+                filing.PeriodOfReport,
+                entry.StatedFilingDate ?? entry.DateFiled,
+                filing.IsAmendment,
+                filing.TableEntryTotal,
+                filing.Holdings.Count(holding => holding.Shares > 0 || holding.Value > 0),
+                cancellationToken
+            );
+    }
+
+    /// <summary>
+    /// Records the confidential-treatment report of filings the recovery queue closed as
+    /// withholding their positions before such reports were recorded. Each one leaves the set
+    /// once recorded, here or by the data set that carries its summary page, so the pass ends by
+    /// itself.
+    /// </summary>
+    public virtual async Task<int> RecordClosedConfidentialFilings(
+        int limit,
+        CancellationToken cancellationToken
+    )
+    {
+        List<HoldingsImportFailure> closed;
+        await using (var scope = _scopeFactory.CreateAsyncScope())
+            closed = await scope
+                .ServiceProvider.GetRequiredService<HoldingsImportFailureRepository>()
+                .GetConfidentialClosuresWithoutReport()
+                .AsNoTracking()
+                .OrderByDescending(row => row.FilingDate)
+                .ThenBy(row => row.AccessionNumber)
+                .Take(limit)
+                .ToListAsync(cancellationToken);
+
+        var recorded = 0;
+        foreach (var row in closed)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var entry = new EdgarDailyIndexEntry
+            {
+                AccessionNumber = row.AccessionNumber,
+                Cik = row.Cik,
+                DateFiled = row.FilingDate,
+                FormType = "13F-HR",
+            };
+            try
+            {
+                if (await RecordConfidentialFilingOf(entry, cancellationToken))
+                    recorded++;
+            }
+            catch (HttpRequestException exception)
+            {
+                _logger.LogWarning(
+                    exception,
+                    "Failed to fetch 13F {Accession} for its confidential-treatment report; the rest waits for the next cycle",
+                    row.AccessionNumber
+                );
+                break;
+            }
+        }
+
+        if (recorded > 0)
+            _logger.LogInformation(
+                "Recorded the confidential-treatment report of {Count} earlier 13F filings",
+                recorded
+            );
+        return recorded;
+    }
+
+    // EDGAR publishes a day's index that night, so an empty one this recent may be unpublished.
+    internal const int DailyIndexPublicationDays = 3;
+
+    /// <summary>
+    /// Records the confidential-treatment reports among one day's filings that the sweep imported,
+    /// before such reports were recorded, without storing a row: a withheld book stores none, and
+    /// a filing with stored rows is left to the data set that carries its summary page. Returns
+    /// false when the day could not be read whole, so the caller retries it.
+    /// </summary>
+    public virtual async Task<bool> RecordConfidentialFilingsOf(
+        DateOnly day,
+        CancellationToken cancellationToken
+    )
+    {
+        List<EdgarDailyIndexEntry> entries;
+        try
+        {
+            entries = await _edgarClient.GetDailyIndex(day, cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _logger.LogWarning(
+                exception,
+                "Failed to fetch the {Date:yyyy-MM-dd} daily index for confidential-treatment reports",
+                day
+            );
+            return false;
+        }
+        if (
+            entries.Count == 0
+            && day.DayOfWeek is not (DayOfWeek.Saturday or DayOfWeek.Sunday)
+            && day.DayNumber
+                >= DateOnly.FromDateTime(DateTime.UtcNow).DayNumber - DailyIndexPublicationDays
+        )
+            return false;
+
+        var imported = await LoadProcessedAccessions(
+            entries
+                .Where(entry => !string.IsNullOrEmpty(entry.AccessionNumber))
+                .Select(entry => entry.AccessionNumber),
+            cancellationToken
+        );
+        var stored = await LoadRetainedAccessions(imported.ToList(), cancellationToken);
+        HashSet<string> reported;
+        await using (var scope = _scopeFactory.CreateAsyncScope())
+            reported = (
+                await scope
+                    .ServiceProvider.GetRequiredService<Form13FConfidentialFilingRepository>()
+                    .GetAll()
+                    .Where(report => imported.Contains(report.AccessionNumber))
+                    .Select(report => report.AccessionNumber)
+                    .ToListAsync(cancellationToken)
+            ).ToHashSet();
+
+        var recorded = 0;
+        foreach (
+            var entry in entries.Where(entry =>
+                imported.Contains(entry.AccessionNumber)
+                && !stored.Contains(entry.AccessionNumber)
+                && !reported.Contains(entry.AccessionNumber)
+            )
+        )
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                if (await RecordConfidentialFilingOf(entry, cancellationToken))
+                    recorded++;
+            }
+            catch (HttpRequestException exception)
+            {
+                _logger.LogWarning(
+                    exception,
+                    "Failed to fetch 13F {Accession} for its confidential-treatment report; retrying the day",
+                    entry.AccessionNumber
+                );
+                return false;
+            }
+        }
+
+        if (recorded > 0)
+            _logger.LogInformation(
+                "Recorded {Count} confidential-treatment 13F reports filed {Date:yyyy-MM-dd}",
+                recorded,
+                day
+            );
+        return true;
+    }
+
+    // An unreadable filing stays to the data set that carries its summary page; an unreachable
+    // source throws, so the caller retries.
+    private async Task<bool> RecordConfidentialFilingOf(
+        EdgarDailyIndexEntry entry,
+        CancellationToken cancellationToken
+    )
+    {
+        Parsed13FFiling filing;
+        try
+        {
+            filing = await ParseFiling(entry, cancellationToken);
+        }
+        catch (Exception exception)
+            when (exception is not (OperationCanceledException or HttpRequestException))
+        {
+            _logger.LogWarning(
+                exception,
+                "Could not read 13F {Accession} for its confidential-treatment report",
+                entry.AccessionNumber
+            );
+            return false;
+        }
+        if (
+            filing is not { ConfidentialOmitted: true }
+            || filing.PeriodOfReport == DateOnly.MinValue
+        )
+            return false;
+        await RecordConfidentialFiling(entry, filing, cancellationToken);
+        return true;
+    }
+
     private async Task RecordFailure(
         EdgarDailyIndexEntry entry,
         DateOnly? reportDate,
@@ -752,6 +1068,23 @@ public class Realtime13FIngestionService
         var repo = scope.ServiceProvider.GetRequiredService<ProcessedFilingRepository>();
 
         return await LoadProcessedSet(repo, accessionNumbers, cancellationToken);
+    }
+
+    private async Task<HashSet<string>> LoadRetainedAccessions(
+        IReadOnlyCollection<string> accessionNumbers,
+        CancellationToken cancellationToken
+    )
+    {
+        if (accessionNumbers.Count == 0)
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var holdings = scope.ServiceProvider.GetRequiredService<InstitutionalHoldingRepository>();
+        return new HashSet<string>(
+            await holdings
+                .GetRetained13FAccessionsAmong(accessionNumbers)
+                .ToListAsync(cancellationToken),
+            StringComparer.OrdinalIgnoreCase
+        );
     }
 
     internal async Task<bool> RecordProcessed(

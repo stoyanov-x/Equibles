@@ -12,8 +12,10 @@ using Equibles.Integrations.Sec;
 using Equibles.Integrations.Sec.Contracts;
 using Equibles.Integrations.Sec.Models;
 using Equibles.Messaging.Contracts.CommonStocks;
+using Equibles.Sec.Data.Models;
 using Equibles.Sec.FinancialFacts.BusinessLogic;
 using Equibles.Sec.FinancialFacts.Data.Models;
+using Equibles.Yahoo.Data.Models;
 using MassTransit;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -69,6 +71,7 @@ public class CompanySyncService : ICompanySyncService
             );
 
             await MaintainFiledEvidence(secCompanies);
+            secCompanies.AddRange(await AdmitOnListingEvidence());
 
             if (_workerOptions.TickersToSync?.Count > 0)
             {
@@ -217,6 +220,47 @@ public class CompanySyncService : ICompanySyncService
         }
     }
 
+    // SEC's directory can show a newly listed registrant with a blank exchange for days after it
+    // starts trading; those rows are admitted only on filed listing evidence (SecListingEvidence).
+    // A failure here admits nobody and never stops the sync.
+    private async Task<List<CompanyInfo>> AdmitOnListingEvidence()
+    {
+        try
+        {
+            var unlisted = await _secEdgarClient.GetUnlistedTickerRegistrants() ?? [];
+            if (_workerOptions.TickersToSync?.Count > 0)
+                unlisted = unlisted
+                    .Where(c =>
+                        c.Tickers.Any(ticker => _workerOptions.TickersToSync.Contains(ticker))
+                    )
+                    .ToList();
+            if (unlisted.Count == 0)
+                return [];
+
+            using var scope = _serviceScopeFactory.CreateScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<EquiblesFinancialDbContext>();
+            var admitted = await SecListingAdmission.Admit(
+                dbContext,
+                _secEdgarClient,
+                unlisted,
+                DateTime.UtcNow,
+                _logger
+            );
+            _logger.LogInformation(
+                "Admitted {Admitted} of {Unlisted} blank-exchange SEC registrants on listing evidence",
+                admitted.Count,
+                unlisted.Count
+            );
+            return admitted;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error admitting blank-exchange SEC registrants");
+            await ReportError("CompanySync.AdmitOnListingEvidence", ex, "");
+            return [];
+        }
+    }
+
     // A registrant SEC no longer lists keeps the name the sync last gave it, so the filing-suffix rule
     // reaches it here. Only the suffix goes: re-casing a name another source wrote is not this pass's call.
     private async Task DropFilingSuffixesFromDepartedRegistrants(StockSyncState state)
@@ -354,6 +398,41 @@ public class CompanySyncService : ICompanySyncService
         return result;
     }
 
+    // How recent a stored bar must be for the presenting line to count as still trading.
+    internal const int TradedLineWindowDays = 10;
+
+    // SEC lists a new symbol (a second exchange line, a ticker change during its changeover) days
+    // before the price provider serves it. Moving the presentation there leaves the company with
+    // no price while the line it had still trades, so that line keeps the presentation until the
+    // new symbol holds a stored bar. A host without the price module holds nothing.
+    private static async Task<bool> HoldsPresentation(
+        EquityIssuer issuer,
+        EquityListing presenting,
+        string candidateTicker,
+        StockSyncState state
+    )
+    {
+        if (state.DbContext.Model.FindEntityType(typeof(EquityDailyStockPrice)) == null)
+            return false;
+        var prices = state.DbContext.Set<EquityDailyStockPrice>().AsNoTracking();
+        var candidateId = issuer
+            .Securities.SelectMany(security => security.Listings)
+            .Where(listing =>
+                listing.MarketCountryCode == "US" && listing.Ticker == candidateTicker
+            )
+            .Select(listing => (Guid?)listing.Id)
+            .FirstOrDefault();
+        if (
+            candidateId != null
+            && await prices.AnyAsync(price => price.EquityListingId == candidateId)
+        )
+            return false;
+        var tradedSince = DateOnly.FromDateTime(DateTime.UtcNow).AddDays(-TradedLineWindowDays);
+        return await prices.AnyAsync(price =>
+            price.EquityListingId == presenting.Id && price.Date >= tradedSince
+        );
+    }
+
     private async Task UpdateExistingStock(
         CompanyInfo secCompany,
         string primaryTicker,
@@ -366,6 +445,26 @@ public class CompanySyncService : ICompanySyncService
             CikNormalizer.Canonicalize(stock.Cik) == canonicalCik
         );
         var normalizedName = NormalizeCompanyName(secCompany.Name);
+        var presenting = existingStock.Presentation?.Listing;
+        if (
+            presenting is { MarketCountryCode: "US", Active: true, DelistedOn: null }
+            && presenting.Ticker != primaryTicker
+            && secondaryTickers.Contains(presenting.Ticker)
+            // A ticker another company presents stays with the collision path below.
+            && !(
+                state.PrimaryTickerToStock.TryGetValue(primaryTicker, out var holder)
+                && holder.Id != existingStock.Id
+            )
+            && await HoldsPresentation(existingStock, presenting, primaryTicker, state)
+        )
+        {
+            secondaryTickers =
+            [
+                .. secondaryTickers.Where(ticker => ticker != presenting.Ticker),
+                primaryTicker,
+            ];
+            primaryTicker = presenting.Ticker;
+        }
         var combinedSecondaryTickers = MergeSecondaryTickers(
             primaryTicker,
             secondaryTickers,
@@ -455,6 +554,8 @@ public class CompanySyncService : ICompanySyncService
                 .ToList()
         );
         var directorySnapshot = new EquityDirectorySnapshot(state.DbContext, existingStock);
+        var firstListing = existingStock.Presentation == null;
+        var listed = false;
         // Save old values for change detection.
         var oldUsListing = existingStock.Presentation?.Listing
             is { MarketCountryCode: "US" } usListing
@@ -553,6 +654,7 @@ public class CompanySyncService : ICompanySyncService
             await state.CommonStockManager.Update(existingStock);
             if (identityTransaction != null)
                 await identityTransaction.CommitAsync();
+            listed = firstListing;
 
             if (oldTicker != primaryTicker)
             {
@@ -606,6 +708,40 @@ public class CompanySyncService : ICompanySyncService
                 "CompanySync.UpdateStock",
                 ex,
                 $"ticker: {primaryTicker}, cik: {secCompany.Cik}"
+            );
+        }
+
+        if (listed)
+            await ResetFilingSync(state, existingStock);
+    }
+
+    // A filer followed before it listed was synced for its registration statements only (SecForm.SyncsFor).
+    // Dropping its sync stamp puts it first in the scraper's next reconciliation, so its other forms (Form 3s,
+    // the closing 8-K) arrive within minutes of the listing, as a newly created company's do.
+    private async Task ResetFilingSync(StockSyncState state, EquityIssuer issuer)
+    {
+        List<CompanyFilingSyncState> stamps = [];
+        try
+        {
+            stamps = await state
+                .DbContext.Set<CompanyFilingSyncState>()
+                .Where(stamp => stamp.EquityIssuerId == issuer.Id)
+                .ToListAsync();
+            if (stamps.Count == 0)
+                return;
+            state.DbContext.RemoveRange(stamps);
+            await state.DbContext.SaveChangesAsync();
+        }
+        catch (Exception ex)
+        {
+            // A kept stamp only delays the other forms to the 24-hour reconciliation. The queued delete must
+            // not ride the run's next save, which would fail it if this one landed and only its reply was lost.
+            foreach (var stamp in stamps)
+                state.DbContext.Entry(stamp).State = EntityState.Detached;
+            _logger.LogWarning(
+                ex,
+                "Could not reset the filing sync of newly listed {IssuerId}",
+                issuer.Id
             );
         }
     }

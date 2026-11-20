@@ -62,6 +62,7 @@ public class StandaloneXbrlParser
 
         try
         {
+            xml = StripSgmlWrapper(xml);
             if (!TryReadContextsAndUnits(xml, out var contexts, out var units))
                 return [];
             return ReadFacts(xml, contexts, units);
@@ -72,17 +73,23 @@ public class StandaloneXbrlParser
         }
     }
 
+    // Stored SEC TEXT bodies retain the SGML <XBRL> wrapper around the XML instance, and the inner
+    // declaration it encloses is not one an XML reader accepts. Every entry point strips it first.
+    private static string StripSgmlWrapper(string xml)
+    {
+        xml = xml.Trim();
+        return
+            xml.StartsWith("<XBRL>", StringComparison.Ordinal)
+            && xml.EndsWith("</XBRL>", StringComparison.Ordinal)
+            ? xml[6..^7].Trim()
+            : xml;
+    }
+
     public List<ParsedFiscalYearEnd> ParseFiscalYearEnds(string xml)
     {
         if (string.IsNullOrWhiteSpace(xml))
             return [];
-        // Stored SEC TEXT bodies retain this SGML wrapper around the XML instance.
-        xml = xml.Trim();
-        if (
-            xml.StartsWith("<XBRL>", StringComparison.Ordinal)
-            && xml.EndsWith("</XBRL>", StringComparison.Ordinal)
-        )
-            xml = xml[6..^7].Trim();
+        xml = StripSgmlWrapper(xml);
 
         var observations = new List<ParsedFiscalYearEnd>();
         try

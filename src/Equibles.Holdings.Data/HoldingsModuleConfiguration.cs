@@ -87,11 +87,12 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
             })
             .IsCreatedConcurrently();
 
-        // Partial covering index for the holder-rank aggregate on the single-holder /
-        // single-stock page. That query needs only common-share 13F rows for one
-        // stock+quarter, grouped by holder and summed by Value. Keeping the predicate
-        // in the index avoids heap-filtering FilingType / OptionType while ingestion is
-        // churning the 30M+ row holdings table (#6049).
+        // Partial covering index built for the holder-rank aggregate on the single-holder /
+        // single-stock page (#6049): 13F rows with no option type for one stock+quarter,
+        // grouped by holder and summed by Value. That aggregate now also leaves principal
+        // rows out (ShareType), which this index cannot answer without heap fetches, so it
+        // reads IX_InstitutionalHolding_StockQuarterExposure above, index-only. This index
+        // stays until production shows no scans of it, then a migration drops it.
         builder
             .Entity<InstitutionalHolding>()
             .HasIndex(h => new
@@ -309,6 +310,7 @@ public class HoldingsModuleConfiguration : Equibles.Data.IFinancialModule
         builder.Entity<Form13FNotice>();
         builder.Entity<Form13FNoticeReporter>();
         builder.Entity<Form13FNoticeDataSet>();
+        builder.Entity<Form13FConfidentialFiling>();
         builder.Entity<ProcessedDataSet>();
         builder.Entity<ProcessedDataSetAccession>();
         builder.Entity<HoldingsCusipRescan>();

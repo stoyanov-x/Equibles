@@ -15,7 +15,8 @@ internal static class EquityDirectoryListingInputValidator
     }
 
     private static bool Source(EquityDirectoryListingInput input) =>
-        Text(input.Source, 64)
+        input.ProvenIssuerId != Guid.Empty
+        && Text(input.Source, 64)
         && Text(input.SourceIssuerIdentifier, 128)
         && Text(input.IssuerName, 500)
         && input.IssuerNameAliases != null
@@ -35,6 +36,11 @@ internal static class EquityDirectoryListingInputValidator
         if (input.Isin != null && !InternationalSecurityIdentifiers.IsValidIsin(input.Isin))
             return false;
         if (input.Isin == null && input.SourceSecurityIdentifier == null)
+            return false;
+        if (
+            input.IsinSupersedesRecorded
+            && (input.Isin == null || input.SourceSecurityIdentifier == null)
+        )
             return false;
         if ((input.SourceSecurityIdentifier == null) != (input.SourceListingIdentifier == null))
             return false;

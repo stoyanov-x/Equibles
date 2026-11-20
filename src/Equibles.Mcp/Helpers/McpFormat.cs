@@ -7,6 +7,10 @@ public static class McpFormat
 {
     private const string Dash = "—";
 
+    // A stored decimal in plain digits without its storage scale (3.6300000000 reads 3.63).
+    // "G29" drops the zeros too, but prints anything below 0.0001 in scientific notation (1E-06).
+    public const string PlainDecimal = "0.############################";
+
     // Formats a nullable value with the given format string, or the em-dash placeholder when null.
     // Always formats with InvariantCulture so MCP markdown does not fork the separators by host locale.
     public static string OrDash<T>(T? value, string format)
@@ -49,6 +53,28 @@ public static class McpFormat
 
     // Nullable companion to Price: em-dash when null.
     public static string PriceOrDash(decimal? value) => value.HasValue ? Price(value.Value) : Dash;
+
+    // A declared per-share amount (a dividend) at the precision the issuer declared, at least two
+    // decimals and at most six: Price's two decimals turned AT&T's $0.2775 into $0.28.
+    public static string PerShareAmount(decimal value) =>
+        Math.Round(value, 6, MidpointRounding.AwayFromZero)
+            .ToString("0.00####", CultureInfo.InvariantCulture);
+
+    // An English ordinal ("1st", "22nd", "23rd", "11th", "54th") for rank and percentile text.
+    public static string Ordinal(long value)
+    {
+        var lastTwo = Math.Abs(value % 100);
+        var suffix = lastTwo is 11 or 12 or 13
+            ? "th"
+            : (lastTwo % 10) switch
+            {
+                1 => "st",
+                2 => "nd",
+                3 => "rd",
+                _ => "th",
+            };
+        return value.ToString(CultureInfo.InvariantCulture) + suffix;
+    }
 
     // Signed price delta (change columns): explicit +/− with Price's adaptive decimals, so a
     // sub-dollar move never rounds to a signless 0.00.

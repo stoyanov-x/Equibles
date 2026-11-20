@@ -87,30 +87,42 @@ public class SharesOutstandingAsOfReader
                 Form = fact.Form,
                 AccessionNumber = fact.AccessionNumber,
                 Consolidated = fact.DimensionsKey == "",
+                DimensionsKey = fact.DimensionsKey,
             })
             .ToListAsync(cancellationToken);
-        var dimensionalIds = facts.Where(f => !f.Consolidated).Select(f => f.Id).ToList();
-        var classMembers = new Dictionary<Guid, (string Axis, string Member)>();
-        foreach (var chunk in dimensionalIds.Chunk(5_000))
+        var dimensionalKeys = facts
+            .Where(f => !f.Consolidated)
+            .Select(f => f.DimensionsKey)
+            .Distinct()
+            .ToList();
+        var members = _financialFactRepository.GetDimensionMembers();
+        var classByKey = new Dictionary<string, (string Axis, string Member)>(
+            StringComparer.Ordinal
+        );
+        foreach (var chunk in dimensionalKeys.Chunk(5_000))
         {
-            var dimensions = await _financialFactRepository
-                .GetAll()
-                .Where(fact => chunk.Contains(fact.Id) && fact.Dimensions.Count == 1)
-                .SelectMany(fact => fact.Dimensions)
+            var dimensions = await members
                 .Where(dimension =>
-                    SharesOutstandingProvider.ClassOfStockAxes.Contains(dimension.Axis)
-                    && !SharesOutstandingProvider.NonClassMembers.Contains(dimension.Member)
+                    chunk.Contains(dimension.DimensionSetKey)
+                    && members.Count(other => other.DimensionSetKey == dimension.DimensionSetKey)
+                        == 1
+                    && SharesOutstandingProvider.ClassOfStockAxes.Contains(dimension.Axis)
+                    && !ShareClassTotal.ExcludedMembers.Contains(dimension.Member)
                 )
                 .Select(dimension => new
                 {
-                    dimension.FinancialFactId,
+                    dimension.DimensionSetKey,
                     dimension.Axis,
                     dimension.Member,
                 })
                 .ToListAsync(cancellationToken);
             foreach (var dimension in dimensions)
-                classMembers[dimension.FinancialFactId] = (dimension.Axis, dimension.Member);
+                classByKey[dimension.DimensionSetKey] = (dimension.Axis, dimension.Member);
         }
+        var classMembers = new Dictionary<Guid, (string Axis, string Member)>();
+        foreach (var fact in facts.Where(f => !f.Consolidated))
+            if (classByKey.TryGetValue(fact.DimensionsKey, out var classMember))
+                classMembers[fact.Id] = classMember;
 
         var counts = new Dictionary<Guid, SharesOutstandingAsOf>();
         foreach (var issuer in facts.GroupBy(fact => fact.IssuerId))
@@ -121,8 +133,8 @@ public class SharesOutstandingAsOfReader
 
     /// <summary>
     /// The latest-dated count: the consolidated fact of the latest filing for that date, or, when
-    /// per-class counts are stated for a date at least as late, their sum from one filing and one
-    /// axis, each class once.
+    /// per-class counts are stated for a later date, their <see cref="ShareClassTotal"/> from one
+    /// filing and one axis. A consolidated count for the same date is the entity figure itself.
     /// </summary>
     internal static SharesOutstandingAsOf Pick(
         IReadOnlyList<FactRow> facts,
@@ -143,18 +155,26 @@ public class SharesOutstandingAsOfReader
             .FirstOrDefault();
         if (
             latestClass != null
-            && (consolidated == null || latestClass.PeriodEnd >= consolidated.PeriodEnd)
+            && (consolidated == null || latestClass.PeriodEnd > consolidated.PeriodEnd)
         )
         {
             var axis = classMembers[latestClass.Id].Axis;
-            var total = classFacts
+            var axisFacts = classFacts
                 .Where(fact =>
                     fact.AccessionNumber == latestClass.AccessionNumber
-                    && fact.PeriodEnd == latestClass.PeriodEnd
                     && classMembers[fact.Id].Axis == axis
                 )
-                .GroupBy(fact => classMembers[fact.Id].Member, StringComparer.Ordinal)
-                .Sum(group => group.First().Value);
+                .ToList();
+            var total = ShareClassTotal.StatesEveryClassAt(
+                axisFacts.Select(fact => (classMembers[fact.Id].Member, fact.PeriodEnd)),
+                latestClass.PeriodEnd
+            )
+                ? ShareClassTotal.Of(
+                    axisFacts
+                        .Where(fact => fact.PeriodEnd == latestClass.PeriodEnd)
+                        .Select(fact => (classMembers[fact.Id].Member, fact.Value))
+                )
+                : null;
             if (total > 0 && total <= long.MaxValue)
                 return new SharesOutstandingAsOf(
                     (long)total,
@@ -183,6 +203,7 @@ public class SharesOutstandingAsOfReader
         public DocumentType Form { get; init; }
         public string AccessionNumber { get; init; }
         public bool Consolidated { get; init; }
+        public string DimensionsKey { get; init; }
     }
 }
 

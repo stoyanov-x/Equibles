@@ -638,6 +638,91 @@ public class YahooPriceImportServiceTests : IDisposable
         split.PriceAdjustmentAppliedTime.Should().BeNull();
     }
 
+    // A live US symbol the provider answers "not found" for is stamped and then left alone for a
+    // week: the second cycle makes no request for it.
+    [Fact]
+    public async Task Import_UsSymbolNotFound_IsStampedAndNotAskedAgainTheNextCycle()
+    {
+        EquityIssuer stock = CreateStock("NOPE", "Unknown To The Provider");
+        await SeedStocks(stock);
+        _yahooClient
+            .GetChart("NOPE", Arg.Any<DateOnly>(), Arg.Any<DateOnly>())
+            .ThrowsAsync(
+                new HttpRequestException("not found", null, System.Net.HttpStatusCode.NotFound)
+            );
+
+        await AttributeFixtureActions();
+        await _service.Import(includeEnrichment: false, CancellationToken.None);
+        await _service.Import(includeEnrichment: false, CancellationToken.None);
+
+        await _yahooClient.Received(1).GetChart("NOPE", Arg.Any<DateOnly>(), Arg.Any<DateOnly>());
+        _stockRepo
+            .GetAll()
+            .Single(row => row.Id == stock.Id)
+            .Presentation.Listing.YahooPriceSyncAttemptedAt.Should()
+            .NotBeNull();
+    }
+
+    [Fact]
+    public async Task Import_UsSymbolNewToTheDirectory_KeepsBeingAskedWhileNotFound()
+    {
+        EquityIssuer stock = CreateStock("NEW-A", "Class Listed This Week");
+        await SeedStocks(stock);
+        _dbContext.Add(
+            new SecTickerDirectoryObservation
+            {
+                Cik = stock.Cik,
+                Ticker = "NEWA",
+                Exchange = "NYSE",
+                FirstObservedOn = DateOnly.FromDateTime(DateTime.UtcNow).AddDays(-3),
+                LastObservedOn = DateOnly.FromDateTime(DateTime.UtcNow),
+            }
+        );
+        await _dbContext.SaveChangesAsync();
+        _yahooClient
+            .GetChart("NEW-A", Arg.Any<DateOnly>(), Arg.Any<DateOnly>())
+            .ThrowsAsync(
+                new HttpRequestException("not found", null, System.Net.HttpStatusCode.NotFound)
+            );
+
+        await AttributeFixtureActions();
+        await _service.Import(includeEnrichment: false, CancellationToken.None);
+        await _service.Import(includeEnrichment: false, CancellationToken.None);
+
+        await _yahooClient.Received(2).GetChart("NEW-A", Arg.Any<DateOnly>(), Arg.Any<DateOnly>());
+    }
+
+    // An issuer admitted on its final prospectus has no directory span yet (SEC still shows no
+    // exchange), and the provider often answers "not found" on its first trading morning.
+    [Fact]
+    public async Task Import_UsSymbolAdmittedOnListingEvidence_KeepsBeingAskedWhileNotFound()
+    {
+        EquityIssuer stock = CreateStock("IPOX", "Listed This Morning");
+        await SeedStocks(stock);
+        _dbContext.Add(
+            new SecListingEvidenceCheck
+            {
+                Cik = stock.Cik,
+                Tickers = ["IPOX"],
+                CheckedAt = DateTime.UtcNow,
+                Outcome = SecListingEvidenceOutcome.Admitted,
+                ProspectusFiledOn = DateOnly.FromDateTime(DateTime.UtcNow),
+            }
+        );
+        await _dbContext.SaveChangesAsync();
+        _yahooClient
+            .GetChart("IPOX", Arg.Any<DateOnly>(), Arg.Any<DateOnly>())
+            .ThrowsAsync(
+                new HttpRequestException("not found", null, System.Net.HttpStatusCode.NotFound)
+            );
+
+        await AttributeFixtureActions();
+        await _service.Import(includeEnrichment: false, CancellationToken.None);
+        await _service.Import(includeEnrichment: false, CancellationToken.None);
+
+        await _yahooClient.Received(2).GetChart("IPOX", Arg.Any<DateOnly>(), Arg.Any<DateOnly>());
+    }
+
     [Fact]
     public async Task Import_InactiveListingHttpFailure_CheckpointsAttemptWithoutCompleting()
     {
@@ -2404,6 +2489,39 @@ public class YahooPriceImportServiceTests : IDisposable
             .GetCurrentUsDirectory()
             .Single(s => s.Presentation.Listing.Ticker == "KST");
         updated.Presentation.Listing.Security.SharesOutstanding.Should().Be(5_000_000);
+    }
+
+    // The feed states its cap at its live price; stored beside our settled close it would read
+    // as a cap for a different price, so the stored figure is the count times the stored close.
+    [Fact]
+    public async Task Import_KeyStatisticsAtALivePriceInsideTheLastBar_StoresTheCapOnTheStoredClose()
+    {
+        EquityIssuer stock = CreateStock("LIV", "Live Price Co.");
+        await SeedStocks(stock);
+        var lastSession = UsMarketCalendar.PreviousTradingDay(
+            DateOnly.FromDateTime(DateTime.UtcNow)
+        );
+        await SeedPrices(CreatePrice(stock, lastSession, 150m));
+        _yahooClient
+            .GetChart("LIV", Arg.Any<DateOnly>(), Arg.Any<DateOnly>())
+            .Returns(new YahooChartData());
+        _yahooClient
+            .GetKeyStatistics("LIV")
+            .Returns(
+                new KeyStatistics
+                {
+                    SharesOutstanding = 10_000_000,
+                    MarketCapitalization = 10_000_000 * 151d,
+                }
+            );
+
+        await AttributeFixtureActions();
+        await _service.Import(CancellationToken.None);
+
+        EquityIssuer updated = _stockRepo
+            .GetCurrentUsDirectory()
+            .Single(s => s.Presentation.Listing.Ticker == "LIV");
+        updated.Presentation.Listing.Security.MarketCapitalization.Should().Be(10_000_000 * 150d);
     }
 
     [Fact]

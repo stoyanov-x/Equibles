@@ -112,6 +112,7 @@ public static class HoldingsBacktestCalculator
         // open at the earliest snapshot's rebalance date instead.
         var priorIdx = ordered.FindLastIndex(x => x.RebalanceDate <= from);
         var snapshotIdx = priorIdx < 0 ? 0 : priorIdx;
+        var firstSnapshotIdx = snapshotIdx;
 
         var startDate = ordered[snapshotIdx].RebalanceDate;
         if (startDate < from)
@@ -180,8 +181,14 @@ public static class HoldingsBacktestCalculator
         }
 
         // Measured over the snapshots the simulation actually rebalanced on, not every snapshot
-        // handed in — a quarter outside the window says nothing about what this result covers.
-        result.Coverage = ComputeCoverage(ordered.Take(snapshotIdx + 1).Select(x => x.Snapshot));
+        // handed in — a quarter before the start or after the end says nothing about what this
+        // result covers, and a start moved past quarters with nothing to buy must not count them.
+        result.Coverage = ComputeCoverage(
+            ordered
+                .Skip(firstSnapshotIdx)
+                .Take(snapshotIdx - firstSnapshotIdx + 1)
+                .Select(x => x.Snapshot)
+        );
 
         return result;
     }
@@ -225,7 +232,7 @@ public static class HoldingsBacktestCalculator
         // Aggregate per exact listing — a holder may report one class across multiple rows when
         // several managers share discretion. Sibling classes never share a price series.
         var positions = snapshot
-            .Positions.Where(p => !p.IsOption && p.Value > 0)
+            .Positions.Where(p => p.IsCloneable)
             .GroupBy(p => new BacktestSecurityKey(p.CommonStockId, p.ListedTicker))
             .Select(g => (Security: g.Key, Value: g.Sum(p => p.Value)))
             .ToList();
@@ -266,31 +273,36 @@ public static class HoldingsBacktestCalculator
 
     /// <summary>
     /// The share of each snapshot's reported value that the long-only clone could actually hold.
-    /// Options are counted in the denominator precisely because they are what the clone drops:
-    /// leaving them out would report 100% coverage for a filer whose book is all puts.
+    /// Options and unpriced holdings are counted in the denominator precisely because they are what
+    /// the clone drops: leaving them out would report 100% coverage for a filer whose book is all puts.
     /// </summary>
     private static BacktestCoverage ComputeCoverage(IEnumerable<BacktestQuarterSnapshot> snapshots)
     {
         var coverage = new BacktestCoverage();
         var shares = new List<decimal>();
+        var unpricedShares = new List<decimal>();
 
         foreach (var snapshot in snapshots)
         {
             decimal total = 0;
             decimal longValue = 0;
+            decimal unpricedValue = 0;
             foreach (var position in snapshot.Positions)
             {
                 if (position.Value <= 0)
                     continue;
                 total += position.Value;
-                if (!position.IsOption)
+                if (position.IsCloneable)
                     longValue += position.Value;
+                else if (!position.IsOption)
+                    unpricedValue += position.Value;
             }
 
             if (total <= 0)
                 continue;
 
             shares.Add(longValue / total * 100m);
+            unpricedShares.Add(unpricedValue / total * 100m);
         }
 
         if (shares.Count == 0)
@@ -299,6 +311,10 @@ public static class HoldingsBacktestCalculator
         coverage.QuartersMeasured = shares.Count;
         coverage.AverageLongPercent = Math.Round(shares.Sum() / shares.Count, 2);
         coverage.MinimumLongPercent = Math.Round(shares.Min(), 2);
+        coverage.AverageUnpricedPercent = Math.Round(
+            unpricedShares.Sum() / unpricedShares.Count,
+            2
+        );
         return coverage;
     }
 

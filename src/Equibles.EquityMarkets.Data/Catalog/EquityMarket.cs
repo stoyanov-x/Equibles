@@ -37,6 +37,33 @@ public sealed record EquityMarket(
     // a FIRDS home share then needs a home-venue line that states the issuer requested admission.
     public bool HomeRequiresIssuerRequest { get; init; } = HomeRequiresIssuerRequest;
 
+    // The operating code people write for a market whose lines are stored under segment codes only (Milan's XMIL);
+    // it names the market for a reader and is never stored on a listing.
+    public string OperatingCode { get; init; }
+
+    // The zone whose clock fixes the close when it is not the market's own (B3 closes on New York's clock);
+    // SessionClose and ClosingAuctionEnd then state the market's clock while both zones keep standard time.
+    public string CloseTimeZoneId { get; init; }
+
+    // The last continuous print and the closing-auction end on the market's own clock for one trading day.
+    public (TimeOnly SessionClose, TimeOnly ClosingAuctionEnd) CloseOn(DateOnly day)
+    {
+        if (CloseTimeZoneId == null)
+            return (SessionClose, ClosingAuctionEnd);
+        var shift = DaylightShift(CloseTimeZoneId, day) - DaylightShift(TimeZoneId, day);
+        return (SessionClose.Add(-shift), ClosingAuctionEnd.Add(-shift));
+    }
+
+    private static TimeSpan DaylightShift(string zoneId, DateOnly day)
+    {
+        var zone = TimeZoneInfo.FindSystemTimeZoneById(zoneId);
+        return zone.GetUtcOffset(day.ToDateTime(new TimeOnly(12, 0))) - zone.BaseUtcOffset;
+    }
+
+    // The stored codes of the lines that price the market's shares, in catalog order.
+    public IEnumerable<string> RegularLineCodes =>
+        MarketIdentifierCodes.Where(code => !IsExtendedSession(code));
+
     // Every venue code, operating or segment, that places a share's home market here.
     public IReadOnlyList<string> HomeVenueCodes { get; init; } =
         HomeVenueCodes ?? MarketIdentifierCodes;

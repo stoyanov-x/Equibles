@@ -115,6 +115,10 @@ public class StockPriceToolsTests : ParadeDbMcpTestBase
         (await Sut().GetLatestClosingPrices(["BP.L"]))
             .Should()
             .Contain("| XLON:BP | 2026-04-01 | 452.35 |");
+
+        // Two spellings of that listing in one batch answer one row, not the same row twice.
+        var twice = await Sut().GetLatestClosingPrices(["BP.L", "XLON:BP"]);
+        twice.Split("| XLON:BP | 2026-04-01 |").Should().HaveCount(2);
     }
 
     private async Task<EquityIssuer> SeedLondon(
@@ -324,18 +328,38 @@ public class StockPriceToolsTests : ParadeDbMcpTestBase
     // ── GetLatestClosingPrices ──────────────────────────────────────────────────
 
     [Fact]
-    public async Task GetLatestClosingPrices_OverMaxTickers_ReturnsLimitMessage()
+    public async Task GetLatestClosingPrices_OverMaxTickers_ReadsTheFirst25AndSaysSo()
     {
         // GetLatestClosingPrices runs one DB lookup per ticker — without an upper bound an agent
-        // could trigger 25× amplification by passing a long ticker list. The tool short-
-        // circuits at >25 with a user-facing instruction to split. Pin the limit so a
-        // regression that bumps it silently can't turn this endpoint into a DB-amplification
-        // DoS vector.
+        // could trigger amplification by passing a long ticker list. The cap still bounds the
+        // lookups at 25, but the batch is answered for those instead of refused outright.
         var tickers = string.Join(",", Enumerable.Range(1, 26).Select(i => $"T{i:D3}"));
 
         var result = await Sut().GetLatestClosingPrices(tickers);
 
-        result.Should().Be("Maximum 25 tickers per request. Please split into multiple calls.");
+        result.Should().Contain("| T025 | — | Not found |");
+        result.Should().NotContain("T026");
+        result
+            .Should()
+            .Contain("only the first 25 tickers were read; ask for the other 1 in another call");
+    }
+
+    [Fact]
+    public async Task GetLatestClosingPrices_OneUnreadableSymbol_StillAnswersTheRest()
+    {
+        EquityIssuer aapl = AaplStock();
+        DbContext.Set<EquityIssuer>().Add(aapl);
+        DbContext
+            .Set<EquityDailyStockPrice>()
+            .Add(PriceFor(aapl, new DateOnly(2026, 4, 5), close: 175.50m, volume: 50_000_000));
+        await DbContext.SaveChangesAsync();
+
+        // A blank member (a stray comma) is skipped, not treated as a symbol.
+        var result = await Sut().GetLatestClosingPrices(["AAPL", "", "^GSPC"]);
+
+        result.Should().Contain("| AAPL | 2026-04-05 | 175.50 |");
+        result.Should().Contain("| ^GSPC | — | Invalid ticker |");
+        result.Should().Contain("Index symbols such as ^GSPC are not listings");
     }
 
     [Fact]
@@ -356,7 +380,6 @@ public class StockPriceToolsTests : ParadeDbMcpTestBase
     [InlineData("ſPY")]
     [InlineData("AAPL/../../x")]
     [InlineData("ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567")]
-    [InlineData("AAPL,,MSFT")]
     public async Task GetLatestClosingPrices_InvalidBatchFailsBeforeRepositoryAccess(string tickers)
     {
         var sut = new StockPriceTools(
@@ -465,6 +488,61 @@ public class StockPriceToolsTests : ParadeDbMcpTestBase
         result.Should().Contain("compare only the post-split interval");
     }
 
+    // SOXX read at its 52-week high after a split although its restated bars put it 27% below:
+    // a split the split history confirms restated no longer shortens the range. A 3-for-2 is
+    // stamped without the boundary check, so it still does.
+    [Theory]
+    [InlineData(1, 5, "| 30.00 | 20.00 |", false)]
+    [InlineData(3, 2, "| 25.00\\* | 20.00\\* |", true)]
+    public async Task GetLatestClosingPrices_SplitStampedRestatedForTheListing_CrossesOnlyAMaterialRatio(
+        int numerator,
+        int denominator,
+        string rangeCells,
+        bool splitLimited
+    )
+    {
+        EquityIssuer stock = AaplStock();
+        var splitDate = new DateOnly(2026, 8, 4);
+        DbContext.Set<EquityIssuer>().Add(stock);
+        DbContext
+            .Set<StockSplit>()
+            .Add(
+                new StockSplit
+                {
+                    EquityIssuerId = stock.Id,
+                    EquityListingId = stock.Presentation.Listing.Id,
+                    PriceSeriesTicker = "AAPL",
+                    EffectiveDate = splitDate,
+                    Numerator = numerator,
+                    Denominator = denominator,
+                    Source = StockSplitSource.Yahoo,
+                    PriceAdjustmentAppliedTime = new DateTime(
+                        2026,
+                        8,
+                        6,
+                        0,
+                        0,
+                        0,
+                        DateTimeKind.Utc
+                    ),
+                }
+            );
+        DbContext
+            .Set<EquityDailyStockPrice>()
+            .AddRange(
+                PriceFor(stock, new DateOnly(2025, 8, 12), close: 22m),
+                PriceFor(stock, splitDate.AddDays(-1), close: 30m),
+                PriceFor(stock, splitDate, close: 20m),
+                PriceFor(stock, new DateOnly(2026, 8, 10), close: 25m)
+            );
+        await DbContext.SaveChangesAsync();
+
+        var result = await Sut().GetLatestClosingPrices("AAPL");
+
+        result.Should().Contain(rangeCells);
+        result.Contains("latest recorded split").Should().Be(splitLimited);
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("AAPL")]
@@ -499,7 +577,7 @@ public class StockPriceToolsTests : ParadeDbMcpTestBase
         var result = await Sut().GetLatestClosingPrices("AAPL");
 
         result.Should().Contain("| AAPL | 2026-08-04 | 20.00 | — | — |");
-        result.Should().Contain("previous session falls before that split");
+        result.Should().Contain("previous session falls before a recorded split");
     }
 
     [Fact]

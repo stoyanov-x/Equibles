@@ -75,7 +75,8 @@ public class FinancialStatementTools
         )]
             string statement = "income",
         [Description(
-            "Fiscal year, e.g. 2023. Defaults to the year of the latest period with line items to show."
+            "Fiscal year as the company names it, e.g. 2023. Defaults to the year of the latest "
+                + "period with line items to show."
         )]
             int? year = null,
         [Description(
@@ -141,10 +142,15 @@ public class FinancialStatementTools
                 // newest period's instants can sit one bucket away (HD's May 2026
                 // sheet is stamped fiscal 2026 while its flows are stamped 2027), so
                 // a period with flows must be offered even when it holds no instant.
+                // The year is typed in the company's own naming; periods are stored under the
+                // calendar year they end in (FiscalYearLabel).
+                var storedYear = year is { } typed
+                    ? FiscalYearLabel.Stored(typed, stock)
+                    : (int?)null;
                 var (candidates, periodError) = await ResolveStatementPeriods(
                     stock,
                     statementType,
-                    year,
+                    storedYear,
                     requestedPeriod,
                     statementType == FinancialStatementType.BalanceSheet
                         ? await StatementConceptIds()
@@ -176,6 +182,7 @@ public class FinancialStatementTools
                         return skipped is { } newer
                             ? table
                                 + SkippedPeriodNote(
+                                    stock,
                                     statementType,
                                     newer.FiscalYear,
                                     newer.FiscalPeriod
@@ -245,12 +252,29 @@ public class FinancialStatementTools
                 )
                 .ToListAsync();
 
-        var facts = allEvidence.Where(f => f.DimensionsKey == "").ToList();
+        // The evidence keeps every dimension for the interim check below, so the consolidated
+        // lines pass the repository's cost-of-sales gate here instead of at the query.
+        var byNatureCostOfSales = (
+            await _financialFactRepository.GetByNatureCostOfSalesIds(stock.Id).ToListAsync()
+        ).ToHashSet();
+        var facts = allEvidence
+            .Where(f => f.DimensionsKey == "" && !byNatureCostOfSales.Contains(f.Id))
+            .ToList();
         facts = StatementLineFacts.RejectAmbiguousInterimAnnualFacts(
             facts,
             allEvidence,
             selectedPeriod
         );
+        // Depreciation and amortization reads as the issuer's whole history folds it, so the
+        // statement and the fact series show one figure for a period (DepreciationTotal).
+        if (statementLines.Any(line => DepreciationTotal.IsFamily(line.Concepts)))
+            facts = await DepreciationTotalFacts.ForStatement(
+                _financialFactRepository,
+                _financialConceptRepository,
+                stock.Id,
+                facts,
+                selectedYear
+            );
 
         if (statementType != FinancialStatementType.BalanceSheet)
         {
@@ -281,8 +305,8 @@ public class FinancialStatementTools
         // statement to one actual period end before selecting line values so it cannot
         // silently combine different balance dates or flow endpoints. A balance sheet
         // loaded by its date already shares one; the anchor is a no-op there.
-        // No balance-sheet dates are loaded, and none are needed: this tool reads
-        // GetConsolidatedByStock, so the latest conforming span IS the entity's own
+        // No balance-sheet dates are loaded, and none are needed: the lines above are
+        // consolidated only, so the latest conforming span IS the entity's own
         // measured endpoint and the rule provably cannot move a consolidated-only
         // fact set (StatementLineFactsAnchorTests). A surface that also loads
         // DIMENSIONAL facts must pass them — see FinancialStatementsHelper.
@@ -305,6 +329,52 @@ public class FinancialStatementTools
             facts,
             selectedPeriod
         );
+        // A cash flow statement is its cash flow lines. An issuer whose facts hold only an income
+        // statement and a balance sheet still fills this template's Net Income line, and that
+        // lone row read as the whole statement.
+        if (statementType == FinancialStatementType.CashFlow)
+        {
+            var ownLines = statementLines.Where(line => line.Alias != NetIncomeAlias).ToList();
+            // A summed depreciation and amortization is built from income-statement parts, so
+            // it is no evidence of a cash flow statement either.
+            var statesOwnLine = ownLines.Any(line =>
+                StatementLineFacts
+                    .PickConceptFact(
+                        line,
+                        conceptIdByKey,
+                        latestByConcept,
+                        operatingCostsClaimant,
+                        derivedOperatingIncomeRounding
+                    )
+                    .Fact
+                    is { } own
+                && !DepreciationTotal.IsSum(own)
+            );
+            if (!statesOwnLine)
+            {
+                var ownConceptIds = ownLines
+                    .SelectMany(line => line.Concepts)
+                    .Where(concept => conceptIdByKey.ContainsKey((concept.Taxonomy, concept.Tag)))
+                    .Select(concept => conceptIdByKey[(concept.Taxonomy, concept.Tag)])
+                    .ToHashSet();
+                return (
+                    null,
+                    allEvidence.Any(fact => ownConceptIds.Contains(fact.FinancialConceptId))
+                        ? EmptyPeriodMessage(
+                            stock,
+                            statementType,
+                            selectedYear,
+                            selectedPeriod,
+                            allEvidence
+                        )
+                        : $"No cash flow figures are held for {EquityListingSymbol.Display(stock)} "
+                            + $"for FY{FiscalYearLabel.For(selectedYear, stock)} {selectedPeriod.NameForHumans()}: its facts for "
+                            + "that year state no operating, investing or financing cash flow line. "
+                            + "Use statement 'income' or 'balance' for the figures held."
+                );
+            }
+        }
+
         var splitSensitive = statementLines.Any(line =>
         {
             var (reportedConcept, fact) = StatementLineFacts.PickConceptFact(
@@ -360,7 +430,7 @@ public class FinancialStatementTools
     )
     {
         var statementName = statementType.NameForHumans().ToLowerInvariant();
-        var label = $"FY{fiscalYear} {fiscalPeriod.NameForHumans()}";
+        var label = $"FY{FiscalYearLabel.For(fiscalYear, stock)} {fiscalPeriod.NameForHumans()}";
         var yearToDateOnly =
             fiscalPeriod != SecFiscalPeriod.FullYear
             && statementType != FinancialStatementType.BalanceSheet
@@ -377,12 +447,15 @@ public class FinancialStatementTools
                 + $"for {label}.";
     }
 
+    private const string NetIncomeAlias = "net-income";
+
     private static string SkippedPeriodNote(
+        EquityIssuer stock,
         FinancialStatementType statementType,
         int fiscalYear,
         SecFiscalPeriod fiscalPeriod
     ) =>
-        $"\n_FY{fiscalYear} {fiscalPeriod.NameForHumans()} is newer but has no "
+        $"\n_FY{FiscalYearLabel.For(fiscalYear, stock)} {fiscalPeriod.NameForHumans()} is newer but has no "
         + $"{statementType.NameForHumans().ToLowerInvariant()} line items this tool can show, so "
         + "the newest period that has them is shown._\n";
 
@@ -402,7 +475,7 @@ public class FinancialStatementTools
         var result = MarkdownTable.Start(
             $"{statementType.NameForHumans()} for {EquityListingSymbol.Display(stock)} "
                 + $"({FactMarkdown.Cell(stock.Name)}) — "
-                + $"FY{selectedYear} {selectedPeriod.NameForHumans()}:",
+                + $"FY{FiscalYearLabel.For(selectedYear, stock)} {selectedPeriod.NameForHumans()}:",
             "| Line Item | Value | Unit | Basis | Period Start | Period End | Form | Filed |",
             "|-----------|------:|------|-------|--------------|------------|------|-------|"
         );
@@ -412,6 +485,7 @@ public class FinancialStatementTools
         var splitAdjusted = false;
         var unresolvedBasis = false;
         var grossProfitReplaced = false;
+        var depreciationSummed = false;
         DateOnly? earliestFiled = null;
         DateOnly? latestFiled = null;
         foreach (var line in statementLines)
@@ -449,8 +523,11 @@ public class FinancialStatementTools
                 derivedOperatingIncomeRounding
             );
             grossProfitReplaced |= replaced;
+            var summed = DepreciationTotal.IsSum(fact);
+            depreciationSummed |= summed;
             var basis =
                 replaced ? "Derived"
+                : summed ? "Sum of reported parts"
                 : StatementQuarterDerivation.IsDerived(fact) ? "Derived quarter"
                 : "Reported";
             result.AppendLine(
@@ -484,6 +561,10 @@ public class FinancialStatementTools
             result.AppendLine($"\n_{FinancialFactSplitAdjustment.UnresolvedNote}_");
         if (grossProfitReplaced)
             result.AppendLine($"\n_{GrossProfitMistag.ReplacedNote}_");
+        if (depreciationSummed)
+            result.AppendLine($"\n_{DepreciationTotal.SumNote}_");
+        if (FiscalYearLabel.Note(stock) is { } namingNote)
+            result.AppendLine($"\n_{namingNote}_");
 
         if (
             selectedPeriod != SecFiscalPeriod.FullYear
@@ -631,11 +712,11 @@ public class FinancialStatementTools
         {
             var latest = ordered[0];
             var wanted =
-                $"{(year?.ToString() ?? "the latest year")} "
+                $"{(year is { } stored ? FiscalYearLabel.For(stored, stock).ToString() : "the latest year")} "
                 + $"{(requestedPeriod?.NameForHumans() ?? "period")}";
             var message =
                 $"{EquityListingSymbol.Display(stock)} has no {statementName} data for {wanted}. Latest available: "
-                + $"FY{latest.FiscalYear} {latest.FiscalPeriod.NameForHumans()}.";
+                + $"FY{FiscalYearLabel.For(latest.FiscalYear, stock)} {latest.FiscalPeriod.NameForHumans()}.";
             // The Q4-under-FY trap: SEC Company Facts embeds the fourth
             // quarter's flow facts in the full-year duration, so a Q4
             // income/cash-flow request usually has nothing to find — that is
@@ -700,7 +781,7 @@ public class FinancialStatementTools
     // the instant ending latest so a comparative column never stands in for the current
     // one, then the latest restatement among same-ending candidates (#1546). Mirrors
     // FinancialStatementsHelper.PickCurrentlyReportedFact on the web surfaces; facts are
-    // already consolidated-only here via GetConsolidatedByStock.
+    // already consolidated-only here.
     internal static FinancialFact PickCurrentlyReportedFact(
         IEnumerable<FinancialFact> facts,
         SecFiscalPeriod fiscalPeriod

@@ -328,6 +328,7 @@ public class EquityIssuerMergeManager
                     "Active" = "Active" OR {from.Active},
                     "IsDirectoryListed" = "IsDirectoryListed" OR {from.IsDirectoryListed},
                     "IsReferenceListed" = "IsReferenceListed" OR {from.IsReferenceListed},
+                    "WasReferenceListed" = "WasReferenceListed" OR {from.WasReferenceListed},
                     "ListedOn" = CASE WHEN "ListedOn" IS NULL THEN NULL ELSE LEAST("ListedOn", {from.ListedOn}) END,
                     "DelistedOn" = CASE
                         WHEN "Active" OR {from.Active} THEN NULL
@@ -562,6 +563,7 @@ public class EquityIssuerMergeManager
             issuer.IndustryId,
             issuer.FiscalYearEndMonth,
             issuer.FiscalYearEndDay,
+            issuer.FiscalYearLabelOffset,
             Securities = issuer.Securities.Select(security => new
             {
                 security.Id,

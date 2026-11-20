@@ -150,9 +150,22 @@ public class FinancialFactsTools
                     return $"No '{concept}' data has been ingested for {EquityListingSymbol.Display(stock)}.";
 
                 var issuerFacts = _financialFactRepository.GetConsolidatedByIssuerId(stock.Id);
-                var facts = await issuerFacts
-                    .Where(f => conceptPriority.Keys.Contains(f.FinancialConceptId))
-                    .ToListAsync();
+                List<FinancialFact> facts;
+                // Depreciation and amortization leaves out a slice tagged beside the total and
+                // sums its two parts where no total is tagged (DepreciationTotal).
+                if (DepreciationTotal.IsFamily(conceptRefs))
+                {
+                    var depreciation = await DepreciationTotalFacts.Load(
+                        _financialFactRepository,
+                        _financialConceptRepository,
+                        [stock.Id]
+                    );
+                    (facts, conceptPriority) = (depreciation.Facts, depreciation.Priority);
+                }
+                else
+                    facts = await issuerFacts
+                        .Where(f => conceptPriority.Keys.Contains(f.FinancialConceptId))
+                        .ToListAsync();
                 if (BankTopLine.IsRevenue(conceptRefs))
                 {
                     var bankComponents = await LoadBankTopLineComponents(issuerFacts);
@@ -160,7 +173,8 @@ public class FinancialFactsTools
                         facts,
                         bankComponents.NetInterestIncome,
                         bankComponents.NoninterestIncome,
-                        conceptPriority
+                        conceptPriority,
+                        bankComponents.InterestExpense
                     );
                 }
                 // The operating-expenses and total-costs lines continue through a filer's
@@ -227,11 +241,14 @@ public class FinancialFactsTools
                     splits,
                     conceptsById
                 );
+                if (shown.Any(DepreciationTotal.IsSum))
+                    table += SumFootnote;
                 // The rows keep the filer's tagged figure; a gross profit that is the period's
                 // operating income is named, and the statement shows the derived figure.
                 var tagWarning = GrossProfitMistag.IsGrossProfit(conceptRefs)
                     ? GrossProfitMistag.Warning(
-                        await MistaggedGrossProfitRows(issuerFacts, shown, asOriginallyReported)
+                        await MistaggedGrossProfitRows(issuerFacts, shown, asOriginallyReported),
+                        stock.FiscalYearLabelOffset
                     )
                     : null;
                 return tagWarning == null
@@ -309,7 +326,12 @@ public class FinancialFactsTools
                 + "unknown value to list supported aliases."
         )]
             string concept,
-        [Description("Fiscal year, e.g. 2023")] int fiscalYear,
+        [Description(
+            "Fiscal year as the calendar year each company's period ends in, e.g. 2025, so every "
+                + "row covers the same months; a company that names that year for the year it "
+                + "starts in (most January year-end retailers) is labelled with its own name"
+        )]
+            int fiscalYear,
         [Description("Fiscal period: 'FY' (default) or 'Q1'..'Q4'")] string fiscalPeriod = "FY"
     )
     {
@@ -366,7 +388,8 @@ public class FinancialFactsTools
                     ? await ResolveBankTopLineComponentIds()
                     : (
                         NetInterestIncome: new HashSet<Guid>(),
-                        NoninterestIncome: new HashSet<Guid>()
+                        NoninterestIncome: new HashSet<Guid>(),
+                        InterestExpense: new HashSet<Guid>()
                     );
                 // The cost lines continue through operating costs per issuer
                 // (OperatingCostsContinuation); gross profit loads what proves a mis-tag.
@@ -381,6 +404,7 @@ public class FinancialFactsTools
                 var loadedConceptIds = conceptPriority
                     .Keys.Concat(bankComponentIds.NetInterestIncome)
                     .Concat(bankComponentIds.NoninterestIncome)
+                    .Concat(bankComponentIds.InterestExpense)
                     .Concat(operatingCosts.Ids)
                     .Concat(grossProfitComponents.SelectMany(c => c.Ids))
                     .ToList();
@@ -399,6 +423,29 @@ public class FinancialFactsTools
                         && loadedConceptIds.Contains(f.FinancialConceptId)
                     )
                     .ToListAsync();
+                // Depreciation and amortization is judged on each issuer's whole history, so the
+                // period compared shows the figure GetFinancialFact shows (DepreciationTotal).
+                if (DepreciationTotal.IsFamily(conceptRefs))
+                {
+                    var depreciation = await DepreciationTotalFacts.Load(
+                        _financialFactRepository,
+                        _financialConceptRepository,
+                        stockIds
+                    );
+                    conceptPriority = depreciation.Priority;
+                    facts = depreciation
+                        .Facts.Where(f =>
+                            f.FiscalYear == fiscalYear
+                            && (
+                                f.FiscalPeriod == period
+                                || (
+                                    includeFullYearForQ4
+                                    && f.FiscalPeriod == SecFiscalPeriod.FullYear
+                                )
+                            )
+                        )
+                        .ToList();
+                }
 
                 if (includeFullYearForQ4)
                 {
@@ -442,7 +489,13 @@ public class FinancialFactsTools
                                     )
                                 )
                                 .ToList(),
-                            conceptPriority
+                            conceptPriority,
+                            // One period shows none of the filer's history, so its interest
+                            // expense is what proves revenue before interest expense.
+                            g.Where(f =>
+                                    bankComponentIds.InterestExpense.Contains(f.FinancialConceptId)
+                                )
+                                .ToList()
                         );
                         (candidates, priority) = OperatingCostsContinuation.Fold(
                             claimableAlias,
@@ -529,6 +582,9 @@ public class FinancialFactsTools
                     )
                     .Select(row => row.Ticker)
                     .ToList();
+                if (rows.Any(row => DepreciationTotal.IsSum(row.Fact)))
+                    table += SumFootnote;
+                table += OwnNamingFootnote(rows, stocks);
                 return mistaggedTickers.Count == 0
                     ? table
                     : table
@@ -559,6 +615,33 @@ public class FinancialFactsTools
             fiscalYear,
             fiscalPeriod
         );
+
+    // The year compared is the calendar year each period ends in; a company that names that year
+    // for the year it starts in is told apart, so its own documents still read as the same year.
+    internal static string OwnNamingFootnote(
+        IEnumerable<(string Ticker, string Name, FinancialFact Fact)> rows,
+        IEnumerable<EquityIssuer> stocks
+    )
+    {
+        var issuers = stocks.GroupBy(stock => stock.Id).ToDictionary(g => g.Key, g => g.First());
+        var named = rows.Where(row =>
+                issuers.TryGetValue(row.Fact.EquityIssuerId, out var issuer)
+                && FiscalYearLabel.For(row.Fact.FiscalYear, issuer) != row.Fact.FiscalYear
+            )
+            .Select(row =>
+                $"{row.Ticker} names this year FY{FiscalYearLabel.For(row.Fact.FiscalYear, issuers[row.Fact.EquityIssuerId])}"
+            )
+            .ToList();
+        return named.Count == 0 ? "" : $"\n_Own naming: {string.Join("; ", named)}._\n";
+    }
+
+    // A summed depreciation and amortization is marked on its own row, so a table that mixes
+    // reported totals and sums says which is which; the footnote explains the mark.
+    private static string SumMark(FinancialFact fact) =>
+        DepreciationTotal.IsSum(fact) ? " " + DepreciationTotal.SumMarker : "";
+
+    private const string SumFootnote =
+        "\n_" + DepreciationTotal.SumMarker + ": " + DepreciationTotal.SumNote + "_\n";
 
     private static string RenderFactHistoryTable(
         string concept,
@@ -593,9 +676,9 @@ public class FinancialFactsTools
                 var unresolved = restated.Unresolved;
                 unresolvedBasis |= unresolved;
                 splitAdjusted |= restated.Adjusted;
-                return $"| {f.PeriodStart:yyyy-MM-dd} | {f.PeriodEnd:yyyy-MM-dd} | {f.FiscalYear} | "
+                return $"| {f.PeriodStart:yyyy-MM-dd} | {f.PeriodEnd:yyyy-MM-dd} | {FiscalYearLabel.For(f.FiscalYear, stock)} | "
                     + $"{f.FiscalPeriod.NameForHumans()} | "
-                    + $"{FactMarkdown.Value(value, f.Unit)}{(unresolved ? " (as filed)" : "")} | "
+                    + $"{FactMarkdown.Value(value, f.Unit)}{(unresolved ? " (as filed)" : "")}{SumMark(f)} | "
                     + $"{FactMarkdown.Cell(f.Unit)} | "
                     + $"{FactMarkdown.Cell(f.Form?.DisplayName)} | "
                     + $"{f.FiledDate:yyyy-MM-dd} | "
@@ -607,6 +690,8 @@ public class FinancialFactsTools
             result.AppendLine($"\n_{FinancialFactSplitAdjustment.Note}_");
         if (unresolvedBasis)
             result.AppendLine($"\n_{FinancialFactSplitAdjustment.UnresolvedNote}_");
+        if (FiscalYearLabel.Note(stock) is { } namingNote)
+            result.AppendLine($"\n_{namingNote}_");
 
         // Rows are newest first, so "first N" reads correctly; a no-op empty
         // line when nothing was cut off.
@@ -816,7 +901,7 @@ public class FinancialFactsTools
                 unresolvedBasis |= unresolved;
                 splitAdjusted |= restated.Adjusted;
                 return $"| {FactMarkdown.Cell(r.Ticker)} | {FactMarkdown.Cell(r.Name)} | "
-                    + $"{FactMarkdown.Value(value, r.Fact.Unit)}{(unresolved ? " (as filed)" : "")} | "
+                    + $"{FactMarkdown.Value(value, r.Fact.Unit)}{(unresolved ? " (as filed)" : "")}{SumMark(r.Fact)} | "
                     + $"{FactMarkdown.Cell(r.Fact.Unit)} | "
                     + $"{r.Fact.PeriodEnd:yyyy-MM-dd} | "
                     + $"{FactMarkdown.Cell(r.Fact.Form?.DisplayName)} | "
@@ -1020,11 +1105,16 @@ public class FinancialFactsTools
     // its revenue line is missing or partial (BankTopLine).
     private async Task<(
         List<FinancialFact> NetInterestIncome,
-        List<FinancialFact> NoninterestIncome
+        List<FinancialFact> NoninterestIncome,
+        List<FinancialFact> InterestExpense
     )> LoadBankTopLineComponents(IQueryable<FinancialFact> issuerFacts)
     {
-        var (netInterestIds, noninterestIds) = await ResolveBankTopLineComponentIds();
-        var componentIds = netInterestIds.Concat(noninterestIds).ToList();
+        var (netInterestIds, noninterestIds, interestExpenseIds) =
+            await ResolveBankTopLineComponentIds();
+        var componentIds = netInterestIds
+            .Concat(noninterestIds)
+            .Concat(interestExpenseIds)
+            .ToList();
         var facts =
             componentIds.Count == 0
                 ? []
@@ -1033,20 +1123,31 @@ public class FinancialFactsTools
                     .ToListAsync();
         return (
             facts.Where(f => netInterestIds.Contains(f.FinancialConceptId)).ToList(),
-            facts.Where(f => noninterestIds.Contains(f.FinancialConceptId)).ToList()
+            facts.Where(f => noninterestIds.Contains(f.FinancialConceptId)).ToList(),
+            facts.Where(f => interestExpenseIds.Contains(f.FinancialConceptId)).ToList()
         );
     }
 
     private async Task<(
         HashSet<Guid> NetInterestIncome,
-        HashSet<Guid> NoninterestIncome
+        HashSet<Guid> NoninterestIncome,
+        HashSet<Guid> InterestExpense
     )> ResolveBankTopLineComponentIds()
     {
         FinancialConceptAliases.TryResolve(BankTopLine.NetInterestIncomeAlias, out var netInterest);
         FinancialConceptAliases.TryResolve(BankTopLine.NoninterestIncomeAlias, out var noninterest);
+        FinancialConceptAliases.TryResolve(
+            BankTopLine.InterestExpenseAlias,
+            out var interestExpense
+        );
         var (netInterestPriority, _) = await ResolveConcepts(netInterest);
         var (noninterestPriority, _) = await ResolveConcepts(noninterest);
-        return ([.. netInterestPriority.Keys], [.. noninterestPriority.Keys]);
+        var (interestExpensePriority, _) = await ResolveConcepts(interestExpense);
+        return (
+            [.. netInterestPriority.Keys],
+            [.. noninterestPriority.Keys],
+            [.. interestExpensePriority.Keys]
+        );
     }
 
     // The alias's ingested concepts: their pick priority, and the variant each was reported

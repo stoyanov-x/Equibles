@@ -25,8 +25,8 @@ namespace Equibles.Sec.FinancialFacts.HostedService.Services;
 
 /// <summary>
 /// Extracts <em>dimensional</em> financial facts from a document's captured raw
-/// XBRL envelope and persists them as <see cref="FinancialFact"/> rows with
-/// <see cref="FinancialFactDimension"/> children — the segment / geography /
+/// XBRL envelope and persists them as <see cref="FinancialFact"/> rows keyed to
+/// their <see cref="FinancialDimensionSet"/> — the segment / geography /
 /// product cuts (e.g. <c>srt:ProductOrServiceAxis</c> → <c>aapl:IPhoneMember</c>)
 /// the SEC Company Facts API drops (see #877).
 ///
@@ -77,11 +77,16 @@ public class XbrlFactExtractionService
     // targeted (XbrlFactsExtractionWorker.SelectDueDocuments), not the whole corpus.
     // Version 10: record each 10-Q/10-K cover's registrant file number and shell-company flag
     // (IssuerCoverStatement), through the same targeted replay.
-    public const int CurrentVersion = 10;
+    // Version 11: standalone instances are read through their stored <XBRL> wrapper (every one
+    // parsed to zero facts before), and 16-week quarters and their cumulative spans take their
+    // fiscal label from the period. The replay is every standalone document plus the targeted
+    // 10-Q/10-K set.
+    public const int CurrentVersion = 11;
 
     /// <summary>
     /// Documents stamped below this version always rerun. Those stamped between it and
-    /// <see cref="CurrentVersion"/> rerun only when they are recent or lagging 10-Q/10-K filings.
+    /// <see cref="CurrentVersion"/> rerun only when they are recent or lagging 10-Q/10-K filings,
+    /// or standalone instances.
     /// The next full-corpus bump sets this equal to <see cref="CurrentVersion"/>, which retires the
     /// targeted replay.
     /// </summary>
@@ -117,7 +122,7 @@ public class XbrlFactExtractionService
     internal const long MaxParseableEnvelopeBytes = 50 * 1024 * 1024;
 
     // Column limits the parsed values must fit (FinancialFact.Unit,
-    // FinancialFactDimension.Axis/Member). Facts that exceed them are skipped
+    // FinancialDimensionSetMember.Axis/Member). Facts that exceed them are skipped
     // rather than truncated — a truncated QName would corrupt the key.
     private const int UnitMaxLength = 32;
     private const int QNameMaxLength = 256;
@@ -313,6 +318,8 @@ public class XbrlFactExtractionService
             dimensionsByKey.TryAdd(candidate.DimensionsKey, candidate.Fact.Dimensions);
         }
 
+        // Sets land before the facts that name them: a fact is never stored without its pairs.
+        await PersistDimensionSets(dimensionsByKey, cancellationToken);
         await BatchPersister.Persist(facts, _insertBatchSize, items => FlushFacts(items, false));
         foreach (
             var group in consolidatedFills.GroupBy(fact =>
@@ -326,7 +333,6 @@ public class XbrlFactExtractionService
                 items => FlushFacts(items, true, refreshFiscalIdentity: group.Key)
             );
         }
-        await PersistDimensions(document, dimensionsByKey, cancellationToken);
 
         // Company Facts may have imported the accession while these fills were written; its
         // cleanup ran before they existed, so withdraw them here instead.
@@ -995,59 +1001,20 @@ public class XbrlFactExtractionService
     }
 
     /// <summary>
-    /// Attaches the (axis, member) child rows to the just-upserted facts. Fact
-    /// ids are re-read by document + dimensions key because an upsert that hit
-    /// an existing row keeps that row's id, not the incoming one. Dimension
-    /// sets are immutable for a given key, so existing children are left
-    /// untouched.
+    /// Stores each dimension combination the document's facts carry once, under the key those
+    /// facts hold in <see cref="FinancialFact.DimensionsKey"/>. A set is immutable for its key,
+    /// so one already stored is left untouched.
     /// </summary>
-    private async Task PersistDimensions(
-        Document document,
+    private async Task PersistDimensionSets(
         Dictionary<string, List<ParsedXbrlDimension>> dimensionsByKey,
         CancellationToken cancellationToken
     )
     {
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<EquiblesFinancialDbContext>();
-
-        var persistedFacts = await dbContext
-            .Set<FinancialFact>()
-            .AsNoTracking()
-            .Where(f => f.DocumentId == document.Id && f.DimensionsKey != "")
-            .Select(f => new { f.Id, f.DimensionsKey })
-            .ToListAsync(cancellationToken);
-
-        var rows = new List<FinancialFactDimension>();
-        foreach (var fact in persistedFacts)
-        {
-            if (!dimensionsByKey.TryGetValue(fact.DimensionsKey, out var dimensions))
-                continue;
-            rows.AddRange(
-                dimensions.Select(d => new FinancialFactDimension
-                {
-                    FinancialFactId = fact.Id,
-                    Axis = d.Axis,
-                    Member = d.Member,
-                })
-            );
-        }
-        if (rows.Count == 0)
-            return;
-
-        foreach (var batch in rows.Chunk(_insertBatchSize))
-        {
-            await dbContext
-                .Set<FinancialFactDimension>()
-                .UpsertRange(batch)
-                .On(d => new
-                {
-                    d.FinancialFactId,
-                    d.Axis,
-                    d.Member,
-                })
-                .NoUpdate()
-                .RunAsync(cancellationToken);
-        }
+        await new FinancialDimensionSetWriter(
+            new FinancialDimensionSetRepository(dbContext)
+        ).AddMissing(dimensionsByKey, cancellationToken);
     }
 
     // Mirrors FinancialFactsImportService.TryMapTaxonomy (kept private there;

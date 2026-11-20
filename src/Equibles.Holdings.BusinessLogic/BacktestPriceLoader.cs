@@ -14,8 +14,9 @@ using Microsoft.EntityFrameworkCore;
 namespace Equibles.Holdings.BusinessLogic;
 
 /// <summary>
-/// Loads exact-listing price returns. Stored closes have no certified split basis, so a
-/// captured split across an actual holding or benchmark comparison makes the result unavailable.
+/// Loads exact-listing price returns. A captured split across an actual holding or benchmark
+/// comparison makes the result unavailable unless <see cref="CertifiedSplitBasis"/> certifies
+/// that the listing's stored series was rebased across it.
 /// </summary>
 [Service]
 public class BacktestPriceLoader
@@ -105,9 +106,11 @@ public class BacktestPriceLoader
         var splitDatesByListing = new Dictionary<ListingKey, DateOnly[]>();
         foreach (var key in listingKeys)
         {
-            var primaryTicker = primaryTickers.GetValueOrDefault(key.CommonStockId);
-            var scoped = PriceSeriesSplitScope.ForPriceComparison(
-                splitsByIssuer.For(key.CommonStockId),
+            var scoped = CertifiedSplitBasis.RemainingBoundaries(
+                PriceSeriesSplitScope.ForPriceComparison(
+                    splitsByIssuer.For(key.CommonStockId),
+                    key.ListedTicker
+                ),
                 key.ListedTicker
             );
             splitDatesByListing[key] = scoped
@@ -120,26 +123,23 @@ public class BacktestPriceLoader
         var requestedKeys = listingKeys.ToHashSet();
         var mappings = await _priceRepository
             .GetUsListingReferences(listingKeys.Select(key => key.CommonStockId).Distinct())
-            .Select(mapping => new
-            {
-                CommonStockId = mapping.Security.EquityIssuerId,
-                ListedTicker = mapping.Ticker,
-                EquityListingId = mapping.Id,
-            })
+            .Select(mapping => new ListingReference(
+                mapping.Security.EquityIssuerId,
+                mapping.Ticker,
+                mapping.Id
+            ))
             .ToListAsync(cancellationToken);
-        var stockByListing = mappings
+        // A symbol two of the issuer's US listings carry names no single series, so it maps to
+        // none and its holdings stay under the strict rules.
+        var listingByKey = mappings
             .GroupBy(mapping => new ListingKey(
                 mapping.CommonStockId,
                 NormalizeTicker(mapping.ListedTicker)
             ))
-            .Where(group => group.Count() == 1)
-            .Select(group => group.Single())
-            .Where(mapping =>
-                requestedKeys.Contains(
-                    new ListingKey(mapping.CommonStockId, NormalizeTicker(mapping.ListedTicker))
-                )
-            )
-            .GroupBy(mapping => mapping.EquityListingId)
+            .Where(group => group.Count() == 1 && requestedKeys.Contains(group.Key))
+            .ToDictionary(group => group.Key, group => group.Single());
+        var stockByListing = listingByKey
+            .Values.GroupBy(mapping => mapping.EquityListingId)
             .ToDictionary(group => group.Key, group => group.First().CommonStockId);
         var rows = await LoadListingRows(
             stockByListing,
@@ -168,13 +168,58 @@ public class BacktestPriceLoader
         if (!pricesByListing.TryGetValue(benchmarkKey, out var benchmarkSeries))
             return null;
 
+        // The first loaded bar of each listing under any symbol its rows were written under: a
+        // bar under an earlier symbol proves the listing traded, so its holding is not unpriced.
+        var firstBarByListing = rows.GroupBy(row => row.EquityListingId)
+            .ToDictionary(group => group.Key, group => group.Min(row => row.Date));
+        // A holding whose listing has no usable close on the day the clone would buy it is left
+        // out of that rebalance and coverage counts it as untracked: a delisted company whose
+        // history the price source no longer serves, a line priced only from a later date, or a
+        // listing that has no price yet. Refusing or shortening the window for it would hide
+        // every other holding's return; once its prices are stored the next run buys it.
+        foreach (var snapshot in snapshots)
+        {
+            var rebalanceDate = HoldingsBacktestCalculator.RebalanceDateOf(snapshot.ReportDate);
+            var buyDate = rebalanceDate > from ? rebalanceDate : from;
+            foreach (var position in snapshot.Positions)
+            {
+                position.Unpriced =
+                    !position.IsOption
+                    && position.Value > 0
+                    && primaryTickers.TryGetValue(position.CommonStockId, out var primary)
+                    && IsUnpriced(
+                        new ListingKey(
+                            position.CommonStockId,
+                            NormalizeTicker(position.ListedTicker ?? primary)
+                        ),
+                        buyDate
+                    );
+            }
+        }
+
+        bool IsUnpriced(ListingKey key, DateOnly buyDate)
+        {
+            if (!listingByKey.TryGetValue(key, out var listing))
+                return false;
+            if (
+                pricesByListing.TryGetValue(key, out var series)
+                && ForwardFill(series, buyDate) is > 0
+            )
+                return false;
+            // Bars under another symbol on or before the buy date mean the listing traded, so
+            // it stays under the strict rules instead of being reported as unpriced.
+            return !firstBarByListing.TryGetValue(listing.EquityListingId, out var firstBar)
+                || firstBar > buyDate;
+        }
+
         var usableFrom = ResolveUsableStart(
             snapshots,
             from,
             to,
             pricesByListing,
             primaryTickers,
-            benchmarkSeries
+            benchmarkSeries,
+            out var unpriced
         );
         if (usableFrom == null)
         {
@@ -182,7 +227,13 @@ public class BacktestPriceLoader
             {
                 StartDate = from,
                 EndDate = to,
-                Reason = "no common comparable price date for the active portfolio and benchmark",
+                Reason =
+                    "no common comparable price date for the active portfolio and benchmark"
+                    + (
+                        unpriced == null
+                            ? ""
+                            : $": {unpriced} has no usable price from the start date on, so start after the holder's last filing that reports it"
+                    ),
             };
         }
 
@@ -348,7 +399,7 @@ public class BacktestPriceLoader
             )
             {
                 if (cached.TailIsCurrent(now, to))
-                    AppendRows(rows, stockId, cached, to);
+                    AppendRows(rows, listingId, stockId, cached, to);
                 else
                     hits.Add((listingId, cached));
             }
@@ -372,7 +423,7 @@ public class BacktestPriceLoader
             {
                 var series = ToSeries(loaded[listingId], loadedAt).WithTailRead(loadedAt, to);
                 _seriesCache.Set(listingId, priceWindowFrom, series);
-                AppendRows(rows, stockByListing[listingId], series, to);
+                AppendRows(rows, listingId, stockByListing[listingId], series, to);
             }
         }
 
@@ -406,7 +457,7 @@ public class BacktestPriceLoader
                         )
                         .WithTailRead(readAt, to);
                     _seriesCache.Set(listingId, priceWindowFrom, current);
-                    AppendRows(rows, stockByListing[listingId], current, to);
+                    AppendRows(rows, listingId, stockByListing[listingId], current, to);
                 }
             }
         }
@@ -553,6 +604,7 @@ public class BacktestPriceLoader
 
     private static void AppendRows(
         List<LoadedPriceRow> rows,
+        Guid listingId,
         Guid stockId,
         CachedListingSeries series,
         DateOnly to
@@ -567,6 +619,7 @@ public class BacktestPriceLoader
                 rows.Add(
                     new LoadedPriceRow
                     {
+                        EquityListingId = listingId,
                         CommonStockId = stockId,
                         ListedTicker = segment.SourceTicker,
                         Date = segment.Dates[index],
@@ -597,9 +650,12 @@ public class BacktestPriceLoader
         DateOnly to,
         IReadOnlyDictionary<ListingKey, PriceRow[]> pricesByListing,
         IReadOnlyDictionary<Guid, string> primaryTickers,
-        PriceRow[] benchmarkSeries
+        PriceRow[] benchmarkSeries,
+        out string unpriced
     )
     {
+        // The first holding whose series has no usable price from the start on; it names what blocks the run.
+        unpriced = null;
         if (snapshots.Count == 0)
             return requestedFrom;
 
@@ -630,14 +686,38 @@ public class BacktestPriceLoader
             if (next == null)
                 return null;
 
-            foreach (
-                var position in active.Snapshot.Positions.Where(position =>
-                    !position.IsOption && position.Value > 0
+            // Every reported holding is left out: start at the next rebalance rather than sit
+            // in cash and publish a flat stretch as the manager's return.
+            if (
+                !active.Snapshot.Positions.Any(position => position.IsCloneable)
+                && active.Snapshot.Positions.FirstOrDefault(position => position.Unpriced)
+                    is { } leftOut
+            )
+            {
+                if (
+                    snapshotIndex + 1 >= ordered.Count
+                    || ordered[snapshotIndex + 1].RebalanceDate > to
                 )
+                {
+                    unpriced = NormalizeTicker(
+                        leftOut.ListedTicker
+                            ?? primaryTickers.GetValueOrDefault(leftOut.CommonStockId)
+                    );
+                    return null;
+                }
+                candidate = ordered[snapshotIndex + 1].RebalanceDate;
+                continue;
+            }
+
+            foreach (
+                var position in active.Snapshot.Positions.Where(position => position.IsCloneable)
             )
             {
                 if (!primaryTickers.TryGetValue(position.CommonStockId, out var primaryTicker))
+                {
+                    unpriced = position.ListedTicker;
                     return null;
+                }
 
                 var key = new ListingKey(
                     position.CommonStockId,
@@ -648,6 +728,7 @@ public class BacktestPriceLoader
                     || FirstUsableDate(series, start) is not { } firstPriceDate
                 )
                 {
+                    unpriced = key.ListedTicker;
                     return null;
                 }
 
@@ -679,9 +760,9 @@ public class BacktestPriceLoader
         return null;
     }
 
-    // A later filing can introduce a listing that was not in the initial portfolio. Rebalance uses
-    // reported value as its denominator, so silently skipping an unpriced position destroys that
-    // weight and publishes a false loss. Fail the result before simulation instead.
+    // A cloneable position without a close on its rebalance date (an ambiguous symbol, or bars
+    // stored under another symbol) would silently lose its weight and publish a false loss, and a
+    // quarter with nothing to buy would publish cash. Fail the result before simulation instead.
     private static bool EveryRebalanceIsPriceable(
         IReadOnlyList<BacktestQuarterSnapshot> snapshots,
         DateOnly from,
@@ -696,11 +777,15 @@ public class BacktestPriceLoader
             if (rebalanceDate < from || rebalanceDate > to)
                 continue;
 
-            foreach (
-                var position in snapshot.Positions.Where(position =>
-                    !position.IsOption && position.Value > 0
-                )
+            // Every holding left out: the clone would sit in cash for the quarter and the flat
+            // stretch would be scored as the manager's return, so the result is unavailable.
+            if (
+                snapshot.Positions.Any(position => position.Unpriced)
+                && !snapshot.Positions.Any(position => position.IsCloneable)
             )
+                return false;
+
+            foreach (var position in snapshot.Positions.Where(position => position.IsCloneable))
             {
                 if (!primaryTickers.TryGetValue(position.CommonStockId, out var primaryTicker))
                     return false;
@@ -726,8 +811,16 @@ public class BacktestPriceLoader
 
     internal readonly record struct ListingKey(Guid CommonStockId, string ListedTicker);
 
+    private sealed record ListingReference(
+        Guid CommonStockId,
+        string ListedTicker,
+        Guid EquityListingId
+    );
+
     private sealed class LoadedPriceRow
     {
+        public Guid EquityListingId { get; init; }
+
         public Guid CommonStockId { get; init; }
 
         public string ListedTicker { get; init; }

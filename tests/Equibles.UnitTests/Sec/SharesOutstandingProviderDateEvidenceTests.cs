@@ -151,6 +151,7 @@ public class SharesOutstandingProviderDateEvidenceTests
         await using var db = NewDb();
         var (stock, concept) = SeedIdentity(db);
         var priorA = ClassFact(
+            db,
             stock,
             concept,
             100,
@@ -160,6 +161,7 @@ public class SharesOutstandingProviderDateEvidenceTests
             "A"
         );
         var priorB = ClassFact(
+            db,
             stock,
             concept,
             200,
@@ -169,6 +171,7 @@ public class SharesOutstandingProviderDateEvidenceTests
             "B"
         );
         var currentA = ClassFact(
+            db,
             stock,
             concept,
             110,
@@ -178,6 +181,7 @@ public class SharesOutstandingProviderDateEvidenceTests
             "A"
         );
         var invalidB = ClassFact(
+            db,
             stock,
             concept,
             210,
@@ -346,6 +350,7 @@ public class SharesOutstandingProviderDateEvidenceTests
         };
 
     private static FinancialFact ClassFact(
+        EquiblesFinancialDbContext db,
         EquityIssuer stock,
         FinancialConcept concept,
         decimal value,
@@ -357,8 +362,7 @@ public class SharesOutstandingProviderDateEvidenceTests
     {
         var fact = Fact(stock, concept, value, asOf, filed, report);
         const string axis = "us-gaap:StatementClassOfStockAxis";
-        fact.DimensionsKey = $"{axis}={member}";
-        fact.Dimensions.Add(new FinancialFactDimension { Axis = axis, Member = member });
+        fact.DimensionsKey = Equibles.TestSupport.FinancialDimensionSeed.Key(db, (axis, member));
         return fact;
     }
 }

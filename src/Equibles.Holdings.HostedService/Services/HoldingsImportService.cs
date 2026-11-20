@@ -3,6 +3,7 @@ using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Equibles.CommonStocks.BusinessLogic;
 using Equibles.CommonStocks.Data.Helpers;
 using Equibles.CommonStocks.Data.Models;
 using Equibles.CommonStocks.Repositories;
@@ -703,14 +704,14 @@ public class HoldingsImportService
         // Retired CUSIPs must keep resolving: after an issuer-level CUSIP change, laggard filers
         // reference the old CUSIP for a quarter or two and every historical data set does forever.
         // Sibling classes resolve through listing claims and keep their listed ticker.
-        var claims = await HoldingCusipResolution.Load(
+        var claims = await CusipResolution.Load(
             stockRepo,
             query,
             uniqueCusipsList,
             cancellationToken
         );
         var contested = new List<string>();
-        var cusipMapping = HoldingCusipResolution.Resolve(claims, contested);
+        var cusipMapping = CusipResolution.Resolve(claims, contested);
         if (contested.Count > 0)
         {
             _logger.LogWarning(
@@ -2107,7 +2108,11 @@ public class HoldingsImportService
     {
         if (Corrupt13FShareCountRepairer.IsSuspect(bufferedRows))
         {
-            var outcome = Corrupt13FShareCountRepairer.Repair(bufferedRows, context.StockPrices);
+            var outcome = Corrupt13FShareCountRepairer.Repair(
+                bufferedRows,
+                holding => FilingBasisPrice(holding, context),
+                row => Revalue(row, context)
+            );
             logger.LogWarning(
                 "Filing {Accession} duplicates its value column into the share-count column; "
                     + "recovered {Repaired} row(s) from the filed value, dropped {Dropped} unrepairable row(s)",
@@ -3059,13 +3064,13 @@ public class HoldingsImportService
         // a lock alone cannot make the mapping captured before a long archive current.
         // Never acquire the global CUSIP lock here; identity writers take it first.
         var stockRepo = new EquityIssuerRepository(dbContext);
-        var claims = await HoldingCusipResolution.Load(
+        var claims = await CusipResolution.Load(
             stockRepo,
             stockRepo.GetAll(),
             cusips,
             cancellationToken
         );
-        var current = HoldingCusipResolution.Resolve(claims, []);
+        var current = CusipResolution.Resolve(claims, []);
         foreach (var cusip in cusips)
             if (
                 !current.TryGetValue(cusip, out var target)
@@ -3501,7 +3506,7 @@ public class HoldingsImportService
             h.ListedTicker
         );
 
-    private static bool IsYes(string raw) =>
+    internal static bool IsYes(string raw) =>
         !string.IsNullOrEmpty(raw)
         && (
             raw.Equals("Y", StringComparison.OrdinalIgnoreCase)

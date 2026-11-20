@@ -130,7 +130,7 @@ public class SplitShareCountEvidenceReconcilerTests(ParadeDbFixture fixture)
         return cover;
     }
 
-    private static FinancialFact ClassCount(
+    private FinancialFact ClassCount(
         EquityIssuer issuer,
         FinancialConcept cover,
         DateOnly asOf,
@@ -152,15 +152,10 @@ public class SplitShareCountEvidenceReconcilerTests(ParadeDbFixture fixture)
             Form = DocumentType.TenQ,
             FiledDate = filed,
             AccessionNumber = $"0001795250-{filed:yyMMdd}",
-            DimensionsKey = $"{member}@{asOf:yyyyMMdd}",
-            Dimensions =
-            [
-                new FinancialFactDimension
-                {
-                    Axis = "us-gaap:StatementClassOfStockAxis",
-                    Member = member,
-                },
-            ],
+            DimensionsKey = Equibles.TestSupport.FinancialDimensionSeed.Key(
+                DbContext,
+                ("us-gaap:StatementClassOfStockAxis", member)
+            ),
         };
 
     private static StockSplit ListedSplit(
@@ -233,12 +228,12 @@ public class SplitShareCountEvidenceReconcilerTests(ParadeDbFixture fixture)
     }
 
     [Fact]
-    public async Task Reconcile_ACommonStockMemberBesideOtherMembers_IsNoWitness()
+    public async Task Reconcile_ACommonStockMemberBesideOtherMembers_CountsAsTheMainClass()
     {
         // Globalstar tags its common shares as us-gaap:CommonStockMember beside its preferred: read
         // as a roll-up and dropped, only the unchanged preferred is left, which would contradict
-        // its real 1-for-15. Nobody can tell a roll-up from the only common class, so the filing
-        // states no count.
+        // its real 1-for-15. A roll-up equals the members beside it; this one does not, so it is
+        // the common class and the filing witnesses the split.
         var cover = await SeedCoverConcept();
         var issuer = Equibles.TestSupport.EquityIssuerSeed.Create(Ticker: "GSTX");
         DbContext.Add(issuer);
@@ -263,7 +258,9 @@ public class SplitShareCountEvidenceReconcilerTests(ParadeDbFixture fixture)
 
         await Reconciler().Reconcile(CancellationToken.None);
 
-        (await Stored(reverse)).ShareCountEvidence.Should().BeNull();
+        (await Stored(reverse))
+            .ShareCountEvidence.Should()
+            .Be(StockSplitShareCountEvidence.Confirmed);
     }
 
     [Fact]

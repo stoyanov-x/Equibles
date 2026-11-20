@@ -79,10 +79,7 @@ public class DocumentScraper : IDocumentScraper
             _logger.LogInformation("Starting document scraping process...");
 
             if (ShouldSyncCompanies())
-            {
-                await _companySyncService.SyncCompaniesFromSecApi();
-                _lastCompanySyncAtUtc = DateTime.UtcNow;
-            }
+                await SyncCompanies(result);
 
             var companiesUntracked = await GetAllCompaniesWithNoTracking();
 
@@ -141,6 +138,29 @@ public class DocumentScraper : IDocumentScraper
 
         return result;
     }
+
+    // Event-driven cycles run every few seconds and ingest filings against the directory already
+    // stored, so a failed sync is reported and retried after a short wait: rethrowing it dropped
+    // every cycle's filings, and left the throttle unset so each cycle fetched the directory again.
+    private async Task SyncCompanies(ScrapingResult result)
+    {
+        try
+        {
+            await _companySyncService.SyncCompaniesFromSecApi();
+            _lastCompanySyncAtUtc = DateTime.UtcNow;
+        }
+        catch (Exception ex) when (_options.UseEventDrivenDiscovery)
+        {
+            _logger.LogError(ex, "Company directory sync failed; filings use the stored directory");
+            RecordError(result, "Company directory sync", ex);
+            await ReportError("SyncCompanies", ex);
+            var interval = TimeSpan.FromMinutes(_options.CompanySyncIntervalMinutes);
+            var retryIn = interval < CompanySyncRetryDelay ? interval : CompanySyncRetryDelay;
+            _lastCompanySyncAtUtc = DateTime.UtcNow - interval + retryIn;
+        }
+    }
+
+    private static readonly TimeSpan CompanySyncRetryDelay = TimeSpan.FromMinutes(5);
 
     // Test seam: the throttle stamp is static (it must outlive the per-cycle
     // scraper), so suites reset it to stay order-independent.
@@ -419,6 +439,8 @@ public class DocumentScraper : IDocumentScraper
                     );
                     continue;
                 }
+                if (!secForm.SyncsFor(company))
+                    continue;
 
                 await ProcessDocumentTypeForCompany(
                     company,
@@ -499,25 +521,30 @@ public class DocumentScraper : IDocumentScraper
             if (metadata != null)
                 await profileReader.Store(company, metadata);
 
-            if (metadata?.FiscalYearEndMonth is { } month)
+            if (metadata != null)
             {
-                // A filer without a current annual report here (a Form D or F-1 filer, or one
-                // that left years ago) states a year end no report of its confirms, so it fills a
-                // blank but never replaces the one its own annual reports elsewhere recorded.
-                if (
+                // The company's own agreeing annual reports outrank the company record, which
+                // states a year end no report confirms for some registrants.
+                var chosen = ReportedFiscalYearEnd.Choose(
+                    metadata.FiscalYearEndMonth,
+                    metadata.FiscalYearEndDay,
+                    metadata.AnnualReportPeriodEnds,
+                    metadata.QuarterlyReportPeriodEnds,
+                    company.FiscalYearEndMonth,
+                    company.FiscalYearEndDay,
                     SecAnnualFiler.IsCurrent(
                         metadata.LatestAnnualReportFiledOn,
                         DateOnly.FromDateTime(DateTime.UtcNow)
-                    ) || company.FiscalYearEndMonth is null
-                )
+                    ),
+                    DateOnly.FromDateTime(DateTime.UtcNow)
+                );
+                if (chosen is { } yearEnd)
                 {
-                    await commonStockManager.SetFiscalYearEnd(
-                        company,
-                        month,
-                        metadata.FiscalYearEndDay
-                    );
+                    await commonStockManager.SetFiscalYearEnd(company, yearEnd.Month, yearEnd.Day);
+                    return;
                 }
-                return;
+                if (metadata.FiscalYearEndMonth is not null)
+                    return;
             }
 
             // SEC metadata lacks fiscal year-end — infer from most recent 10-K.

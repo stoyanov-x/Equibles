@@ -19,7 +19,10 @@ namespace Equibles.Holdings.Data.Models;
 [Index(nameof(WindowYears), nameof(BenchmarkTicker), nameof(AlphaPercent))]
 public class FundScore
 {
-    public const int CurrentCalculationVersion = 3;
+    // 4: certified splits are crossed and holdings with no close on the buy date are left out.
+    // 5: a score exists only for a representative clone (BacktestCoverage.IsRepresentative) over
+    // at least a year, for a filer that still files.
+    public const int CurrentCalculationVersion = 5;
 
     public Guid Id { get; set; } = Guid.NewGuid();
 

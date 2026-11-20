@@ -52,13 +52,15 @@ public class FilingDiscoveryServiceDiscoveryTests
     private static FilingDiscoveryService CreateService(
         ISecEdgarClient secEdgarClient,
         EquiblesFinancialDbContext context,
-        DocumentScraperOptions options = null
+        DocumentScraperOptions options = null,
+        params IRecentFilingSink[] sinks
     ) =>
         new(
             secEdgarClient,
             new BackfillStateRepository(context),
             Options.Create(options ?? new DocumentScraperOptions()),
-            Substitute.For<ILogger<FilingDiscoveryService>>()
+            Substitute.For<ILogger<FilingDiscoveryService>>(),
+            sinks
         );
 
     private static EquityIssuer Tracked(string ticker, string cik) =>
@@ -102,6 +104,100 @@ public class FilingDiscoveryServiceDiscoveryTests
         var dirty = await CreateService(client, context).DiscoverCompaniesWithNewFilings([apple]);
 
         dirty.Should().ContainSingle().Which.Should().BeSameAs(apple);
+    }
+
+    // A filer with no listing yet is followed for its registration statements only, so its 8-K
+    // never dirties it while its amended S-1 does (SecForm.SyncsFor).
+    [Fact]
+    public async Task Feed_FilerWithNoListing_IsDirtiedOnlyByARegistrationStatement()
+    {
+        await using var context = CreateContext();
+        var registrant = new EquityIssuer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Anthropic, PBC",
+            Cik = "2130357",
+        };
+        var currentReport = ClientWithFeed(
+            new EdgarRecentFilingEntry
+            {
+                Cik = "0002130357",
+                FormType = "8-K",
+                AccessionNumber = "0002130357-26-000001",
+            }
+        );
+
+        var dirtiedByCurrentReport = await CreateService(currentReport, context)
+            .DiscoverCompaniesWithNewFilings([registrant]);
+
+        dirtiedByCurrentReport.Should().BeEmpty();
+
+        FilingDiscoveryService.ResetCrossCycleStateForTests();
+        var amendment = ClientWithFeed(
+            new EdgarRecentFilingEntry
+            {
+                Cik = "0002130357",
+                FormType = "S-1/A",
+                AccessionNumber = "0001628280-26-074338",
+            }
+        );
+
+        var dirtiedByAmendment = await CreateService(amendment, context)
+            .DiscoverCompaniesWithNewFilings([registrant]);
+
+        dirtiedByAmendment.Should().ContainSingle().Which.Should().BeSameAs(registrant);
+    }
+
+    // Another lane's forms ride the same poll: a sink is offered every entry the poll reads for
+    // the first time, whatever its form or filer, and a failing sink never fails discovery.
+    [Fact]
+    public async Task Feed_OffersEachNewEntryToEverySinkOnce_AndSurvivesAFailingSink()
+    {
+        await using var context = CreateContext();
+        EquityIssuer apple = Tracked("AAPL", "320193");
+        var client = ClientWithFeed(
+            new EdgarRecentFilingEntry
+            {
+                Cik = "0000320193",
+                FormType = "8-K",
+                AccessionNumber = "0000320193-26-000001",
+            },
+            new EdgarRecentFilingEntry
+            {
+                Cik = "0001167483",
+                FormType = "13F-HR",
+                AccessionNumber = "0000919574-26-008062",
+            }
+        );
+        var failing = Substitute.For<IRecentFilingSink>();
+        failing
+            .Offer(Arg.Any<IReadOnlyList<EdgarRecentFilingEntry>>(), Arg.Any<CancellationToken>())
+            .ThrowsAsync(new InvalidOperationException("sink down"));
+        var offered = new List<string>();
+        var sink = Substitute.For<IRecentFilingSink>();
+        sink.Offer(Arg.Any<IReadOnlyList<EdgarRecentFilingEntry>>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                offered.AddRange(
+                    call.Arg<IReadOnlyList<EdgarRecentFilingEntry>>()
+                        .Select(entry => entry.AccessionNumber)
+                );
+                return Task.CompletedTask;
+            });
+        var service = CreateService(
+            client,
+            context,
+            new DocumentScraperOptions { RecentFeedPollSeconds = 0 },
+            failing,
+            sink
+        );
+
+        var dirty = await service.DiscoverCompaniesFromRecentFeed([apple]);
+        // A second poll re-reads the same page: nothing is new, so nothing is offered again.
+        await service.DiscoverCompaniesFromRecentFeed([apple]);
+
+        dirty.Should().ContainSingle().Which.Should().BeSameAs(apple);
+        offered.Should().Equal("0000320193-26-000001", "0000919574-26-008062");
     }
 
     [Fact]

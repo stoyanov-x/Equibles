@@ -12,12 +12,18 @@ namespace Equibles.Holdings.HostedService.Services;
 public class HoldingsImportRecoveryService(
     HoldingsImportFailureRepository failures,
     InstitutionalHoldingRepository holdings,
+    RealtimeSweepStateRepository sweepStates,
     ISecEdgarClient edgar,
     Realtime13FIngestionService ingestion,
     ILogger<HoldingsImportRecoveryService> logger
 )
 {
     private const int FilersPerCycle = 10;
+
+    // SEC's per-filer filing list lags acceptance by minutes. A filing discovered within the
+    // window retries on the short interval; an older one keeps the filer's ordinary cooldown.
+    internal static readonly TimeSpan ListingLagRetry = TimeSpan.FromMinutes(3);
+    internal static readonly TimeSpan ListingLagWindow = TimeSpan.FromHours(1);
 
     public async Task Recover(DateOnly minReportDate, CancellationToken cancellationToken)
     {
@@ -29,13 +35,23 @@ public class HoldingsImportRecoveryService(
             .Select(group => new
             {
                 Cik = group.Key,
+                // 0 while a due filing is not stored yet, so its manager goes before the managers
+                // that only owe a replay of stored filings.
+                ReplayOnly = group.Min(row =>
+                    row.Reason == HoldingsImportFailureReason.StoredReplay ? 1 : 0
+                ),
                 NextAttemptAt = group.Min(row => row.NextAttemptAt),
             })
-            .OrderBy(row => row.NextAttemptAt)
+            .OrderBy(row => row.ReplayOnly)
+            .ThenBy(row => row.NextAttemptAt)
             .ThenBy(row => row.Cik)
             .Select(row => row.Cik)
             .Take(FilersPerCycle)
             .ToListAsync(cancellationToken);
+        var sweptThrough = await sweepStates
+            .GetByWorker(Holdings13FRealtimeWorker.WorkerStateName)
+            .Select(state => (DateOnly?)state.SweptThrough)
+            .SingleOrDefaultAsync(cancellationToken);
         foreach (var cik in due)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -44,7 +60,23 @@ public class HoldingsImportRecoveryService(
             await failures.Defer(cik, now, cancellationToken);
             try
             {
-                await RecoverFiler(cik, minReportDate, cancellationToken);
+                await RecoverFiler(cik, minReportDate, sweptThrough, cancellationToken);
+            }
+            catch (PendingFilingNotListedException)
+            {
+                // Expected minutes after acceptance; only a filing discovered recently retries soon.
+                var retried = await failures.RetrySoon(
+                    cik,
+                    now - ListingLagWindow,
+                    now + ListingLagRetry,
+                    cancellationToken
+                );
+                logger.LogInformation(
+                    "Holdings recovery for CIK {Cik} waits for SEC's filing list; {Retried} filings retry in {Minutes} minutes",
+                    cik,
+                    retried,
+                    ListingLagRetry.TotalMinutes
+                );
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
@@ -60,6 +92,7 @@ public class HoldingsImportRecoveryService(
     private async Task RecoverFiler(
         string cik,
         DateOnly minReportDate,
+        DateOnly? sweptThrough,
         CancellationToken cancellationToken
     )
     {
@@ -72,11 +105,26 @@ public class HoldingsImportRecoveryService(
             return;
         var startedAt = DateTime.UtcNow;
         var from = pending.Min(row => row.FilingDate);
+        // The sweep has yet to re-apply this manager's filings from where it resumes: its cursor,
+        // or its trailing days when the cursor is newer. A tail that starts later marks the
+        // pending filing processed, and the sweep then re-applies an older filing over it.
+        if (sweptThrough != null)
+        {
+            var sweepResumes = Holdings13FRealtimeWorker.ComputeWindowStart(
+                DateOnly.FromDateTime(startedAt),
+                sweptThrough,
+                Holdings13FRealtimeWorker.TrailingReSweepDays,
+                0
+            );
+            if (sweepResumes < from)
+                from = sweepResumes;
+        }
         var filings = await edgar.GetCompanyFilings(
             cik,
             edgarForm: null,
+            // No upper bound: a filing accepted after 17:30 ET is dated the next business day.
             fromDate: from,
-            toDate: DateOnly.FromDateTime(DateTime.UtcNow)
+            toDate: null
         );
         var outOfScope = filings
             .Where(f => f.ReportDate != default && f.ReportDate < minReportDate)
@@ -120,7 +168,7 @@ public class HoldingsImportRecoveryService(
             // EDGAR removes a filing the filer withdraws or SEC rejects after acceptance, and its
             // directory goes with it; a directory still published means the index only lags.
             if (await edgar.FilingExists(cik, row.AccessionNumber, cancellationToken))
-                throw new InvalidDataException(
+                throw new PendingFilingNotListedException(
                     "The SEC submissions response omitted a pending filing EDGAR still publishes; recovery was not attempted."
                 );
             await failures.Resolve(

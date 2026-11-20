@@ -139,6 +139,16 @@ public class SecEdgarClient : ISecEdgarClient
         }
     }
 
+    public async Task<List<CompanyInfo>> GetUnlistedTickerRegistrants()
+    {
+        var url = $"{FilesBaseUrl}/files/company_tickers_exchange.json";
+        _logger.LogInformation("Requesting: {Url}", url);
+        var content = await FetchStringAsync(url);
+        return ParseUnlistedRegistrantsFromResponse(
+            JsonConvert.DeserializeObject<CompanyTickersResponse>(content)
+        );
+    }
+
     public async Task<List<FundClassTicker>> GetFundClassTickers()
     {
         try
@@ -251,6 +261,10 @@ public class SecEdgarClient : ISecEdgarClient
                 LatestAnnualReportFiledOn = SecRegistrantFilings.LatestAnnualReportFiledOn(
                     recentFilings
                 ),
+                AnnualReportPeriodEnds = SecRegistrantFilings.AnnualReportPeriodEnds(recentFilings),
+                QuarterlyReportPeriodEnds = SecRegistrantFilings.QuarterlyReportPeriodEnds(
+                    recentFilings
+                ),
                 PeriodicReportFileNumber = SecRegistrantFilings.PeriodicReportFileNumber(
                     recentFilings
                 ),
@@ -267,6 +281,16 @@ public class SecEdgarClient : ISecEdgarClient
             // HTTP errors (including exhausted 429 retries) propagate to caller
             _logger.LogError(ex, "HTTP error retrieving metadata for CIK: {Cik}", cik);
             throw;
+        }
+        catch (OperationCanceledException ex)
+        {
+            // No caller token reaches this read, so a cancellation is the HttpClient timeout: a
+            // failed read like any HTTP error, never the "not found" a null stands for.
+            _logger.LogError(ex, "Timed out retrieving metadata for CIK: {Cik}", cik);
+            throw new HttpRequestException(
+                $"SEC EDGAR timed out reading metadata for CIK {cik}",
+                ex
+            );
         }
         catch (Exception ex)
         {
@@ -300,6 +324,16 @@ public class SecEdgarClient : ISecEdgarClient
             // HTTP errors (including exhausted 429 retries) propagate to caller
             _logger.LogError(ex, "HTTP error retrieving company facts for CIK: {Cik}", cik);
             throw;
+        }
+        catch (OperationCanceledException ex)
+        {
+            // No caller token reaches this read, so a cancellation is the HttpClient timeout: a
+            // failed read like any HTTP error, never the "not found" a null stands for.
+            _logger.LogError(ex, "Timed out retrieving company facts for CIK: {Cik}", cik);
+            throw new HttpRequestException(
+                $"SEC EDGAR timed out reading company facts for CIK {cik}",
+                ex
+            );
         }
         catch (Exception ex)
         {
@@ -954,6 +988,15 @@ public class SecEdgarClient : ISecEdgarClient
             CompanyName = company,
             Cik = cik,
             DateFiled = ParseInvariantDateOr(dateFiled, fallbackDate),
+            StatedFilingDate = DateOnly.TryParseExact(
+                dateFiled,
+                "yyyyMMdd",
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None,
+                out var stated
+            )
+                ? stated
+                : null,
             AccessionNumber = accession,
         };
         return true;
@@ -1428,6 +1471,59 @@ public class SecEdgarClient : ISecEdgarClient
         }
 
         return companiesByCik.Values.ToList();
+    }
+
+    // The registrants whose every row has a blank exchange, the ones ParseCompaniesFromResponse
+    // skips entirely; a registrant with any exchange-listed row is not one of them.
+    private static List<CompanyInfo> ParseUnlistedRegistrantsFromResponse(
+        CompanyTickersResponse response
+    )
+    {
+        if (response?.Fields == null || response.Data == null)
+            return [];
+
+        var cikIndex = response.Fields.IndexOf("cik");
+        var nameIndex = response.Fields.IndexOf("name");
+        var tickerIndex = response.Fields.IndexOf("ticker");
+        var exchangeIndex = response.Fields.IndexOf("exchange");
+        if (cikIndex == -1 || nameIndex == -1 || tickerIndex == -1 || exchangeIndex == -1)
+            return [];
+
+        var unlisted = new Dictionary<string, CompanyInfo>();
+        var listedCiks = new HashSet<string>();
+        foreach (var row in response.Data)
+        {
+            if (
+                !TryExtractCompanyRow(
+                    row,
+                    cikIndex,
+                    nameIndex,
+                    tickerIndex,
+                    out var cik,
+                    out var name,
+                    out var ticker
+                )
+            )
+                continue;
+
+            var exchange =
+                row.Count > exchangeIndex ? row[exchangeIndex]?.ToString()?.Trim() : null;
+            if (!string.IsNullOrEmpty(exchange))
+            {
+                listedCiks.Add(cik);
+                continue;
+            }
+
+            if (!unlisted.TryGetValue(cik, out var company))
+            {
+                company = new CompanyInfo { Cik = cik, Name = name ?? string.Empty };
+                unlisted[cik] = company;
+            }
+            if (!company.Tickers.Contains(ticker))
+                company.Tickers.Add(ticker);
+        }
+
+        return unlisted.Values.Where(company => !listedCiks.Contains(company.Cik)).ToList();
     }
 
     private static bool TryExtractCompanyRow(

@@ -9,6 +9,8 @@
 - Null and empty-string ticker sentinels remain unattributed and are excluded from listing registration and audit expectations; their original rows and values are retained.
 - Unattributed issuer-level rows stay issuer-level; never assign an old ambiguous price, split or holding to today's primary ticker.
 - An unattributed split blocks a history replacement unless the series is a venue listing whose own capture or chart states the same event (same ratio, same-event window).
+- A US series' full-history replacement removes an unattributed split its own evidence settles: a row attached to the listing states the same event, or the provider that captured it reports no split near the date and the fetched bars, traded on both sides of the date, do not jump by its ratio there (only for a ratio the jump detector treats as material). Every other listing of the issuer whose stored bars cross the date must state the event itself; anything else keeps the refusal. `ResettleUnattributedSplits` re-reads each affected issuer once per process.
+- A US ticker SEC lists first does not take the presentation while it holds no stored price and the presenting line still trades; it stays a directory-listed line and takes over on the first sync after its first bar.
 - A verified listing requires source evidence, MIC, currency and positive quote scale; legacy migration does not grant verification or international publication.
 - Historical symbols and reused tickers keep separate source keys and listing IDs; one symbol never merges different issuers.
 - Database writer guards synchronize issuer changes and register newly observed exact historical series from EF, bulk imports and retiring binaries.
@@ -104,6 +106,7 @@
 ## Market capture
 
 - Beijing uses the ISO [BJSE market identifier](https://www.iso20022.org/sites/default/files/ISO10383_MIC/ISO10383_MIC.csv), CNY quotations and Asia/Shanghai time. Continuous trading ends at 14:57 and the closing auction ends at 15:00 under [BSE trading rules section 2.3.2](https://www.bse.cn/jygl_list/200028217.html).
+- B3 uses the ISO BVMF market identifier, BRL quotations and America/Sao_Paulo time. Continuous trading opens at 10:00 in São Paulo and ends at 15:55 in New York, with the closing call uncrossing at 16:00 there, so `EquityMarket.CloseOn` restates the São Paulo close for a trading day: 17:55 while the US keeps standard time, 16:55 under US daylight saving. It states no price provider.
 - A registered market can lack an available price provider; absent symbol suffix and exchange-code fields must remain null together, and no provider identity may be guessed from the venue name. Split-basis audits must retain applied markers when that provider cannot reconcile the market.
 
 - London directory discovery reads the one instrument list the exchange's report index names on its document host, with its publication date; an index that names none, several, an off-origin file or no date, or a workbook older than the committed directory, fails the pass and never reconciles a shorter or older market.

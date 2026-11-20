@@ -16,6 +16,11 @@ public class EquityDirectoryListingInput
     // An existing security the source proved is this same share, such as an interlisted line's home-market
     // security; the listing joins it, and any identifier naming another security or issuer refuses the row.
     public Guid? ProvenSecurityId { get; set; }
+
+    // An existing issuer the source proved is this company, such as a registrant whose own regulatory filings state
+    // the company's national registration number; the listing joins it, and any identifier naming another issuer
+    // refuses the row.
+    public Guid? ProvenIssuerId { get; set; }
     public string IssuerName { get; set; }
     public List<string> IssuerNameAliases { get; set; } = [];
 
@@ -24,6 +29,10 @@ public class EquityDirectoryListingInput
     public string LegalEntityIdentifier { get; set; }
     public List<string> RelatedIsins { get; set; } = [];
     public string Isin { get; set; }
+
+    // The source proved Isin now numbers the security SourceSecurityIdentifier is bound to, as when a numbering agency
+    // renumbers a share on its company's rename; the bound security takes it in place of the one it recorded.
+    public bool IsinSupersedesRecorded { get; set; }
     public EquitySecurityKind? SecurityType { get; set; }
     public DateOnly? ListedOn { get; set; }
     public string Ticker { get; set; }

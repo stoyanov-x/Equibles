@@ -19,11 +19,11 @@ See [`docs/`](docs/README.md) for the user guide and technical documentation.
 
 ## What's Included
 
-Everything marked **Self-hosted** is scraped, stored, and served by this repo — **71 MCP tools**, no account, no key. [Equibles Cloud](https://equibles.com) runs this exact core over the same protocol with the same tool names, and adds more tools on top.
+Everything marked **Self-hosted** is scraped, stored, and served by this repo — **72 MCP tools**, no account, no key. [Equibles Cloud](https://equibles.com) runs this exact core over the same protocol with the same tool names, and adds more tools on top.
 
 | Domain | Data Source | Self-hosted | [Equibles Cloud](https://equibles.com) | Description |
 |--------|------------|:---:|:---:|-------------|
-| **SEC Filings** | SEC EDGAR | ✅ | ✅ | Annual, quarterly and current reports (10-K, 10-Q, 8-K, 20-F, 6-K, 40-F), proxies (DEF 14A, DEFA14A, PRE 14A), registration statements (S-1, S-3, S-3ASR, S-4, F-1, F-3, F-3ASR, F-4), tender offers (SC TO, SC 14D9) and late-filing notices (NT 10-K, NT 10-Q, NT 20-F), with full-text search |
+| **SEC Filings** | SEC EDGAR | ✅ | ✅ | Annual, quarterly and current reports (10-K, 10-Q, 8-K, 20-F, 6-K, 40-F), proxies (DEF 14A, DEFA14A, PRE 14A), registration statements (S-1, S-3, S-3ASR, S-4, F-1, F-3, F-3ASR, F-4) and final prospectuses (424B4), tender offers (SC TO, SC 14D9) and late-filing notices (NT 10-K, NT 10-Q, NT 20-F), with full-text search |
 | **Financial Statements** | SEC XBRL | ✅ | ✅ | Parsed income statement, balance sheet, and cash flow facts per fiscal period |
 | **Holdings** | SEC 13F-HR | ✅ | ✅ | Institutional ownership — who owns what, how much, and trend over time |
 | **Fund Filings** | SEC NPORT / N-CEN / Form D | ✅ | ✅ | Fund portfolio holdings, registered-fund operations (service providers, fund types, advisers by CRD), and exempt offerings (private placements) |
@@ -344,7 +344,7 @@ Build first: a plain `dotnet run` restores and prints build output on stdout, wh
 
 ## Tools
 
-This self-hosted build exposes 71 tools over MCP. The hosted server at `https://mcp.equibles.com/mcp` runs this same core and [adds more on top](#whats-included). Full catalog and client setup: [daniel3303/stock-market-mcp-server](https://github.com/daniel3303/stock-market-mcp-server).
+This self-hosted build exposes 72 tools over MCP. The hosted server at `https://mcp.equibles.com/mcp` runs this same core and [adds more on top](#whats-included). Full catalog and client setup: [daniel3303/stock-market-mcp-server](https://github.com/daniel3303/stock-market-mcp-server).
 
 **13F institutional holdings**
 
@@ -358,6 +358,7 @@ This self-hosted build exposes 71 tools over MCP. The hosted server at `https://
 - GetOwnershipSignals — who holds a stock and how across every 13F book: conviction, crowding, ownership of the estimated free float, holder concentration, holding periods, the holders' estimated cost and share held at a loss, and holder-overlap peers
 - GetHolderTargets — shareholder targeting: 13F filers that hold a stock's holder-overlap peers but not the stock, ranked by money in the peers, with style and holder type
 - GetHolderTypeFlows — market-wide money in and out of US equities by kind of 13F filer for a closed quarter, optionally split by sector, with net flow as a share of each bucket's prior book
+- GetLatest13FFilings — the newest 13F filings loaded, with each one's SEC filing date and load time, and how many filings are loaded per recent filing day
 - GetInstitutionPortfolio — an institution's 13F portfolio, with how long each position has been held and its estimated cost per share
 - SearchInstitutions — strict-first tokenized name/CIK search with filing date, 13F AUM, position count, and holder type
 - GetTopInstitutionalBuyersSellers — biggest adds/reductions on a stock this quarter
@@ -445,7 +446,7 @@ This self-hosted build exposes 71 tools over MCP. The hosted server at `https://
 
 - GetStockPrices — daily OHLCV plus the stored auxiliary adjusted close when it differs
 - GetLatestClosingPrices — latest close/change/volume
-- GetDividendHistory — stored declared cash dividends for an exact stock or ETF listing
+- GetDividendHistory — stored cash dividends for an exact stock or ETF listing
 - GetStochasticOscillator — stochastic oscillator (%K/%D)
 - GetAverageTrueRange — average true range (ATR)
 - GetOnBalanceVolume — on-balance volume (OBV)
