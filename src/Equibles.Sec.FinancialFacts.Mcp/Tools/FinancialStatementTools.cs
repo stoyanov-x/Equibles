@@ -12,12 +12,15 @@ using Equibles.Errors.BusinessLogic.Extensions;
 using Equibles.Errors.Data.Models;
 using Equibles.Mcp;
 using Equibles.Mcp.Helpers;
+using Equibles.Sec.FinancialFacts.BusinessLogic.ReleaseStatements;
 using Equibles.Sec.FinancialFacts.BusinessLogic.Splits;
 using Equibles.Sec.FinancialFacts.Data.Enums;
 using Equibles.Sec.FinancialFacts.Data.Models;
 using Equibles.Sec.FinancialFacts.Data.Statements;
+using Equibles.Sec.FinancialFacts.Mcp.Captures;
 using Equibles.Sec.FinancialFacts.Mcp.Helpers;
 using Equibles.Sec.FinancialFacts.Repositories;
+using Equibles.Sec.Repositories;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
@@ -31,17 +34,25 @@ public class FinancialStatementTools
     private readonly FinancialConceptRepository _financialConceptRepository;
     private readonly EquityIssuerRepository _commonStockRepository;
     private readonly StockSplitRepository _stockSplitRepository;
+    private readonly DocumentRepository _documentRepository;
+    private readonly ReleaseStatementFigureRepository _releaseFigureRepository;
     private readonly McpToolRunner _runner;
 
+    // The document repository is optional: a host without the filings module has no stored
+    // earnings release to point at.
     public FinancialStatementTools(
         FinancialFactRepository financialFactRepository,
         FinancialConceptRepository financialConceptRepository,
         EquityIssuerRepository commonStockRepository,
         StockSplitRepository stockSplitRepository,
         ErrorManager errorManager,
-        ILogger<FinancialStatementTools> logger
+        ILogger<FinancialStatementTools> logger,
+        DocumentRepository documentRepository = null,
+        ReleaseStatementFigureRepository releaseFigureRepository = null
     )
     {
+        _documentRepository = documentRepository;
+        _releaseFigureRepository = releaseFigureRepository;
         _financialFactRepository = financialFactRepository;
         _financialConceptRepository = financialConceptRepository;
         _commonStockRepository = commonStockRepository;
@@ -58,6 +69,7 @@ public class FinancialStatementTools
             + "period end. Quarterly flow rows are always discrete quarters: when the filer "
             + "reports only cumulative year-to-date values in a currency, the quarter is derived by "
             + "exact subtraction from the preceding cumulative period and marked Derived. "
+            + "Adds a newer earnings release's figures as preliminary, or names that 8-K. "
             + "Company-specific dimensional facts (e.g. product-segment revenue) are not "
             + "included — use GetRevenueBreakdown for segment/geographic revenue, and "
             + "GetFinancialFact or CompareFinancialFact for one line item across periods "
@@ -157,8 +169,46 @@ public class FinancialStatementTools
                         : conceptIds,
                     conceptIds
                 );
+                // A request for an earlier fiscal year is not asking for the period the release covers.
+                var newerRelease = await NewerEarningsRelease.Find(
+                    _financialFactRepository,
+                    _documentRepository,
+                    stock.Id
+                );
+                // The release's own figures for this statement's lines where the lane placed
+                // them, in statement order, else the pointer to the release.
+                var preliminary = PreliminaryReleaseFigures.Render(
+                    ReleaseFigureReader
+                        .ForStatement(
+                            await PreliminaryReleaseFigures.Load(
+                                _releaseFigureRepository,
+                                _financialFactRepository,
+                                _stockSplitRepository,
+                                stock.Id
+                            ),
+                            statementType
+                        )
+                        .Where(row =>
+                            (storedYear == null || row.Figure.FiscalYear == storedYear.Value)
+                            && (
+                                requestedPeriod == null
+                                || ReleaseFigureReader
+                                    .PeriodOf(row.Figure)
+                                    .Answers(requestedPeriod.Value)
+                            )
+                        )
+                        .Select(row => (row.Line.Label, row.Figure))
+                        .ToList(),
+                    stock
+                );
+                var releaseNote =
+                    preliminary.Length > 0 ? preliminary
+                    : newerRelease != null
+                    && (storedYear == null || storedYear.Value >= newerRelease.LatestFiscalYear)
+                        ? newerRelease.Note
+                    : "";
                 if (periodError != null)
-                    return periodError;
+                    return periodError + releaseNote;
 
                 // An exact year and period render as asked. Otherwise the newest period that renders
                 // wins: a half-year filer's Q2 bucket holds only six-month spans, which a quarterly
@@ -168,7 +218,7 @@ public class FinancialStatementTools
                 (int FiscalYear, SecFiscalPeriod FiscalPeriod)? skipped = null;
                 foreach (var candidate in candidates.Take(pinned ? 1 : MaxDefaultPeriodAttempts))
                 {
-                    var (table, empty) = await RenderPeriod(
+                    var (table, empty, capture) = await RenderPeriod(
                         stock,
                         statementType,
                         statementLines,
@@ -179,19 +229,46 @@ public class FinancialStatementTools
                         operatingCostsClaimant
                     );
                     if (table != null)
-                        return skipped is { } newer
-                            ? table
-                                + SkippedPeriodNote(
-                                    stock,
-                                    statementType,
-                                    newer.FiscalYear,
-                                    newer.FiscalPeriod
-                                )
-                            : table;
+                    {
+                        var note = skipped is { } newer
+                            ? SkippedPeriodNote(
+                                stock,
+                                statementType,
+                                newer.FiscalYear,
+                                newer.FiscalPeriod
+                            )
+                            : "";
+                        // A card keeps two notes, so what changes the reading of every figure comes first.
+                        McpResultCapture.Record(
+                            capture with
+                            {
+                                Notes =
+                                [
+                                    .. new[]
+                                    {
+                                        preliminary.Length > 0 ? PreliminaryReleaseFigures.CardLead
+                                        : newerRelease != null && releaseNote.Length > 0
+                                            ? newerRelease.CardNote
+                                        : "",
+                                        skipped is { } skippedPeriod
+                                            ? SkippedPeriodCardNote(
+                                                stock,
+                                                statementType,
+                                                skippedPeriod.FiscalYear,
+                                                skippedPeriod.FiscalPeriod
+                                            )
+                                            : "",
+                                    }.Where(text => text.Length > 0),
+                                    .. capture.Notes,
+                                ],
+                            }
+                        );
+                        return table + note + releaseNote;
+                    }
                     firstEmpty ??= empty;
                     skipped ??= candidate;
                 }
-                return firstEmpty;
+                return firstEmpty + releaseNote;
             },
             "GetFinancialStatement",
             $"ticker: {FactMarkdown.Clean(ticker)}, statement: {FactMarkdown.Clean(statement)}, "
@@ -199,8 +276,12 @@ public class FinancialStatementTools
         );
     }
 
-    // Renders one fiscal (year, period): the table, or null with the message that explains its absence.
-    private async Task<(string Table, string Empty)> RenderPeriod(
+    // Renders one fiscal (year, period): the table and its capture, or null with the message that explains its absence.
+    private async Task<(
+        string Table,
+        string Empty,
+        FinancialStatementCapture Capture
+    )> RenderPeriod(
         EquityIssuer stock,
         FinancialStatementType statementType,
         IReadOnlyList<StatementLine> statementLines,
@@ -297,7 +378,8 @@ public class FinancialStatementTools
         if (facts.Count == 0)
             return (
                 null,
-                EmptyPeriodMessage(stock, statementType, selectedYear, selectedPeriod, allEvidence)
+                EmptyPeriodMessage(stock, statementType, selectedYear, selectedPeriod, allEvidence),
+                null
             );
 
         // A filing re-reports comparative spans under its own fiscal stamp, and a stale
@@ -370,7 +452,8 @@ public class FinancialStatementTools
                         : $"No cash flow figures are held for {EquityListingSymbol.Display(stock)} "
                             + $"for FY{FiscalYearLabel.For(selectedYear, stock)} {selectedPeriod.NameForHumans()}: its facts for "
                             + "that year state no operating, investing or financing cash flow line. "
-                            + "Use statement 'income' or 'balance' for the figures held."
+                            + "Use statement 'income' or 'balance' for the figures held.",
+                    null
                 );
             }
         }
@@ -393,7 +476,7 @@ public class FinancialStatementTools
                 .ToListAsync()
             : [];
 
-        var table = RenderStatementTable(
+        var (table, capture) = RenderStatementTable(
             stock,
             statementType,
             selectedYear,
@@ -415,7 +498,8 @@ public class FinancialStatementTools
                     selectedPeriod,
                     allEvidence
                 )
-                : null
+                : null,
+            capture
         );
     }
 
@@ -459,7 +543,16 @@ public class FinancialStatementTools
         + $"{statementType.NameForHumans().ToLowerInvariant()} line items this tool can show, so "
         + "the newest period that has them is shown._\n";
 
-    private static string RenderStatementTable(
+    private static string SkippedPeriodCardNote(
+        EquityIssuer stock,
+        FinancialStatementType statementType,
+        int fiscalYear,
+        SecFiscalPeriod fiscalPeriod
+    ) =>
+        $"FY{FiscalYearLabel.For(fiscalYear, stock)} {fiscalPeriod.NameForHumans()} is newer, but none of its "
+        + $"{statementType.NameForHumans().ToLowerInvariant()} figures can be shown here.";
+
+    private static (string Table, FinancialStatementCapture Capture) RenderStatementTable(
         EquityIssuer stock,
         FinancialStatementType statementType,
         int selectedYear,
@@ -480,6 +573,8 @@ public class FinancialStatementTools
             "|-----------|------:|------|-------|--------------|------------|------|-------|"
         );
 
+        var lines = new List<FinancialStatementCaptureLine>();
+        var notes = new List<string>();
         var rendered = 0;
         var omitted = 0;
         var splitAdjusted = false;
@@ -530,6 +625,25 @@ public class FinancialStatementTools
                 : summed ? "Sum of reported parts"
                 : StatementQuarterDerivation.IsDerived(fact) ? "Derived quarter"
                 : "Reported";
+            lines.Add(
+                new FinancialStatementCaptureLine(
+                    line.Label,
+                    line.Alias,
+                    basis,
+                    new FinancialFactCaptureRow(
+                        FiscalYearLabel.For(fact.FiscalYear, stock),
+                        fact.FiscalPeriod,
+                        fact.PeriodStart,
+                        fact.PeriodEnd,
+                        value,
+                        fact.Unit,
+                        unresolved,
+                        summed,
+                        fact.Form?.DisplayName,
+                        fact.FiledDate
+                    )
+                )
+            );
             result.AppendLine(
                 $"| {FactMarkdown.Cell(line.Label)} | "
                     + $"{FactMarkdown.Value(value, fact.Unit)}{(unresolved ? " (as filed)" : "")} | "
@@ -548,44 +662,73 @@ public class FinancialStatementTools
         }
 
         if (rendered == 0)
-            return null;
+            return (null, null);
 
+        // The answer prints each note in full; its card takes a short line for its reader, most important first.
+        void Note(string text, string card)
+        {
+            result.AppendLine($"\n_{text}_");
+            notes.Add(card);
+        }
         if (omitted > 0)
             result.AppendLine(
                 "\n_Line items the filer did not report for this period are omitted._"
             );
 
         if (splitAdjusted)
-            result.AppendLine($"\n_{FinancialFactSplitAdjustment.Note}_");
+            Note(FinancialFactSplitAdjustment.Note, FinancialFactSplitAdjustment.CardNote);
         if (unresolvedBasis)
-            result.AppendLine($"\n_{FinancialFactSplitAdjustment.UnresolvedNote}_");
+            Note(
+                FinancialFactSplitAdjustment.UnresolvedNote,
+                FinancialFactSplitAdjustment.UnresolvedCardNote
+            );
         if (grossProfitReplaced)
-            result.AppendLine($"\n_{GrossProfitMistag.ReplacedNote}_");
+            Note(
+                GrossProfitMistag.ReplacedNote,
+                "Gross Profit is Revenue − Cost of Revenue where the tagged figure was operating income."
+            );
         if (depreciationSummed)
-            result.AppendLine($"\n_{DepreciationTotal.SumNote}_");
+            Note(
+                DepreciationTotal.SumNote,
+                "Depreciation & amortization adds the reported parts where no total is tagged."
+            );
         if (FiscalYearLabel.Note(stock) is { } namingNote)
-            result.AppendLine($"\n_{namingNote}_");
+            Note(namingNote, "Fiscal years are named for the calendar year they start in.");
 
         if (
             selectedPeriod != SecFiscalPeriod.FullYear
             && statementType != FinancialStatementType.BalanceSheet
         )
-            result.AppendLine(
-                "\n_All flow rows span one discrete quarter. A Derived quarter is exact "
+            Note(
+                "All flow rows span one discrete quarter. A Derived quarter is exact "
                     + "subtraction of consecutive cumulative facts with the same concept, "
-                    + "currency and fiscal-year start; an unprovable YTD-only line is omitted._"
+                    + "currency and fiscal-year start; an unprovable YTD-only line is omitted.",
+                "Each row is one quarter; Derived quarter rows are computed from year-to-date totals."
             );
 
         // Each line independently takes its latest restatement, so one
         // statement can mix filing vintages — flag it so a partially restated
         // total that disagrees with non-restated components is explainable.
         if (earliestFiled != latestFiled)
-            result.AppendLine(
-                $"\n_Values reflect the latest restatement per line; source filings span "
-                    + $"{earliestFiled:yyyy-MM-dd} to {latestFiled:yyyy-MM-dd} — see the Filed column._"
+            Note(
+                $"Values reflect the latest restatement per line; source filings span "
+                    + $"{earliestFiled:yyyy-MM-dd} to {latestFiled:yyyy-MM-dd} — see the Filed column.",
+                "Each line takes its latest restatement, so filing dates differ."
             );
+        if (omitted > 0)
+            notes.Add("Lines the company did not report are left out.");
 
-        return result.ToString();
+        return (
+            result.ToString(),
+            new FinancialStatementCapture(
+                stock,
+                statementType,
+                FiscalYearLabel.For(selectedYear, stock),
+                selectedPeriod,
+                lines,
+                notes
+            )
+        );
     }
 
     // The line the issuer's operating costs continue (OperatingCostsContinuation), read off its

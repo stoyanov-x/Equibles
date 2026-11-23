@@ -1,7 +1,9 @@
 using Equibles.Fred.Data.Models;
+using Equibles.Fred.Mcp.Captures;
 using Equibles.Fred.Mcp.Tools;
 using Equibles.Fred.Repositories;
 using Equibles.IntegrationTests.Helpers;
+using Equibles.Mcp;
 using Xunit;
 
 namespace Equibles.IntegrationTests.Mcp;
@@ -662,5 +664,24 @@ public class FredToolsTests : ParadeDbMcpTestBase
 
         result.Should().Contain("FEDFUNDS");
         result.Should().Contain("CPIAUCSL");
+    }
+
+    // ── Card captures ──────────────────────────────────────────────────
+
+    // A card beside the answer gets the observations the answer kept, oldest first, and the cut in a reader's words.
+    [Fact]
+    public async Task GetEconomicIndicator_RecordsTheObservationsItListed()
+    {
+        using var scope = McpResultCapture.Begin();
+        await Sut().GetEconomicIndicator("FEDFUNDS", "2025-01-01", "2025-12-31", maxResults: 2);
+
+        var capture = scope.Get<EconomicIndicatorCapture>();
+        capture.Series.SeriesId.Should().Be("FEDFUNDS");
+        capture
+            .Observations.Select(o => o.Date)
+            .Should()
+            .Equal(new DateOnly(2025, 6, 1), new DateOnly(2025, 9, 1));
+        capture.TotalInRange.Should().Be(5);
+        capture.Notes.Should().Equal("Showing the newest 2 of 5 observations in the range.");
     }
 }

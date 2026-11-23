@@ -1,7 +1,9 @@
 using Equibles.Fred.Data.Models;
+using Equibles.Fred.Mcp.Captures;
 using Equibles.Fred.Mcp.Tools;
 using Equibles.Fred.Repositories;
 using Equibles.IntegrationTests.Helpers;
+using Equibles.Mcp;
 using Xunit;
 
 namespace Equibles.IntegrationTests.Mcp;

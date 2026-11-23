@@ -3,9 +3,11 @@ using Equibles.CommonStocks.Repositories;
 using Equibles.CorporateActions.Data.Models;
 using Equibles.CorporateActions.Repositories;
 using Equibles.IntegrationTests.Helpers;
+using Equibles.Mcp;
 using Equibles.Sec.Data.Models;
 using Equibles.Sec.FinancialFacts.Data.Enums;
 using Equibles.Sec.FinancialFacts.Data.Models;
+using Equibles.Sec.FinancialFacts.Mcp.Captures;
 using Equibles.Sec.FinancialFacts.Mcp.Tools;
 using Equibles.Sec.FinancialFacts.Repositories;
 using Xunit;
@@ -484,8 +486,16 @@ public class FinancialFactsToolsTests : ParadeDbMcpTestBase
         );
         await DbContext.SaveChangesAsync();
 
+        using var scope = McpResultCapture.Begin();
         var result = await Sut().GetFinancialFact("AAPL", "revenue");
 
+        // The card reads the same rows the table prints, newest first.
+        var capture = scope.Get<FinancialFactHistoryCapture>();
+        capture
+            .Rows.Select(row => (row.FiscalYear, row.Value))
+            .Should()
+            .Equal((2023, 400_000_000_000m), (2022, 320_000_000_000m));
+        capture.TotalPeriods.Should().Be(2);
         // Newest period first; the alias spans both tags.
         result.Should().Contain("| 2023-01-01 | 2023-12-31 | 2023 | FY | $400,000,000,000 |");
         result.Should().Contain("| 2022-01-01 | 2022-12-31 | 2022 | FY | $320,000,000,000 |");
@@ -493,6 +503,45 @@ public class FinancialFactsToolsTests : ParadeDbMcpTestBase
         var idx2023 = result.IndexOf("2023-12-31", StringComparison.Ordinal);
         var idx2022 = result.IndexOf("2022-12-31", StringComparison.Ordinal);
         idx2023.Should().BeLessThan(idx2022, "rows are ordered newest period first");
+    }
+
+    // The card states the cut without the answer's advice on arguments, which only a model can act on.
+    [Fact]
+    public async Task GetFinancialFact_TruncatedHistory_CardNoteStatesTheCut()
+    {
+        EquityIssuer stock = Apple();
+        DbContext.Set<EquityIssuer>().Add(stock);
+        var revenues = AddConcept("Revenues");
+        AddFact(
+            stock,
+            revenues,
+            2022,
+            SecFiscalPeriod.FullYear,
+            320_000_000_000m,
+            new DateOnly(2023, 1, 15),
+            DocumentType.TenK,
+            "a-2022"
+        );
+        AddFact(
+            stock,
+            revenues,
+            2023,
+            SecFiscalPeriod.FullYear,
+            400_000_000_000m,
+            new DateOnly(2024, 1, 15),
+            DocumentType.TenK,
+            "a-2023"
+        );
+        await DbContext.SaveChangesAsync();
+
+        using var scope = McpResultCapture.Begin();
+        var result = await Sut().GetFinancialFact("AAPL", "revenue", maxResults: 1);
+
+        result.Should().Contain("Showing first 1 of 2 results - raise maxResults to see more.");
+        scope
+            .Get<FinancialFactHistoryCapture>()
+            .Notes.Should()
+            .Contain("Showing the newest 1 of 2 periods.");
     }
 
     [Fact]

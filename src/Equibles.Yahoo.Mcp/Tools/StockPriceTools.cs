@@ -15,6 +15,7 @@ using Equibles.Mcp;
 using Equibles.Mcp.Helpers;
 using Equibles.Yahoo.Data.Models;
 using Equibles.Yahoo.Data.Prices;
+using Equibles.Yahoo.Mcp.Captures;
 using Equibles.Yahoo.Mcp.Contracts;
 using Equibles.Yahoo.Repositories;
 using Microsoft.EntityFrameworkCore;
@@ -129,7 +130,8 @@ public class StockPriceTools
                             barInterval,
                             start,
                             end,
-                            maxResults
+                            maxResults,
+                            holdNote
                         ),
                         holdNote
                     );
@@ -181,6 +183,17 @@ public class StockPriceTools
                         : "_Adj Close equals Close on every row shown. Captured splits and cash dividends trigger a full-history refresh, but equality does not prove that a split-spanning window uses one basis._"
                 );
 
+                McpResultCapture.Record(
+                    new StockPriceHistoryCapture(
+                        CaptureListing(listing),
+                        PriceBarInterval.Daily,
+                        start,
+                        end,
+                        total,
+                        records.OrderBy(p => p.Date).Select(DailyBar).ToList(),
+                        holdNote
+                    )
+                );
                 return WithHoldNote(result.ToString(), holdNote);
             },
             "GetStockPrices",
@@ -418,15 +431,16 @@ public class StockPriceTools
                         && previous.Date < boundary;
                     var changeCell = "—";
                     var changePctCell = "—";
+                    decimal? dayChange = null;
+                    decimal? dayChangePercent = null;
                     if (previousClose != null)
                     {
                         var change = price.Close - previousClose.Value;
+                        dayChange = change;
+                        dayChangePercent = change / previousClose.Value * 100m;
                         changeCell = McpFormat.SignedPrice(change);
                         changePctCell =
-                            McpFormat.Invariant(
-                                change / previousClose.Value * 100m,
-                                "+0.00;-0.00;0.00"
-                            ) + "%";
+                            McpFormat.Invariant(dayChangePercent.Value, "+0.00;-0.00;0.00") + "%";
                     }
                     else if (
                         previous != null
@@ -559,9 +573,11 @@ public class StockPriceTools
                 }
 
                 foreach (var segment in invalidSegments.Distinct(StringComparer.Ordinal))
+                {
                     result.AppendLine(
                         PlaceholderRow(MarkdownTable.EscapeCell(segment), "Invalid ticker")
                     );
+                }
                 if (invalidSegments.Count > 0)
                 {
                     result.AppendLine();
@@ -645,6 +661,18 @@ public class StockPriceTools
                     kPeriod,
                     dPeriod
                 );
+                RecordIndicator(
+                    listing,
+                    StockIndicatorKind.StochasticOscillator,
+                    $"%K={kPeriod}, %D={dPeriod}",
+                    records,
+                    renderFrom,
+                    maxResults,
+                    holdNote,
+                    kPeriod + dPeriod - 1,
+                    ("%K", k),
+                    ("%D", d)
+                );
 
                 return RenderNewestFirst(
                     $"Stochastic Oscillator (%K={kPeriod}, %D={dPeriod}) for {ListingTitle(listing)}:",
@@ -722,6 +750,18 @@ public class StockPriceTools
 
                 var (highs, lows, closes) = ExtractHighLowClose(records);
                 var atr = TechnicalIndicatorService.ComputeAtr(highs, lows, closes, period);
+                RecordIndicator(
+                    listing,
+                    StockIndicatorKind.AverageTrueRange,
+                    $"period={period}",
+                    records,
+                    renderFrom,
+                    maxResults,
+                    holdNote,
+                    // Wilder smoothing never forgets: every value carries part of every bar loaded before it.
+                    records.Count,
+                    ("ATR", atr)
+                );
 
                 return RenderNewestFirst(
                     $"Average True Range (period={period}) for {ListingTitle(listing)}:",
@@ -788,6 +828,18 @@ public class StockPriceTools
                 var closes = records.Select(p => p.Close).ToList();
                 var volumes = records.Select(p => p.Volume).ToList();
                 var obv = TechnicalIndicatorService.ComputeObv(closes, volumes);
+                RecordIndicator(
+                    listing,
+                    StockIndicatorKind.OnBalanceVolume,
+                    $"anchored at 0 on {records[0].Date:yyyy-MM-dd}",
+                    records,
+                    0,
+                    maxResults,
+                    holdNote,
+                    // A day's step reads the close before it.
+                    2,
+                    ("OBV", obv.Select(value => (decimal?)value).ToList())
+                );
 
                 return RenderNewestFirst(
                     $"On-Balance Volume for {ListingTitle(listing)}:",
@@ -864,6 +916,19 @@ public class StockPriceTools
                     period,
                     stdDev
                 );
+                RecordIndicator(
+                    listing,
+                    StockIndicatorKind.BollingerBands,
+                    $"period={period}, stdDev={McpFormat.Invariant(stdDev, "0.#")}",
+                    records,
+                    renderFrom,
+                    maxResults,
+                    holdNote,
+                    period,
+                    ("Lower", lower),
+                    ("Middle", middle),
+                    ("Upper", upper)
+                );
 
                 return RenderNewestFirst(
                     $"Bollinger Bands (period={period}, stdDev={McpFormat.Invariant(stdDev, "0.#")}) for {ListingTitle(listing)}:",
@@ -905,6 +970,74 @@ public class StockPriceTools
         if (middle == null || middle.Value == 0 || upper == null || lower == null)
             return null;
         return Math.Round((upper.Value - lower.Value) / middle.Value, 4);
+    }
+
+    private static StockPriceCaptureListing CaptureListing(PricedListing listing) =>
+        new(
+            listing.Stock,
+            listing.PriceTicker,
+            listing.Venue,
+            listing.Symbol,
+            listing.Venue != null
+            || string.Equals(
+                listing.Stock.Presentation.Listing.Ticker,
+                listing.PriceTicker,
+                StringComparison.OrdinalIgnoreCase
+            )
+                ? listing.Stock.Name
+                : null,
+            listing.Venue == null ? null : QuoteUnit(listing.Venue)
+        );
+
+    private static PriceBar DailyBar(EquityDailyStockPrice price) =>
+        new(
+            price.Date,
+            price.Date,
+            price.Open,
+            price.High,
+            price.Low,
+            price.Close,
+            price.AdjustedClose,
+            price.Volume,
+            false
+        );
+
+    // Records the rows an indicator table prints, oldest first: the table walks newest first from the last
+    // record down to renderFrom, and stops after maxResults rows.
+    private static void RecordIndicator(
+        PricedListing listing,
+        StockIndicatorKind kind,
+        string parameters,
+        List<EquityDailyStockPrice> records,
+        int renderFrom,
+        int maxResults,
+        string holdNote,
+        int readsBack,
+        params (string Name, IReadOnlyList<decimal?> Values)[] lines
+    )
+    {
+        var first = Math.Max(renderFrom, records.Count - maxResults);
+        var warmupFrom = Math.Max(0, first - (readsBack - 1));
+        McpResultCapture.Record(
+            new StockIndicatorCapture(
+                CaptureListing(listing),
+                kind,
+                parameters,
+                lines.Select(line => line.Name).ToList(),
+                records.Skip(first).Select(DailyBar).ToList(),
+                lines
+                    .Select(line => (IReadOnlyList<decimal?>)line.Values.Skip(first).ToList())
+                    .ToList(),
+                records.Count - renderFrom,
+                holdNote,
+                readsBack,
+                records
+                    .Skip(warmupFrom)
+                    .Take(first - warmupFrom)
+                    .Select(price => price.Date)
+                    .ToList()
+            )
+        );
     }
 
     // CommonStock.Name describes the primary SEC listing. Secondary symbols can identify a
@@ -1037,7 +1170,8 @@ public class StockPriceTools
         PriceBarInterval interval,
         DateOnly start,
         DateOnly end,
-        int maxResults
+        int maxResults,
+        string holdNote
     )
     {
         var daily = await rangeQuery.OrderBy(p => p.Date).ToListAsync();
@@ -1092,6 +1226,17 @@ public class StockPriceTools
             );
         result.AppendLine(
             "_Each bar rolls up the stored daily rows (first open, highest high, lowest low, last close and Adj Close, summed volume) and is dated by its last session. Stored rows do not certify one split basis, so a bar spanning a captured split can mix bases._"
+        );
+        McpResultCapture.Record(
+            new StockPriceHistoryCapture(
+                CaptureListing(listing),
+                interval,
+                start,
+                end,
+                bars.Count,
+                shown,
+                holdNote
+            )
         );
         return result.ToString();
     }

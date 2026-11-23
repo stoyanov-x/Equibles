@@ -3,6 +3,7 @@ using Equibles.Errors.BusinessLogic;
 using Equibles.Errors.BusinessLogic.Extensions;
 using Equibles.Errors.Data.Models;
 using Equibles.Fred.Data.Models;
+using Equibles.Fred.Mcp.Captures;
 using Equibles.Fred.Repositories;
 using Equibles.Mcp;
 using Equibles.Mcp.Helpers;
@@ -40,7 +41,7 @@ public class FredTools
         ReadOnly = true
     )]
     [Description(
-        "Get time series data for a FRED economic indicator. Returns historical observations for indicators like FEDFUNDS (fed funds rate), CPIAUCSL (CPI inflation), UNRATE (unemployment), GDP, T10Y2Y (yield spread), VIXCLS (VIX), SP500, MORTGAGE30US, M2SL (money supply), and more. Covers the curated set Equibles tracks, not the full FRED catalog, including Canadian series from the Bank of Canada (BOC-V39079 policy rate, CORRA, 2- and 10-year bond yields) and Statistics Canada (STATCAN-V41690973 CPI, CPI-trim and CPI-median, unemployment, employment, real GDP) — use SearchEconomicIndicators to find available series."
+        "Get time series data for a FRED economic indicator. Returns historical observations for indicators like FEDFUNDS (fed funds rate), DFF (the daily effective federal funds rate, EFFR), DFEDTARU and DFEDTARL (the Federal Reserve's FOMC policy rate target range, upper and lower bound), SOFR, IORB (interest rate on reserve balances), CPIAUCSL (CPI inflation), UNRATE (unemployment), GDP, T10Y2Y (yield spread), VIXCLS (VIX), SP500, MORTGAGE30US, M2SL (money supply), and more. Covers the curated set Equibles tracks, not the full FRED catalog, including Canadian series from the Bank of Canada (BOC-V39079 policy rate, CORRA, 2- and 10-year bond yields) and Statistics Canada (STATCAN-V41690973 CPI, CPI-trim and CPI-median, unemployment, employment, real GDP) — use SearchEconomicIndicators to find available series."
     )]
     public Task<string> GetEconomicIndicator(
         [Description(
@@ -146,6 +147,28 @@ public class FredTools
                         Environment.NewLine
                         + $"_Showing the newest {observations.Count} of {total} observations in the range - raise maxResults (max {McpLimit.MaxResults}) or narrow the date range for earlier data._"
                         + Environment.NewLine;
+                }
+
+                // The card states the same cut and coverage, without the answer's advice on arguments.
+                if (observations.Count > 0)
+                {
+                    var notes = new List<string>();
+                    if (observations.Count < total)
+                        notes.Add(
+                            $"Showing the newest {observations.Count} of {total} observations in the range."
+                        );
+                    if (coverageNote.Length > 0)
+                        notes.Add(coverageNote.Trim().Trim('_'));
+                    McpResultCapture.Record(
+                        new EconomicIndicatorCapture(
+                            series,
+                            observations.OrderBy(o => o.Date).ToList(),
+                            start,
+                            end,
+                            total,
+                            notes
+                        )
+                    );
                 }
 
                 return table + coverageNote;
@@ -295,7 +318,7 @@ public class FredTools
         ReadOnly = true
     )]
     [Description(
-        "Search the curated set of US macro series from FRED and Canadian series from FRED, the Bank of Canada and Statistics Canada that Equibles tracks (rates, inflation, employment, GDP, housing, market indicators) — not the full FRED catalog. Search first requires every punctuation-independent query word anywhere across the series ID, title, or category, then broadens to any word only when that strict search has no rows. Standard names such as fed funds rate, jobless claims, payrolls, yield curve, and core CPI are recognized. An empty query lists every tracked series. Results include seasonal adjustment, the latest observation date, and the UTC time Equibles last synced the series."
+        "Search the curated set of US macro series from FRED and Canadian series from FRED, the Bank of Canada and Statistics Canada that Equibles tracks (rates, inflation, employment, GDP, housing, market indicators) — not the full FRED catalog. Search first requires every punctuation-independent query word anywhere across the series ID, title, or category, then broadens to any word only when that strict search has no rows. Standard names such as fed funds rate, jobless claims, payrolls, yield curve, and core CPI are recognized; the tracked interest rates include the effective federal funds rate (EFFR), the Federal Reserve's FOMC target range upper and lower bounds, SOFR and IORB. An empty query lists every tracked series. Results include seasonal adjustment, the latest observation date, and the UTC time Equibles last synced the series."
     )]
     public Task<string> SearchEconomicIndicators(
         [Description(
@@ -537,7 +560,7 @@ public class FredTools
 
     // Previous and Change span one observation, so the row states how far apart observations are:
     // a daily rate and a quarterly output figure otherwise read as the same kind of move.
-    private static string FrequencyName(string code) =>
+    public static string FrequencyName(string code) =>
         code?.Trim().ToUpperInvariant() switch
         {
             "D" => "Daily",
@@ -557,7 +580,7 @@ public class FredTools
             ? ""
             : $" | Country: {series.CountryCode} | Source: {SourceName(series.Source)}";
 
-    private static string SourceName(IndicatorSource source) =>
+    public static string SourceName(IndicatorSource source) =>
         source switch
         {
             IndicatorSource.BankOfCanada => "Bank of Canada",
